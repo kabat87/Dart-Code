@@ -2629,7 +2629,7 @@
 	},
 	"dependencies": {
 		"minimatch": "^5.0.1",
-		"semver": "^7.3.5",
+		"semver": "^7.3.6",
 		"vscode-debugadapter": "^1.51.0",
 		"vscode-debugprotocol": "^1.51.0",
 		"vscode-languageclient": "^7.0.0",
