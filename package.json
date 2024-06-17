@@ -2642,7 +2642,7 @@
 		"vscode-debugadapter": "^1.51.0",
 		"vscode-debugprotocol": "^1.51.0",
 		"vscode-languageclient": "^7.0.0",
-		"ws": "^8.5.0"
+		"ws": "^8.17.1"
 	},
 	"devDependencies": {
 		"@types/glob": "^7.2.0",
