@@ -1,7 +1,67 @@
 import { strict as assert } from "assert";
 import * as vs from "vscode";
-import { envUtils } from "../../../shared/vscode/utils";
+import { buildHostKind, envUtils } from "../../../shared/vscode/utils";
 import { sb } from "../../helpers";
+
+describe("buildHostKind", () => {
+	function verify(appName: string | undefined, appHost: string | undefined, remoteName: string | undefined, expected: string | undefined) {
+		assert.equal(buildHostKind({ appName, appHost, remoteName }), expected);
+	}
+
+	it("builds the correct standard Desktop string", () => {
+		verify("Visual Studio Code", "desktop", undefined, undefined);
+		verify("Visual Studio Code", "desktop", "", undefined);
+		verify("Visual Studio Code", "", "", undefined);
+	});
+
+	it("handles misreported 'desktop' cloud IDEs", () => {
+		verify("Theia", "desktop", "", "web");
+		verify("Cloud Shell", "desktop", "", "web");
+		verify("IDX", "desktop", "a", "web-a");
+	});
+
+	it("converts host remoteNames to top level domains", () => {
+		verify("Foo", "web", "cloudthing.dev", "web-cloudthing.dev");
+		verify("Foo", "web", "myapp.cloudthing.dev", "web-cloudthing.dev");
+		verify("Foo", "web", "myapp.me.cloudthing.dev", "web-cloudthing.dev");
+	});
+
+	it("removes server-distro hostnames", () => {
+		verify("Foo", "server-distro", "my-ide.foo", "server-distro");
+		verify("Foo", "server-distro-my-ide.foo", "bar", "server-distro");
+		verify("Foo", "server-distro-my-ide.foo", "", "server-distro");
+		verify("Foo", "server-distro-my-ide.foo", undefined, "server-distro");
+		verify("Foo", "server-distro-my-ide.foo", "my-ide.foo", "server-distro");
+	});
+
+	it("removes local hosts", () => {
+		verify("Foo", "my-cloud-ide", "danny.local", "my-cloud-ide");
+		verify("Foo", "my-cloud-ide", "localhost", "my-cloud-ide");
+		verify("Foo", "my-cloud-ide", "foo-danny.local", "my-cloud-ide");
+	});
+
+	it("removes port and version numbers", () => {
+		verify("Foo", "web", "cloudthing.dev:1234", "web-cloudthing.dev");
+		verify("Foo", "my-cloud-ide", "143.192:8080", "my-cloud-ide");
+		verify("Foo", "my-cloud-ide", "foo-143.192:8080", "my-cloud-ide-foo");
+		verify("Foo", "my-cloud-ide-1.2", "foo-143.192:8080", "my-cloud-ide-foo");
+	});
+
+	it("handles only appName", () => {
+		verify("appName", "", "", undefined);
+		verify("appName", undefined, undefined, undefined);
+	});
+
+	it("handles only appHost", () => {
+		verify("", "appHost", "", "appHost");
+		verify(undefined, "appHost", undefined, "appHost");
+	});
+
+	it("handles only remoteName", () => {
+		verify("", "", "remoteName", "remoteName");
+		verify(undefined, undefined, "remoteName", "remoteName");
+	});
+});
 
 describe("exposeUrl", () => {
 	describe("when asExternalUri is a no-op", () => {
@@ -59,7 +119,7 @@ describe("exposeUrl", () => {
 			sb.stub(vs.env, "asExternalUri").callsFake((uri: vs.Uri) => {
 				// VS Code doesn't map URIs if there isn't an explicit port
 				// so reproduce that here to ensure we account for it.
-				if (uri.authority.indexOf(":") === -1)
+				if (!uri.authority.includes(":"))
 					return uri;
 
 				return uri.with({

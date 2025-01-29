@@ -1,7 +1,7 @@
 import * as vs from "vscode";
 import { AnalysisGetSignatureResponse, ParameterInfo } from "../../shared/analysis_server_types";
 import { fsPath } from "../../shared/utils/fs";
-import { cleanDartdoc } from "../../shared/vscode/extension_utils";
+import { cleanDartdoc, createMarkdownString } from "../../shared/vscode/extension_utils";
 import { DasAnalyzerClient } from "../analysis/analyzer_das";
 
 export class DartSignatureHelpProvider implements vs.SignatureHelpProvider {
@@ -17,7 +17,7 @@ export class DartSignatureHelpProvider implements vs.SignatureHelpProvider {
 			if (token && token.isCancellationRequested)
 				return undefined;
 
-			const sig = new vs.SignatureInformation(this.getSignatureLabel(resp), new vs.MarkdownString(cleanDartdoc(resp.dartdoc)));
+			const sig = new vs.SignatureInformation(this.getSignatureLabel(resp), createMarkdownString(cleanDartdoc(resp.dartdoc)));
 			sig.parameters = resp.parameters.map((p) => new vs.ParameterInformation(this.getLabel(p)));
 
 			const sigs = new vs.SignatureHelp();
@@ -32,9 +32,9 @@ export class DartSignatureHelpProvider implements vs.SignatureHelpProvider {
 	}
 
 	private getSignatureLabel(resp: AnalysisGetSignatureResponse): string {
-		const req = resp.parameters.filter((p) => p.kind === "REQUIRED" || p.kind === "REQUIRED_POSITIONAL");
-		const opt = resp.parameters.filter((p) => p.kind === "OPTIONAL" || p.kind === "OPTIONAL_POSITIONAL");
-		const named = resp.parameters.filter((p) => p.kind === "NAMED" || p.kind === "OPTIONAL_NAMED" || p.kind === "REQUIRED_NAMED");
+		const req = resp.parameters.filter((p) => (p.kind as string) === "REQUIRED" || p.kind === "REQUIRED_POSITIONAL");
+		const opt = resp.parameters.filter((p) => (p.kind as string) === "OPTIONAL" || p.kind === "OPTIONAL_POSITIONAL");
+		const named = resp.parameters.filter((p) => (p.kind as string) === "NAMED" || p.kind === "OPTIONAL_NAMED" || p.kind === "REQUIRED_NAMED");
 		const params = [];
 		if (req.length)
 			params.push(req.map(this.getLabel).join(", "));

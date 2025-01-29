@@ -1,14 +1,22 @@
 {
 	"files.insertFinalNewline": true,
 	"dart.maxLogLineLength": 20000,
+	// GH Actions can be slow so set budget slightly higher.
+	"dart.completionBudgetMilliseconds": 1000,
 	"dart.doNotFormat": [
-		"**/excluded/**",
+		"**/excluded*/**",
 		"**/excluded_*.dart"
 	],
 	"dart.analysisExcludedFolders": [
-		"lib/excluded",
+		"lib/excluded_by_setting",
 		"nested_flutter_example",
+		"test/excluded_by_setting",
 	],
-	"dart.showIgnoreQuickFixes": true,
-	"dart.showDartDeveloperLogs": true
+	"dart.showDartDeveloperLogs": true,
+	"dart.experimentalNewRefactors": true, // Old flag
+	"dart.experimentalRefactors": true, // New flag
+	"editor.wordBasedSuggestions": "off", // Prevents us from using presence of completions to know we got Dart ones
+	"dart.env": {
+		"CUSTOM_DART_ENV": "x"
+	},
 }

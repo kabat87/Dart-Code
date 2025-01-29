@@ -1,5 +1,6 @@
 import * as vs from "vscode";
-import { ClientCapabilities, StaticFeature } from "vscode-languageclient";
+import * as ls from "vscode-languageclient";
+import { ClientCapabilities, FeatureState, StaticFeature } from "vscode-languageclient";
 import { DartCapabilities } from "../../shared/capabilities/dart";
 import { IAmDisposable } from "../../shared/interfaces";
 import { disposeAll } from "../../shared/utils";
@@ -21,8 +22,11 @@ export class SnippetTextEditFeature implements IAmDisposable {
 			fillClientCapabilities(capabilities: ClientCapabilities) {
 				capabilities.experimental = capabilities.experimental ?? {};
 				if (supportsSnippetTextEdits && snippetTextEditsEnabled) {
-					(capabilities.experimental as any).snippetTextEdit = true;
+					capabilities.experimental.snippetTextEdit = true;
 				}
+			},
+			getState(): FeatureState {
+				return { kind: "static" };
 			},
 			initialize() { },
 		};
@@ -40,10 +44,23 @@ export class SnippetTextEditFeature implements IAmDisposable {
 					if (entries.length === 1 && entries[0][1].length === 1) {
 						const uri = entries[0][0];
 						const textEdit = entries[0][1][0];
-						// HACK: This should be checking InsertTextFormat:
-						// https://github.com/microsoft/language-server-protocol/issues/724#issuecomment-800334721
-						const hasSnippet = /\$(\d+|\{\d+:([^}]*)\})/.test(textEdit.newText);
-						// if ((textEdit as any).insertTextFormat === InsertTextFormat.Snippet) {
+						// HACK: Check the injected insertTextFormat added in the asWorkspaceEdit overrides.
+						const hasSnippet = (textEdit as any).insertTextFormat === ls.InsertTextFormat.Snippet;
+
+						// HACK: Work around the server producing 0th choice tabstops that are not valid until a
+						// server fix lands.
+						// https://github.com/Dart-Code/Dart-Code/issues/3996
+						if (hasSnippet
+							// Has a 0th choice snippet.
+							&& textEdit.newText.includes("${0|")
+							&& textEdit.newText.includes("|}")
+							// Does not have a 1st snippet.
+							&& !textEdit.newText.includes("${1")
+							&& !textEdit.newText.includes("$1")) {
+							// "Upgrade" choice from tabstop 0 to tabstop 1.
+							textEdit.newText = textEdit.newText.replace("${0|", "${1|");
+						}
+
 						if (hasSnippet) {
 							action.edit = undefined;
 							action.command = {
@@ -63,7 +80,7 @@ export class SnippetTextEditFeature implements IAmDisposable {
 		const editor = await vs.window.showTextDocument(doc);
 
 		if (doc.version !== documentVersion)
-			vs.window.showErrorMessage(`Unable to apply snippet, document was modified`);
+			void vs.window.showErrorMessage(`Unable to apply snippet, document was modified`);
 
 		const leadingIndentCharacters = doc.lineAt(edit.range.start.line).firstNonWhitespaceCharacterIndex;
 		const newText = this.compensateForVsCodeIndenting(edit.newText, leadingIndentCharacters);

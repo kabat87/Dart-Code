@@ -1,31 +1,36 @@
+import * as child_process from "child_process";
 import * as path from "path";
 import * as vs from "vscode";
 import { ProgressLocation } from "vscode";
 import { DaemonCapabilities, FlutterCapabilities } from "../../shared/capabilities/flutter";
-import { flutterPath, isChromeOS } from "../../shared/constants";
+import { flutterPath, isChromeOS, isDartCodeTestRun, tenMinutesInMs, twentySecondsInMs } from "../../shared/constants";
+import { FLUTTER_SUPPORTS_ATTACH } from "../../shared/constants.contexts";
 import { LogCategory } from "../../shared/enums";
 import * as f from "../../shared/flutter/daemon_interfaces";
-import { FlutterWorkspaceContext, IFlutterDaemon, Logger } from "../../shared/interfaces";
+import { FlutterWorkspaceContext, IFlutterDaemon, Logger, SpawnedProcess } from "../../shared/interfaces";
 import { CategoryLogger, logProcess } from "../../shared/logging";
 import { UnknownNotification, UnknownResponse } from "../../shared/services/interfaces";
 import { StdIOService } from "../../shared/services/stdio_service";
-import { PromiseCompleter, usingCustomScript } from "../../shared/utils";
+import { PromiseCompleter, usingCustomScript, withTimeout } from "../../shared/utils";
 import { isRunningLocally } from "../../shared/vscode/utils";
+import { Analytics } from "../analytics";
 import { config } from "../config";
-import { FLUTTER_SUPPORTS_ATTACH } from "../extension";
 import { promptToReloadExtension } from "../utils";
 import { getFlutterConfigValue } from "../utils/misc";
 import { getGlobalFlutterArgs, getToolEnv, runToolProcess, safeToolSpawn } from "../utils/processes";
 
 export class FlutterDaemon extends StdIOService<UnknownNotification> implements IFlutterDaemon {
 	private hasStarted = false;
-	private hasShownTerminationError = false;
+	private hasShownTerminatedError = false;
+	private hasLoggedDaemonTimeout = false;
 	private isShuttingDown = false;
 	private startupReporter: vs.Progress<{ message?: string; increment?: number }> | undefined;
 	private daemonStartedCompleter = new PromiseCompleter<void>();
+	public daemonStarted = this.daemonStartedCompleter.promise;
+	private pingIntervalId?: NodeJS.Timeout;
 	public capabilities: DaemonCapabilities = DaemonCapabilities.empty;
 
-	constructor(logger: Logger, private readonly workspaceContext: FlutterWorkspaceContext, flutterCapabilities: FlutterCapabilities) {
+	constructor(logger: Logger, private readonly analytics: Analytics, private readonly workspaceContext: FlutterWorkspaceContext, flutterCapabilities: FlutterCapabilities, private readonly runIfNoDevices?: () => void, portFromLocalExtension?: number) {
 		super(new CategoryLogger(logger, LogCategory.FlutterDaemon), config.maxLogLineLength, true, true);
 
 		const folder = workspaceContext.sdks.flutter;
@@ -33,9 +38,9 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 		this.registerForDaemonConnected((e) => {
 			this.additionalPidsToTerminate.push(e.pid);
 			this.capabilities.version = e.version;
-			vs.commands.executeCommand("setContext", FLUTTER_SUPPORTS_ATTACH, this.capabilities.canFlutterAttach);
+			void vs.commands.executeCommand("setContext", FLUTTER_SUPPORTS_ATTACH, this.capabilities.canFlutterAttach);
 
-			this.deviceEnable();
+			void this.deviceEnable();
 		});
 
 		const daemonArgs = [];
@@ -44,18 +49,26 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 		if (showWebServer && flutterCapabilities.supportsShowWebServerDevice)
 			daemonArgs.push("--show-web-server-device");
 
-		if (process.env.DART_CODE_IS_TEST_RUN)
+		if (isDartCodeTestRun)
 			daemonArgs.push("--show-test-device");
 
-		const execution = usingCustomScript(
-			path.join(workspaceContext.sdks.flutter, flutterPath),
-			["daemon"].concat(daemonArgs),
-			workspaceContext.config?.flutterDaemonScript,
-		);
+		if (portFromLocalExtension) {
+			this.createNcProcess(portFromLocalExtension);
+			this.startPing();
+		} else if (workspaceContext.config.forceFlutterWorkspace && config.daemonPort) {
+			this.createNcProcess(config.daemonPort);
+			this.startPing(workspaceContext.config.restartMacDaemonMessage);
+		} else {
+			const execution = usingCustomScript(
+				path.join(workspaceContext.sdks.flutter, flutterPath),
+				["daemon"].concat(daemonArgs),
+				workspaceContext.config?.flutterDaemonScript,
+			);
 
-		const flutterAdditionalArgs = config.for(vs.Uri.file(folder)).flutterAdditionalArgs;
-		const args = getGlobalFlutterArgs().concat(flutterAdditionalArgs).concat(execution.args);
-		this.createProcess(folder, execution.executable, args, { toolEnv: getToolEnv() });
+			const flutterAdditionalArgs = config.for(vs.Uri.file(folder)).flutterAdditionalArgs;
+			const args = getGlobalFlutterArgs().concat(flutterAdditionalArgs).concat(execution.args);
+			this.createProcess(folder, execution.executable, args, { toolEnv: getToolEnv() });
+		}
 
 		if (isChromeOS && config.flutterAdbConnectOnChromeOs) {
 			logger.info("Running ADB Connect on Chrome OS");
@@ -65,18 +78,77 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 		}
 	}
 
+	public startPing(customMessage?: string) {
+		const message = customMessage ?? "The daemon connection was lost. Reload the extension to restart the daemon.";
+		this.pingIntervalId = setInterval(async () => {
+			try {
+				await withTimeout(this.daemonVersion(), "The daemon connection was lost", 10);
+			} catch (e) {
+				clearInterval(this.pingIntervalId);
+				this.logger.error(e);
+				this.hasShownTerminatedError = true;
+				void promptToReloadExtension(message);
+			}
+		}, 60 * 1000);
+	}
+
+	// This is for the case where a user has started a flutter daemon process on their local machine where devices are available, and
+	// has forwarded this port to the remote machine where the Dart extension is running. Netcat is used to access the local devices,
+	// instead of starting another daemon process on the remote machine.
+	protected createNcProcess(port: number) {
+		this.process = child_process.spawn("nc", ["localhost", port.toString()]) as SpawnedProcess;
+
+		this.process.stdout.on("data", (data: Buffer | string) => this.handleStdOut(data));
+		this.process.stderr.on("data", (data: Buffer | string) => this.handleStdErr(data));
+		this.process.on("exit", (code, signal) => this.handleExit(code, signal));
+		this.process.on("error", (error) => {
+			void vs.window.showErrorMessage(`Remote daemon startup had an error: ${error}. Check the instructions for using dart.daemonPort`);
+			this.handleError(error);
+		});
+	}
+
 	protected handleExit(code: number | null, signal: NodeJS.Signals | null) {
-		if (code && !this.hasShownTerminationError && !this.isShuttingDown) {
-			this.hasShownTerminationError = true;
-			const message = this.hasStarted ? "has terminated" : "failed to start";
-			// tslint:disable-next-line: no-floating-promises
-			promptToReloadExtension(`The Flutter Daemon ${message}.`, undefined, true);
-		}
+		if (code && !this.isShuttingDown)
+			this.handleUncleanExit();
+
 		super.handleExit(code, signal);
+	}
+
+	private handleUncleanExit() {
+		if (this.runIfNoDevices) {
+			this.runIfNoDevices();
+		} else if (!this.hasShownTerminatedError) {
+			this.showTerminatedError(this.hasStarted ? "has terminated" : "failed to start");
+		}
+	}
+
+	protected notifyRequestAfterExit() {
+		this.showTerminatedError("is not running");
+	}
+
+	private lastShownTerminatedError: number | undefined;
+	private readonly noRepeatTerminatedErrorThresholdMs = tenMinutesInMs;
+	private showTerminatedError(message: string) {
+		// Don't show this notification if we've shown it recently.
+		if (this.lastShownTerminatedError && Date.now() - this.lastShownTerminatedError < this.noRepeatTerminatedErrorThresholdMs)
+			return;
+
+		this.lastShownTerminatedError = Date.now();
+
+		// This flag is set here, but checked in handleUncleanExit because explicit calls
+		// here can override hasShownTerminationError, for example to show the error when
+		// something tries to interact with the API (`notifyRequestAfterExit`).
+		this.hasShownTerminatedError = true;
+		void promptToReloadExtension(`The Flutter Daemon ${message}.`, undefined, true, config.flutterDaemonLogFile);
 	}
 
 	public dispose() {
 		this.isShuttingDown = true;
+
+		if (this.pingIntervalId) {
+			clearInterval(this.pingIntervalId);
+		}
+
 		super.dispose();
 	}
 
@@ -84,10 +156,9 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 		try {
 			super.sendMessage(json);
 		} catch (e) {
-			if (!this.hasShownTerminationError && !this.isShuttingDown) {
-				this.hasShownTerminationError = true;
-				// tslint:disable-next-line: no-floating-promises
-				promptToReloadExtension("The Flutter Daemon has terminated.", undefined, true);
+			if (!this.hasShownTerminatedError && !this.isShuttingDown) {
+				this.hasShownTerminatedError = true;
+				void promptToReloadExtension("The Flutter Daemon has terminated.", undefined, true, config.flutterDaemonLogFile);
 				throw e;
 			}
 		}
@@ -114,18 +185,18 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 		const matches = FlutterDaemon.outOfDateWarning.exec(message);
 		if (matches && matches.length === 2)
 			upgradeMessage = `Your installation of Flutter is ${matches[1]} days old.`;
-		else if (message.indexOf(FlutterDaemon.newVersionMessage) !== -1)
+		else if (message.includes(FlutterDaemon.newVersionMessage))
 			upgradeMessage = "A new version of Flutter is available";
 
 		if (upgradeMessage) {
 			if (await vs.window.showWarningMessage(upgradeMessage, "Upgrade Flutter"))
-				vs.commands.executeCommand("flutter.upgrade");
+				void vs.commands.executeCommand("flutter.upgrade");
 			return;
 		}
 
 		if (!this.hasShownStartupError && message.startsWith("Flutter requires")) {
 			this.logger.error(message, LogCategory.FlutterDaemon);
-			vs.window.showErrorMessage(message);
+			void vs.window.showErrorMessage(message);
 			this.hasShownStartupError = true;
 			return;
 		}
@@ -139,7 +210,7 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 				if (this.startupReporter) {
 					this.startupReporter.report({ message });
 				} else {
-					vs.window.withProgress({
+					void vs.window.withProgress({
 						location: ProgressLocation.Notification,
 						title: "Flutter Setup",
 					}, (progressReporter) => {
@@ -202,12 +273,16 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 
 	// Request methods.
 
+	public daemonVersion(): Thenable<string> {
+		return this.sendRequest("daemon.version");
+	}
+
 	public deviceEnable(): Thenable<UnknownResponse> {
 		return this.sendRequest("device.enable");
 	}
 
 	public getEmulators(): Thenable<f.FlutterEmulator[]> {
-		return this.sendRequest("emulator.getEmulators");
+		return this.withRecordedTimeout(this.sendRequest("emulator.getEmulators"));
 	}
 
 	public launchEmulator(emulatorId: string, coldBoot: boolean): Thenable<void> {
@@ -219,7 +294,7 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 	}
 
 	public getSupportedPlatforms(projectRoot: string): Thenable<f.SupportedPlatformsResponse> {
-		return this.sendRequest("daemon.getSupportedPlatforms", { projectRoot });
+		return this.withRecordedTimeout(this.sendRequest("daemon.getSupportedPlatforms", { projectRoot }));
 	}
 
 	public serveDevTools(): Thenable<f.ServeDevToolsResponse> {
@@ -227,7 +302,40 @@ export class FlutterDaemon extends StdIOService<UnknownNotification> implements 
 	}
 
 	public shutdown(): Thenable<void> {
-		return this.sendRequest("daemon.shutdown");
+		this.isShuttingDown = true;
+		return this.hasStarted && !this.hasShownTerminatedError ? this.sendRequest("daemon.shutdown") : new Promise<void>((resolve) => resolve());
+	}
+
+	private async withRecordedTimeout<T>(promise: Thenable<T>): Promise<T> {
+		// Don't use timeout unless we haven't shown the message before and we know
+		// we have fully started up (so we don't false trigger during slow startups
+		// caused by SDK upgrades, etc.).
+		const recordTimeouts = this.hasStarted && !this.hasLoggedDaemonTimeout && !this.isShuttingDown && !this.processExited;
+		if (!recordTimeouts)
+			return promise; // Short-cut creating the timer.
+
+		return new Promise<T>((resolve, reject) => {
+			// Set a timer to record if the request doesn't respond fast enough.
+			const timeoutTimer = setTimeout(() => {
+				const recordTimeouts = this.hasStarted && !this.hasLoggedDaemonTimeout && !this.isShuttingDown && !this.processExited;
+				if (recordTimeouts) {
+					this.analytics.logErrorFlutterDaemonTimeout();
+					this.hasLoggedDaemonTimeout = true;
+				}
+			}, twentySecondsInMs);
+
+			// eslint-disable-next-line @typescript-eslint/no-floating-promises
+			promise.then(
+				(result) => {
+					clearTimeout(timeoutTimer);
+					resolve(result);
+				},
+				(e) => {
+					clearTimeout(timeoutTimer);
+					reject(e);
+				},
+			);
+		});
 	}
 
 	// Subscription methods.

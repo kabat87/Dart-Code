@@ -1,13 +1,13 @@
 /* eslint-disable no-underscore-dangle */
 import * as path from "path";
 import * as vs from "vscode";
-import { CancellationToken, CompletionContext, CompletionItem, CompletionItemKind, CompletionItemProvider, CompletionList, CompletionTriggerKind, Disposable, MarkdownString, Position, Range, SnippetString, TextDocument } from "vscode";
+import { CancellationToken, CompletionContext, CompletionItem, CompletionItemKind, CompletionItemProvider, CompletionList, CompletionTriggerKind, Disposable, Position, Range, SnippetString, TextDocument } from "vscode";
 import * as as from "../../shared/analysis_server_types";
 import { IAmDisposable, Logger } from "../../shared/interfaces";
 import { disposeAll, flatMap } from "../../shared/utils";
 import { fsPath } from "../../shared/utils/fs";
 import { resolvedPromise } from "../../shared/utils/promises";
-import { cleanDartdoc } from "../../shared/vscode/extension_utils";
+import { cleanDartdoc, createMarkdownString } from "../../shared/vscode/extension_utils";
 import { DelayedCompletionItem, LazyCompletionItem } from "../../shared/vscode/interfaces";
 import { DasAnalyzerClient } from "../analysis/analyzer_das";
 import { hasOverlappingEdits } from "../commands/edit_das";
@@ -418,7 +418,7 @@ export class DartCompletionItemProvider implements CompletionItemProvider, IAmDi
 		// If element has parameters (METHOD/CONSTRUCTOR/FUNCTION), show its parameters.
 		if (suggestion.parameters && completionItemKind !== CompletionItemKind.Property && suggestion.kind !== "OVERRIDE"
 			// Don't ever show if there is already a paren! (#969).
-			&& label.indexOf("(") === -1
+			&& !label.includes("(")
 		) {
 			label += suggestion.parameters.length === 2 ? "()" : "(…)";
 			detail = suggestion.parameters;
@@ -501,6 +501,8 @@ export class DartCompletionItemProvider implements CompletionItemProvider, IAmDi
 		// If we have trailing commas (flutter) they look weird in the list, so trim the off (for display label only).
 		if (label.endsWith(","))
 			label = label.substr(0, label.length - 1).trim();
+		else
+			label = label.trim();
 
 		// If we didnt have a CompletionItemKind from our element, base it on the CompletionSuggestionKind.
 		// This covers things like Keywords that don't have elements.
@@ -512,7 +514,7 @@ export class DartCompletionItemProvider implements CompletionItemProvider, IAmDi
 		if (suggestion.isDeprecated)
 			completion.tags = [vs.CompletionItemTag.Deprecated];
 		completion.detail = detail;
-		completion._documentation = docs ? new MarkdownString(docs) : undefined;
+		completion._documentation = docs ? createMarkdownString(docs) : undefined;
 		completion.insertText = completionText;
 		completion.keepWhitespace = true;
 		completion.range = {
@@ -529,7 +531,7 @@ export class DartCompletionItemProvider implements CompletionItemProvider, IAmDi
 			completion.commitCharacters = this.getCommitCharacters(suggestion.kind);
 
 		const triggerCompletionsFor = ["import '';"];
-		if (triggerCompletionsFor.indexOf(label) !== -1)
+		if (triggerCompletionsFor.includes(label))
 			triggerCompletion = true;
 
 		// Handle folders in imports better.
@@ -686,7 +688,7 @@ export class DartCompletionItemProvider implements CompletionItemProvider, IAmDi
 
 		if (hasProblematicEdits) {
 			this.logger.error("Unable to insert imports because of overlapping edits from the server.");
-			vs.window.showErrorMessage(`Unable to insert imports because of overlapping edits from the server`);
+			void vs.window.showErrorMessage(`Unable to insert imports because of overlapping edits from the server`);
 			return undefined;
 		}
 

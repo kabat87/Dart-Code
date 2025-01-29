@@ -1,16 +1,17 @@
+import { DebugProtocol } from "@vscode/debugprotocol";
 import { strict as assert } from "assert";
 import * as path from "path";
 import { DebugAdapterExecutable, DebugAdapterServer, DebugAdapterTrackerFactory, DebugConfiguration, Uri } from "vscode";
-import { DebugProtocol } from "vscode-debugprotocol";
 import { dartVMPath, flutterPath, isWin, vmServiceListeningBannerPattern } from "../shared/constants";
 import { DartVsCodeLaunchArgs } from "../shared/debug/interfaces";
 import { DebuggerType, LogCategory, VmServiceExtension } from "../shared/enums";
 import { SpawnedProcess } from "../shared/interfaces";
 import { logProcess } from "../shared/logging";
+import { withTimeout } from "../shared/utils";
 import { faint } from "../shared/utils/colors";
 import { fsPath } from "../shared/utils/fs";
 import { DartDebugClient } from "./dart_debug_client";
-import { currentTestName, defer, delay, extApi, getLaunchConfiguration, logger, watchPromise, withTimeout } from "./helpers";
+import { currentTestName, defer, delay, extApi, getLaunchConfiguration, logger, watchPromise } from "./helpers";
 
 export const flutterTestDeviceId = process.env.FLUTTER_TEST_DEVICE_ID || "flutter-tester";
 export const flutterTestDeviceIsWeb = flutterTestDeviceId === "chrome" || flutterTestDeviceId === "web-server";
@@ -30,41 +31,59 @@ export async function startDebugger(dc: DartDebugClient, script?: Uri | string, 
 
 export function createDebugClient(debugType: DebuggerType) {
 	const descriptor = extApi.debugAdapterDescriptorFactory.descriptorForType(debugType);
-	const trackerFactory = extApi.debugLogger as DebugAdapterTrackerFactory;
+	const trackerFactories = extApi.trackerFactories as DebugAdapterTrackerFactory[];
 	const dc = descriptor instanceof DebugAdapterServer
-		? new DartDebugClient({ port: descriptor.port }, extApi.debugCommands, extApi.testCoordinator, trackerFactory)
+		? new DartDebugClient({ port: descriptor.port }, extApi.debugCommands, extApi.testCoordinator, trackerFactories, extApi.dartCapabilities)
 		: descriptor instanceof DebugAdapterExecutable
-			? new DartDebugClient({ runtime: descriptor.command, executable: descriptor.args[0], args: descriptor.args.slice(1) }, extApi.debugCommands, extApi.testCoordinator, trackerFactory)
+			? new DartDebugClient(
+				{
+					args: descriptor.args.slice(1),
+					executable: descriptor.args[0],
+					runtime: descriptor.command,
+				},
+				extApi.debugCommands,
+				extApi.testCoordinator,
+				trackerFactories,
+				extApi.dartCapabilities,
+			)
 			: undefined;
 	if (!dc)
 		throw Error(`Unknown debug descriptor type ${descriptor}`);
 
-	dc.defaultTimeout = 60000;
+	dc.defaultTimeout = 120000;
 	const thisDc = dc;
 	defer("Terminate and clean up debug client/adapter", async () => {
-		if (!dc.hasStarted) {
+		if (!thisDc.hasStarted) {
 			extApi.logger.info(`Skipping shutdown because it never started`);
 			return;
 		}
-		if (debugType === DebuggerType.DartTest) {
-			// The test runner doesn't quit on the first SIGINT, it prints a message that it's waiting for the
-			// test to finish and then runs cleanup. Since we don't care about this for these tests, we just send
-			// a second request and that'll cause it to quit immediately.
-			return withTimeout(
-				Promise.all([
-					thisDc.terminateRequest().catch((e) => logger.error(e)),
-					delay(500).then(() => thisDc.stop()).catch((e) => logger.error(e)),
-				]),
-				"Timed out disconnecting - this is often normal because we have to try to quit twice for the test runner",
-				60,
-			);
-		} else {
-			extApi.logger.info(`Calling dc.stop()...`);
-			await thisDc.stop();
-			extApi.logger.info(`Done calling dc.stop()`);
+		if (!thisDc.hasTerminated) {
+			// Wait for a terminated event with a timeout.
+			const terminatedEvent = new Promise((resolve) => thisDc.on("terminated", resolve));
+			try {
+				thisDc.terminateRequest().catch((e) => logger.warn(e));
+				// Tests may require a second terminateRequest because they first print "waiting for test to finish...".
+				if (debugType === DebuggerType.DartTest || debugType === DebuggerType.FlutterTest || debugType === DebuggerType.WebTest) {
+					await Promise.race([delay(300), terminatedEvent]);
+					// If we still hasn't termianted, send the second.
+					if (!thisDc.hasTerminated) {
+						thisDc.terminateRequest().catch((e) => logger.warn(e));
+						await Promise.race([delay(300), terminatedEvent]);
+					}
+				}
+			} catch (e) {
+				logger.warn(e);
+			}
+			await withTimeout(terminatedEvent, "Timed out terminating and cleaning up!", 50);
+		}
+
+		try {
+			thisDc.stop().catch((e) => logger.warn(e));
+		} catch (e) {
+			logger.warn(e);
 		}
 	});
-	return dc;
+	return thisDc;
 }
 
 /// Waits for all the provided promises, but throws if the debugger terminates before they complete.
@@ -72,11 +91,7 @@ export function waitAllThrowIfTerminates(dc: DartDebugClient, ...promises: Array
 	let didCompleteSuccessfully = false;
 	return Promise.race([
 		new Promise<void>(async (resolve, reject) => {
-			await dc.waitForEvent("terminated", "waitAllThrowIfTerminates")
-				.catch(() => {
-					// Swallow errors, as we don't care if this times out, we're only using it
-					// to tell if we stopped by the time we hit the end of this test.
-				});
+			await dc.waitForEvent("terminated", "waitAllThrowIfTerminates", 180000);
 			// Wait a small amount to allow other awaited tasks to complete.
 			setTimeout(() => {
 				if (didCompleteSuccessfully) {
@@ -182,8 +197,6 @@ export function spawnDartProcessPaused(program: Uri, cwd: Uri, ...vmArgs: string
 		"--enable-vm-service=0",
 		"--pause_isolates_on_start=true",
 	];
-	if (extApi.dartCapabilities.supportsDisableDartDev && !extApi.dartCapabilities.hasDdsTimingFix)
-		debugArgs.push("--disable-dart-dev");
 	const allArgs = [
 		...debugArgs,
 		...vmArgs,
@@ -232,7 +245,7 @@ export class DartProcess {
 	public readonly vmServiceUri: Promise<string>;
 	public readonly exitCode: Promise<number | null>;
 	public get hasExited() { return this.exited; }
-	private exited: boolean = false;
+	private exited = false;
 
 	constructor(public readonly process: SpawnedProcess) {
 		this.vmServiceUri = new Promise((resolve, reject) => {
@@ -254,7 +267,8 @@ export async function killFlutterTester(): Promise<void> {
 	// not need to).
 	if (!extApi)
 		return;
-	return new Promise((resolve) => {
+
+	await new Promise<void>((resolve) => {
 		const proc = isWin
 			? extApi.safeToolSpawn(undefined, "taskkill", ["/IM", "flutter_tester.exe", "/F"])
 			: extApi.safeToolSpawn(undefined, "pkill", ["flutter_tester"]);
@@ -266,10 +280,25 @@ export async function killFlutterTester(): Promise<void> {
 			resolve();
 		});
 	});
+
+	if (!isWin) {
+		await new Promise<void>((resolve) => {
+			const proc2 = extApi.safeToolSpawn(undefined, "ps", ["-x"]);
+
+			proc2.stdout.setEncoding("utf8");
+			proc2.stdout.on("data", (data: Buffer | string) => logger.info(data.toString()));
+			proc2.stderr.setEncoding("utf8");
+			proc2.stderr.on("data", (data: Buffer | string) => logger.info(data.toString()));
+			proc2.on("error", (error) => logger.info(error?.message));
+			proc2.on("data", (data: Buffer | string) => logger.info(data.toString()));
+
+			proc2.on("exit", () => resolve());
+		});
+	}
 }
 
 export function isSdkFrame(frame: DebugProtocol.StackFrame) {
-	return !frame.source || frame.source.name && frame.source.name.startsWith("dart:");
+	return frame.source && frame.source.name && frame.source.name.startsWith("dart:");
 }
 
 export function isExternalPackage(frame: DebugProtocol.StackFrame) {

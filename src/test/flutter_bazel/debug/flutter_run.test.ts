@@ -1,10 +1,11 @@
+import { strict as assert } from "assert";
 import * as path from "path";
 import { isWin } from "../../../shared/constants";
 import { DebuggerType } from "../../../shared/enums";
 import { fsPath } from "../../../shared/utils/fs";
 import { DartDebugClient } from "../../dart_debug_client";
-import { createDebugClient, flutterTestDeviceIsWeb, killFlutterTester, startDebugger, waitAllThrowIfTerminates } from "../../debug_helpers";
-import { activate, ensureHasRunRecently, extApi, flutterBazelHelloWorldMainFile, flutterBazelRoot, prepareHasRunFile, watchPromise } from "../../helpers";
+import { createDebugClient, flutterTestDeviceId, flutterTestDeviceIsWeb, killFlutterTester, startDebugger, waitAllThrowIfTerminates } from "../../debug_helpers";
+import { activate, ensureHasRunRecently, extApi, flutterBazelHelloWorldFolder, flutterBazelHelloWorldMainFile, flutterBazelRoot, getResolvedDebugConfiguration, prepareHasRunFile, watchPromise } from "../../helpers";
 
 const deviceName = flutterTestDeviceIsWeb ? "Chrome" : "Flutter test device";
 
@@ -31,12 +32,41 @@ describe(`flutter run debugger`, () => {
 
 	afterEach(() => watchPromise("Killing flutter_tester processes", killFlutterTester()));
 
+	describe("resolves the correct debug config", () => {
+		it("for a simple script", async () => {
+			const resolvedConfig = await getResolvedDebugConfiguration({
+				deviceId: flutterTestDeviceId,
+				program: "//foo/bar",
+				suppressPrompts: true, // Don't prompt if there are errors because we can't resolve package:flutter.
+			});
+
+			assert.ok(resolvedConfig);
+			assert.equal(resolvedConfig.program, "//foo/bar");
+			// Expect the bazel root, not the project folder, because this is the common ancestor of
+			// the two workspace folders we have open.
+			assert.equal(resolvedConfig.cwd, fsPath(flutterBazelRoot));
+		});
+
+		it("for a relative program in a workspaceFolder", async () => {
+			const resolvedConfig = await getResolvedDebugConfiguration({
+				deviceId: flutterTestDeviceId,
+				program: "lib/main.dart",
+				suppressPrompts: true, // Don't prompt if there are errors because we can't resolve package:flutter.
+			});
+
+			assert.ok(resolvedConfig);
+			assert.equal(resolvedConfig.program, fsPath(flutterBazelHelloWorldMainFile));
+			assert.equal(resolvedConfig.cwd, fsPath(flutterBazelHelloWorldFolder));
+		});
+	});
+
 	it("runs using custom script", async () => {
 		const root = fsPath(flutterBazelRoot);
 		const hasRunFile = prepareHasRunFile(root, "flutter_run");
 
-		const config = await startDebugger(dc, flutterBazelHelloWorldMainFile, { suppressPromptOnErrors: true });
+		const config = await startDebugger(dc, flutterBazelHelloWorldMainFile, { suppressPrompts: true });
 		await waitAllThrowIfTerminates(dc,
+			dc.debuggerReady(),
 			dc.assertOutputContains("console", `Launching lib${path.sep}main.dart on ${deviceName} in debug mode...\n`),
 			dc.configurationSequence(),
 			dc.launch(config),

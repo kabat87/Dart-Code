@@ -1,25 +1,31 @@
 import * as path from "path";
 import * as stream from "stream";
-import { CancellationToken, CodeActionContext, CompletionContext, CompletionItem, CompletionItemKind, MarkdownString, MarkedString, Position, Range, TextDocument, Uri, window, workspace } from "vscode";
-import { ConfigurationParams, ConfigurationRequest, ExecuteCommandSignature, HandleWorkDoneProgressSignature, LanguageClientOptions, Location, Middleware, ProgressToken, ProvideCodeActionsSignature, ProvideCompletionItemsSignature, ProvideHoverSignature, RAL, ResolveCompletionItemSignature, TextDocumentPositionParams, WorkDoneProgressBegin, WorkDoneProgressEnd, WorkDoneProgressReport, WorkspaceEdit } from "vscode-languageclient";
-import { ProvideDocumentColorsSignature } from "vscode-languageclient/lib/common/colorProvider";
+import * as vs from "vscode";
+import * as ls from "vscode-languageclient";
 import { LanguageClient, StreamInfo, StreamMessageReader, StreamMessageWriter } from "vscode-languageclient/node";
-import { AnalyzerStatusNotification, CompleteStatementRequest, DiagnosticServerRequest, ReanalyzeRequest, SuperRequest } from "../../shared/analysis/lsp/custom_protocol";
+import { AnalyzerStatusNotification, AugmentationRequest, AugmentedRequest, CompleteStatementRequest, ConnectToDtdRequest, DiagnosticServerRequest, ImportsRequest, OpenUriNotification, ReanalyzeRequest, SuperRequest } from "../../shared/analysis/lsp/custom_protocol";
 import { Analyzer } from "../../shared/analyzer";
 import { DartCapabilities } from "../../shared/capabilities/dart";
 import { dartVMPath, validClassNameRegex, validMethodNameRegex } from "../../shared/constants";
 import { LogCategory } from "../../shared/enums";
 import { DartSdks, Logger } from "../../shared/interfaces";
 import { CategoryLogger } from "../../shared/logging";
-import { PromiseCompleter } from "../../shared/utils";
+import { DartToolingDaemon } from "../../shared/services/tooling_daemon";
 import { fsPath } from "../../shared/utils/fs";
-import { cleanDartdoc } from "../../shared/vscode/extension_utils";
+import { ANALYSIS_FILTERS } from "../../shared/vscode/constants";
+import { DartTextDocumentContentProviderFeature } from "../../shared/vscode/dart_text_document_content_provider";
+import { cleanDartdoc, createMarkdownString } from "../../shared/vscode/extension_utils";
+import { InteractiveRefactors } from "../../shared/vscode/interactive_refactors";
+import { CommonCapabilitiesFeature } from "../../shared/vscode/lsp_common_capabilities";
+import { LspUriConverters } from "../../shared/vscode/lsp_uri_converters";
+import { getLanguageStatusItem } from "../../shared/vscode/status_bar";
+import { envUtils, hostKind, isRunningLocally } from "../../shared/vscode/utils";
 import { WorkspaceContext } from "../../shared/workspace";
 import { config } from "../config";
-import { DART_MODE } from "../extension";
-import { IgnoreLintCodeActionProvider } from "../providers/ignore_lint_code_action_provider";
+import { checkForLargeNumberOfTodos } from "../user_prompts";
 import { reportAnalyzerTerminatedWithError } from "../utils/misc";
 import { safeToolSpawn } from "../utils/processes";
+import { getDiagnosticErrorCode } from "../utils/vscode/diagnostics";
 import { getAnalyzerArgs } from "./analyzer";
 import { SnippetTextEditFeature } from "./analyzer_lsp_snippet_text_edits";
 import { LspFileTracker } from "./file_tracker_lsp";
@@ -27,44 +33,91 @@ import { LspFileTracker } from "./file_tracker_lsp";
 export class LspAnalyzer extends Analyzer {
 	public readonly client: LanguageClient;
 	public readonly fileTracker: LspFileTracker;
-	public readonly snippetTextEdits: SnippetTextEditFeature;
-	public readonly vmServicePort: number | undefined;
+	private readonly snippetTextEdits: SnippetTextEditFeature;
+	public readonly refactors: InteractiveRefactors;
+	public readonly dartTextDocumentContentProvider: DartTextDocumentContentProviderFeature | undefined;
+	private readonly statusItem = getLanguageStatusItem("dart.analysisServer", ANALYSIS_FILTERS);
 
-	protected readonly onDocumentColorsRequestedCompleter = new PromiseCompleter<void>();
-	public readonly onDocumentColorsRequested = this.onDocumentColorsRequestedCompleter.promise;
-
-	constructor(logger: Logger, sdks: DartSdks, private readonly dartCapabilities: DartCapabilities, wsContext: WorkspaceContext) {
+	constructor(logger: Logger, sdks: DartSdks, private readonly dartCapabilities: DartCapabilities, wsContext: WorkspaceContext, private readonly dtd: DartToolingDaemon | undefined) {
 		super(new CategoryLogger(logger, LogCategory.Analyzer));
-		this.vmServicePort = config.analyzerVmServicePort;
+
+		this.setupStatusItem();
+
 		this.snippetTextEdits = new SnippetTextEditFeature(dartCapabilities);
-		this.client = createClient(this.logger, sdks, dartCapabilities, wsContext, this.buildMiddleware(), this.vmServicePort);
+		this.refactors = new InteractiveRefactors(logger, dartCapabilities);
+		this.client = this.createClient(this.logger, sdks, dartCapabilities, wsContext, this.buildMiddleware());
+		if (this.dartCapabilities.supportsMacroGeneratedFiles) {
+			// Just because it's enabled doesn't mean the server actually supports it.
+			this.dartTextDocumentContentProvider = new DartTextDocumentContentProviderFeature(logger, this.client, dartCapabilities);
+			this.client.registerFeature(this.dartTextDocumentContentProvider.feature);
+			this.disposables.push(this.dartTextDocumentContentProvider);
+		}
 		this.fileTracker = new LspFileTracker(logger, this.client, wsContext);
+		this.client.registerFeature(new CommonCapabilitiesFeature().feature);
 		this.client.registerFeature(this.snippetTextEdits.feature);
-		this.disposables.push(this.client.start());
+		this.client.registerFeature(this.refactors.feature);
+		this.disposables.push({ dispose: () => this.client.stop() });
 		this.disposables.push(this.fileTracker);
 		this.disposables.push(this.snippetTextEdits);
+		this.disposables.push(this.refactors);
 
-		// tslint:disable-next-line: no-floating-promises
-		this.client.onReady().then(() => {
+		void this.client.start().then(() => {
+			this.statusItem.text = "Dart Analysis Server";
 			// Reminder: These onNotification calls only hold ONE handler!
 			// https://github.com/microsoft/vscode-languageserver-node/issues/174
 			// TODO: Remove this once Dart/Flutter stable LSP servers are using $/progress.
 			this.client.onNotification(AnalyzerStatusNotification.type, (params) => {
 				this.onAnalysisStatusChangeEmitter.fire({ isAnalyzing: params.isAnalyzing });
 			});
+			this.client.onNotification(OpenUriNotification.type, (params) => {
+				const uri = vs.Uri.parse(params.uri);
+				switch (uri.scheme) {
+					case "file":
+						void vs.window.showTextDocument(uri);
+						break;
+					case "http":
+					case "https":
+						void envUtils.openInBrowser(uri.toString());
+						break;
+					default:
+						console.error(`Unable to open URI ${uri} as requested by LSP server. Unknown scheme.`);
+
+				}
+			});
 			this.onReadyCompleter.resolve();
+
+			// If we have DTD, send it to the server.
+			if (config.previewDtdLspIntegration && dtd !== null) {
+				// TODO(dantup): Switch from a preview flag to using a server-provided capability. That capability is not
+				//  yet available because we want to do more testing behind the preview flag first.
+				const registerExperimentalHandlers = !!config.experimentalDtdHandlers;
+				dtd?.dtdUri
+					.then((uri) => uri ? this.client.sendRequest(ConnectToDtdRequest.type, { uri, registerExperimentalHandlers }) : undefined)
+					.catch((e) => this.logger.error(`Failed to call connectToDtd. Does this version of the SDK support it? ${e}`));
+			}
 		});
 	}
 
-	private buildMiddleware(): Middleware {
+	private setupStatusItem() {
+		const statusItem = this.statusItem;
+		statusItem.text = "Dart Language Server Starting…";
+
+		statusItem.command = {
+			command: "dart.restartAnalysisServer",
+			title: "restart",
+			tooltip: "Restarts the Dart Language Server",
+		};
+	}
+
+	private buildMiddleware(): ls.Middleware {
 		// Why need this 🤷‍♂️?
 		function isLanguageValuePair(input: any): input is { language: string; value: string } {
 			return "language" in input && typeof input.language === "string" && "value" in input && typeof input.value === "string";
 		}
 
-		function cleanDocString<T extends MarkedString | MarkdownString | string>(input: T): T {
-			if (input instanceof MarkdownString)
-				return new MarkdownString(cleanDartdoc(input.value)) as T;
+		function cleanDocString<T extends vs.MarkedString | vs.MarkdownString | string>(input: T): T {
+			if (input instanceof vs.MarkdownString)
+				return createMarkdownString(cleanDartdoc(input.value)) as T;
 			else if (typeof input === "string")
 				return cleanDartdoc(input) as T;
 			else if (isLanguageValuePair(input))
@@ -76,7 +129,7 @@ export class LspAnalyzer extends Analyzer {
 		/// Whether or not to trigger completion again when completing on this item. This is used
 		/// for convenience, eg. when completing the "import '';" snippet people expect completion
 		/// to immediately reopen.
-		function shouldTriggerCompletionAgain(item: CompletionItem): boolean {
+		function shouldTriggerCompletionAgain(item: vs.CompletionItem): boolean {
 			const label = typeof item.label === "string" ? item.label : item.label.label;
 
 			if (label === "import '';")
@@ -86,7 +139,7 @@ export class LspAnalyzer extends Analyzer {
 			if (label.trimRight().endsWith(":"))
 				return true;
 
-			if (item.kind === CompletionItemKind.Folder) {
+			if (item.kind === vs.CompletionItemKind.Folder) {
 				const label = typeof item.label === "string" ? item.label : item.label.label;
 				return label.endsWith("/");
 			}
@@ -99,7 +152,7 @@ export class LspAnalyzer extends Analyzer {
 		/// Whether or not to trigger signature help on this item. This is used because if a user doesn't
 		/// type the ( manually (but it's inserted as part of the completion) then the parameter hints do
 		/// not show up.
-		function shouldTriggerSignatureHelp(item: CompletionItem): boolean {
+		function shouldTriggerSignatureHelp(item: vs.CompletionItem): boolean {
 			let insertText: string | undefined;
 			if (item.insertText) {
 				if (typeof item.insertText === "string")
@@ -116,8 +169,8 @@ export class LspAnalyzer extends Analyzer {
 			return false;
 		}
 
+		const refactors = this.refactors;
 		const snippetTextEdits = this.snippetTextEdits;
-		const ignoreActionProvider = new IgnoreLintCodeActionProvider(DART_MODE);
 
 		const startTimer = (message: string): ({ end: (message: string | undefined) => void }) => {
 			const startTime = process.hrtime();
@@ -130,22 +183,43 @@ export class LspAnalyzer extends Analyzer {
 			};
 		};
 
+		let isFirstAnalysisCompletion = true;
 		return {
-			handleWorkDoneProgress: (token: ProgressToken, params: WorkDoneProgressBegin | WorkDoneProgressReport | WorkDoneProgressEnd, next: HandleWorkDoneProgressSignature) => {
-				if (params.kind === "begin")
-					this.onAnalysisStatusChangeEmitter.fire({ isAnalyzing: true, suppressProgress: true });
-				else if (params.kind === "end")
-					this.onAnalysisStatusChangeEmitter.fire({ isAnalyzing: false, suppressProgress: true });
+			handleWorkDoneProgress: (token: ls.ProgressToken, params: ls.WorkDoneProgressBegin | ls.WorkDoneProgressReport | ls.WorkDoneProgressEnd, next: ls.HandleWorkDoneProgressSignature) => {
+				// TODO: Handle nested/overlapped progresses.
+				if (token === "ANALYZING") {
+					if (params.kind === "begin") {
+						this.statusItem.busy = true;
+						this.onAnalysisStatusChangeEmitter.fire({ isAnalyzing: true, suppressProgress: true });
+					} else if (params.kind === "end") {
+						if (isFirstAnalysisCompletion) {
+							isFirstAnalysisCompletion = false;
+							void checkForLargeNumberOfTodos(this.client.diagnostics);
+						}
+						this.statusItem.busy = false;
+						this.onAnalysisStatusChangeEmitter.fire({ isAnalyzing: false, suppressProgress: true });
+					}
+				}
 
 				next(token, params);
 			},
 
-			provideCompletionItem: async (document: TextDocument, position: Position, context: CompletionContext, token: CancellationToken, next: ProvideCompletionItemsSignature) => {
+			handleDiagnostics(uri, diagnostics, next) {
+				for (const diagnostic of diagnostics) {
+					const errorCode = getDiagnosticErrorCode(diagnostic);
+					if (errorCode === "file_names") {
+						diagnostic.message += "\nYou may need to close the file and restart VS Code after renaming a file by only casing.";
+					}
+				}
+				next(uri, diagnostics);
+			},
+
+			provideCompletionItem: async (document: vs.TextDocument, position: vs.Position, context: vs.CompletionContext, token: vs.CancellationToken, next: ls.ProvideCompletionItemsSignature) => {
 				const range = document.getWordRangeAtPosition(position);
 				const prefix = range ? document.getText(range) : undefined;
 				const timer = startTimer(`Completion: ${prefix ?? ""}`);
 				const results = await next(document, position, context, token);
-				let items: CompletionItem[];
+				let items: vs.CompletionItem[];
 				let isIncomplete = false;
 
 				// Handle either a CompletionItem[] or CompletionList.
@@ -155,15 +229,19 @@ export class LspAnalyzer extends Analyzer {
 					items = results.items;
 					isIncomplete = results.isIncomplete ?? false;
 				} else {
-					items = results as CompletionItem[];
+					items = results as vs.CompletionItem[];
 				}
 				timer.end(`${items.length} results ${isIncomplete ? "(incomplete)" : ""} ${token.isCancellationRequested ? "(cancelled)" : ""}`);
 
 				if (!items.length)
 					return;
 
-				const parameterHintsEnabled = !!workspace.getConfiguration("editor").get("parameterHints.enabled");
+				const parameterHintsEnabled = !!vs.workspace.getConfiguration("editor").get("parameterHints.enabled");
 				for (const item of items) {
+					if (!item || !item.label) {
+						console.warn(`Got completion item with no label: ${JSON.stringify(item)}\n\nItem count: ${items.length}\nDocument: ${document.uri}\nPosition: ${position.line}:${position.character}`);
+					}
+
 					if (shouldTriggerCompletionAgain(item)) {
 						item.command = {
 							command: "editor.action.triggerSuggest",
@@ -180,56 +258,76 @@ export class LspAnalyzer extends Analyzer {
 				return results;
 			},
 
-			resolveCompletionItem: (item: CompletionItem, token: CancellationToken, next: ResolveCompletionItemSignature) => {
+			async provideInlayHints(document: vs.TextDocument, viewPort: vs.Range, token: vs.CancellationToken, next: ls.ProvideInlayHintsSignature) {
+				const hints = await next(document, viewPort, token);
+				if (hints) {
+					for (const hint of hints) {
+						const pos = hint.position;
+						let isValid = pos.character >= 0;
+
+						const labelParts = Array.isArray(hint.label) ? hint.label : [];
+						for (const labelPart of labelParts) {
+							if (labelPart.location && (labelPart.location.range.start.character < 0 || labelPart.location.range.end.character < 0))
+								isValid = false;
+						}
+
+						if (!isValid)
+							console.warn(`Got invalid InlayHint from server: ${document.uri}, ${viewPort.start.line}:${viewPort.start.character}-${viewPort.end.line}:${viewPort.end.character} ${JSON.stringify(hint)}`);
+					}
+				}
+
+				return hints;
+			},
+
+			resolveCompletionItem: (item: vs.CompletionItem, token: vs.CancellationToken, next: ls.ResolveCompletionItemSignature) => {
 				if (item.documentation)
 					item.documentation = cleanDocString(item.documentation);
 				return next(item, token);
 			},
 
-			provideHover: async (document: TextDocument, position: Position, token: CancellationToken, next: ProvideHoverSignature) => {
+			provideHover: async (document: vs.TextDocument, position: vs.Position, token: vs.CancellationToken, next: ls.ProvideHoverSignature) => {
 				const item = await next(document, position, token);
 				if (item?.contents)
 					item.contents = item.contents.map((s) => cleanDocString(s));
 				return item;
 			},
 
-			provideDocumentColors: (document: TextDocument, token: CancellationToken, next: ProvideDocumentColorsSignature) => {
-				this.onDocumentColorsRequestedCompleter.resolve();
-				return next(document, token);
-			},
-
-			async provideCodeActions(document: TextDocument, range: Range, context: CodeActionContext, token: CancellationToken, next: ProvideCodeActionsSignature) {
+			async provideCodeActions(document: vs.TextDocument, range: vs.Range, context: vs.CodeActionContext, token: vs.CancellationToken, next: ls.ProvideCodeActionsSignature) {
 				const documentVersion = document.version;
-				let res = await next(document, range, context, token) || [];
+				const res = await next(document, range, context, token) || [];
 
 				snippetTextEdits.rewriteSnippetTextEditsToCommands(documentVersion, res);
-
-				const hasExistingIgnoreActions = res.find((r) => r.title.startsWith("Ignore "));
-				if (!hasExistingIgnoreActions) {
-					const ignoreActions = ignoreActionProvider.provideCodeActions(document, range, context, token);
-					if (ignoreActions)
-						res = res.concat(ignoreActions);
-				}
+				refactors.rewriteCommands(res);
 
 				return res;
 			},
 
-			executeCommand: async (command: string, args: any[], next: ExecuteCommandSignature) => {
-				if (command === "refactor.perform") {
-					const expectedCount = 6;
-					if (args && args.length === expectedCount) {
+			executeCommand: async (command: string, args: any[], next: ls.ExecuteCommandSignature) => {
+				const validateCommand = command === "refactor.perform"
+					? "refactor.validate"
+					: command === "dart.refactor.perform"
+						? "dart.refactor.validate"
+						: undefined;
+				if (validateCommand) {
+					// Handle both the old way (6 args as a list) and the new way (a single arg that's a map).
+					const mapArgsIndex = 0;
+					const listArgsKindIndex = 0;
+					const listArgsOptionsIndex = 5;
+					const isValidListArgs = args.length === 6;
+					const isValidMapsArgs = args.length === 1 && args[mapArgsIndex]?.path !== undefined;
+					if (args && (isValidListArgs || isValidMapsArgs)) {
 						const refactorFailedErrorCode = -32011;
-						const refactorKind = args[0];
-						const optionsIndex = 5;
+						const mapArgs = args[mapArgsIndex];
+						const refactorKind = isValidListArgs ? args[listArgsKindIndex] : mapArgs.kind;
 						// Intercept EXTRACT_METHOD and EXTRACT_WIDGET to prompt the user for a name, but first call the validation
 						// so we don't ask for a name if it will fail for a reason like a closure with an argument.
 						const willPrompt = refactorKind === "EXTRACT_METHOD" || refactorKind === "EXTRACT_WIDGET";
 						if (willPrompt) {
 							if (this.dartCapabilities.supportsRefactorValidate) {
 								try {
-									const validateResult = await next("refactor.validate", args);
+									const validateResult = await next(validateCommand, args);
 									if (validateResult.valid === false) {
-										window.showErrorMessage(validateResult.message as string);
+										void vs.window.showErrorMessage(validateResult.message as string);
 										return;
 									}
 								} catch (e) {
@@ -241,25 +339,30 @@ export class LspAnalyzer extends Analyzer {
 							let name: string | undefined;
 							switch (refactorKind) {
 								case "EXTRACT_METHOD":
-									name = await window.showInputBox({
+									name = await vs.window.showInputBox({
 										prompt: "Enter a name for the method",
 										validateInput: (s) => validMethodNameRegex.test(s) ? undefined : "Enter a valid method name",
 										value: "newMethod",
 									});
 									if (!name)
 										return;
-									args[optionsIndex] = Object.assign({}, args[optionsIndex], { name });
 									break;
 								case "EXTRACT_WIDGET":
-									name = await window.showInputBox({
+									name = await vs.window.showInputBox({
 										prompt: "Enter a name for the widget",
 										validateInput: (s) => validClassNameRegex.test(s) ? undefined : "Enter a valid widget name",
 										value: "NewWidget",
 									});
 									if (!name)
 										return;
-									args[optionsIndex] = Object.assign({}, args[optionsIndex], { name });
 									break;
+							}
+
+							if (name) {
+								if (isValidListArgs)
+									args[listArgsOptionsIndex] = Object.assign({}, args[listArgsOptionsIndex], { name });
+								else
+									args[0].options = Object.assign({}, args[0].options, { name });
 							}
 						}
 
@@ -270,7 +373,7 @@ export class LspAnalyzer extends Analyzer {
 							return await next(command, args);
 						} catch (e: any) {
 							if (e?.code === refactorFailedErrorCode) {
-								window.showErrorMessage(e.message as string);
+								void vs.window.showErrorMessage(e.message as string);
 								return;
 							} else {
 								throw e;
@@ -282,13 +385,28 @@ export class LspAnalyzer extends Analyzer {
 			},
 
 			workspace: {
-				configuration: async (params: ConfigurationParams, token: CancellationToken, next: ConfigurationRequest.HandlerSignature) => {
+				configuration: async (params: ls.ConfigurationParams, token: vs.CancellationToken, next: ls.ConfigurationRequest.HandlerSignature) => {
 					const results = await next(params, token);
 
-					// Replace any instance of enableSnippets with the value of enableServerSnippets.
 					if (Array.isArray(results)) {
 						for (const result of results) {
+							// Replace any instance of enableSnippets with the value of enableServerSnippets.
 							result.enableSnippets = config.enableServerSnippets && this.dartCapabilities.supportsServerSnippets;
+
+							// Flatten showTodos to a boolean if array not supported.
+							if (Array.isArray(result.showTodos) && !this.dartCapabilities.supportsShowTodoArray) {
+								result.showTodos = result.showTodos.length !== 0;
+							}
+
+							// Set default documentation and maxCompletionItems based on whether we're running locally or not.
+							// When running locally, payload size is less of an issue so we include full docs and a large list.
+							if (isRunningLocally) {
+								result.maxCompletionItems = result.maxCompletionItems ?? 100000;
+								result.documentation = result.documentation ?? "full";
+							} else {
+								result.maxCompletionItems = result.maxCompletionItems ?? 1000;
+								result.documentation = result.documentation ?? "none";
+							}
 						}
 					}
 
@@ -306,90 +424,200 @@ export class LspAnalyzer extends Analyzer {
 		try {
 			return await this.client.sendRequest(ReanalyzeRequest.type);
 		} catch (e) {
-			window.showErrorMessage("Reanalyze is not supported by this version of the Dart SDK's LSP server.");
+			void vs.window.showErrorMessage("Reanalyze is not supported by this version of the Dart SDK's LSP server.");
 		}
 	}
 
-	public async getSuper(params: TextDocumentPositionParams): Promise<Location | null> {
+	public async getSuper(params: ls.TextDocumentPositionParams): Promise<ls.Location | null> {
 		return this.client.sendRequest(
 			SuperRequest.type,
 			params,
 		);
 	}
 
-	public async completeStatement(params: TextDocumentPositionParams): Promise<WorkspaceEdit | null> {
+	public async getImports(params: ls.TextDocumentPositionParams): Promise<ls.Location[] | null> {
+		return this.client.sendRequest(
+			ImportsRequest.type,
+			params,
+		);
+	}
+
+	public async getAugmented(params: ls.TextDocumentPositionParams): Promise<ls.Location | null> {
+		return this.client.sendRequest(
+			AugmentedRequest.type,
+			params,
+		);
+	}
+
+	public async getAugmentation(params: ls.TextDocumentPositionParams): Promise<ls.Location | null> {
+		return this.client.sendRequest(
+			AugmentationRequest.type,
+			params,
+		);
+	}
+
+	public async completeStatement(params: ls.TextDocumentPositionParams): Promise<ls.WorkspaceEdit | null> {
 		return this.client.sendRequest(
 			CompleteStatementRequest.type,
 			params,
 		);
 	}
-}
 
-function createClient(logger: Logger, sdks: DartSdks, dartCapabilities: DartCapabilities, wsContext: WorkspaceContext, middleware: Middleware, vmServicePort: number | undefined): LanguageClient {
-	const clientOptions: LanguageClientOptions = {
-		initializationOptions: {
-			closingLabels: config.closingLabels,
-			flutterOutline: wsContext.hasAnyFlutterProjects,
-			onlyAnalyzeProjectsWithOpenFiles: config.onlyAnalyzeProjectsWithOpenFiles,
-			outline: true,
-			suggestFromUnimportedLibraries: config.autoImportCompletions,
-		},
-		middleware,
-		outputChannelName: "LSP",
-		uriConverters: {
-			code2Protocol: (uri) => Uri.file(fsPath(uri, { useRealCasing: !!config.normalizeFileCasing })).toString(),
-			protocol2Code: (file) => Uri.parse(file),
-		},
-	};
+	private createClient(logger: Logger, sdks: DartSdks, dartCapabilities: DartCapabilities, wsContext: WorkspaceContext, middleware: ls.Middleware): LanguageClient {
+		const converters = new LspUriConverters(!!config.normalizeFileCasing);
+		const clientOptions: ls.LanguageClientOptions = {
+			initializationOptions: {
+				allowOpenUri: true,
+				appHost: vs.env.appHost,
+				closingLabels: config.closingLabels,
+				completionBudgetMilliseconds: config.completionBudgetMilliseconds,
+				flutterOutline: wsContext.hasAnyFlutterProjects,
+				hostKind,
+				onlyAnalyzeProjectsWithOpenFiles: config.onlyAnalyzeProjectsWithOpenFiles,
+				outline: true,
+				// For legacy SDKs, removed from server in https://dart-review.googlesource.com/c/sdk/+/349742
+				// Can be removed in future when the SDKs that needed the flag is a small enough portion that
+				// it's ok for them to not get the surveys.
+				previewSurveys: true,
+				remoteName: vs.env.remoteName,
+				suggestFromUnimportedLibraries: config.autoImportCompletions,
+				useInEditorDartFixPrompt: true,
+			},
+			markdown: {
+				supportHtml: true,
+			},
+			middleware,
+			outputChannelName: "LSP",
+			revealOutputChannelOn: ls.RevealOutputChannelOn.Never,
+			uriConverters: {
+				// Don't just use "converters" here because LSP doesn't bind "this".
+				code2Protocol: (uri) => converters.code2Protocol(uri),
+				protocol2Code: (file) => converters.protocol2Code(file),
+			},
+		};
 
-	const client = new LanguageClient(
-		"dartAnalysisLSP",
-		"Dart Analysis Server",
-		async () => {
-			const streamInfo = await spawnServer(logger, sdks, dartCapabilities, vmServicePort);
-			const jsonEncoder = RAL().applicationJson.encoder;
+		const client = new LanguageClient(
+			"dartAnalysisLSP",
+			"Dart Analysis Server",
+			async () => {
+				const streamInfo = await this.spawnServer(logger, sdks, dartCapabilities);
+				const jsonEncoder = ls.RAL().applicationJson.encoder;
 
-			return {
-				detached: streamInfo.detached,
-				reader: new StreamMessageReader(streamInfo.reader),
-				writer: new StreamMessageWriter(streamInfo.writer, {
-					contentTypeEncoder: {
-						encode: (msg, options) => {
-							(msg as any).clientRequestTime = Date.now();
-							return jsonEncoder.encode(msg, options);
+				return {
+					detached: streamInfo.detached,
+					reader: new StreamMessageReader(streamInfo.reader),
+					writer: new StreamMessageWriter(streamInfo.writer, {
+						contentTypeEncoder: {
+							encode: (msg, options) => {
+								(msg as any).clientRequestTime = Date.now();
+								return jsonEncoder.encode(msg, options);
+							},
+							name: "withTiming",
 						},
-						name: "withTiming",
-					},
-				}),
-			};
-		},
-		clientOptions,
-	);
+					}),
+				};
+			},
+			clientOptions,
+		);
 
-	return client;
-}
+		// HACK: Override the asCodeActionResult result to use our own custom asWorkspaceEdit so we can carry
+		//       insertTextFormat from the protocol through to the middleware to handle snippets.
+		//       This can be removed when we have a better way to do this.
+		//       https://github.com/microsoft/vscode-languageserver-node/issues/1000
+		const p2c = (client as any)._p2c; // eslint-disable-line no-underscore-dangle
+		const originalAsWorkspaceEdit = p2c.asWorkspaceEdit as Function; // eslint-disable-line @typescript-eslint/ban-types
+		const originalAsCodeAction = p2c.asCodeAction as Function; // eslint-disable-line @typescript-eslint/ban-types
 
-function spawnServer(logger: Logger, sdks: DartSdks, dartCapabilities: DartCapabilities, vmServicePort: number | undefined): Promise<StreamInfo> {
-	// TODO: Replace with constructing an Analyzer that passes LSP flag (but still reads config
-	// from paths etc) and provide it's process.
-	const vmPath = path.join(sdks.dart, dartVMPath);
-	const args = getAnalyzerArgs(logger, sdks, dartCapabilities, true, vmServicePort);
+		async function asWorkspaceEdit(item: ls.WorkspaceEdit | undefined | null, token?: vs.CancellationToken): Promise<vs.WorkspaceEdit | undefined> {
+			const result = (await originalAsWorkspaceEdit(item, token)) as vs.WorkspaceEdit | undefined;
+			if (!result) return;
 
-	logger.info(`Spawning ${vmPath} with args ${JSON.stringify(args)}`);
-	const process = safeToolSpawn(undefined, vmPath, args);
-	logger.info(`    PID: ${process.pid}`);
+			const snippetTypes = new Set<string>();
+			// Figure out which are Snippets.
+			for (const change of item?.documentChanges ?? []) {
+				if (ls.TextDocumentEdit.is(change)) {
+					const uri = vs.Uri.parse(change.textDocument.uri);
+					for (const edit of change.edits) {
+						if ((edit as any).insertTextFormat === ls.InsertTextFormat.Snippet) {
+							snippetTypes.add(`${fsPath(uri)}:${edit.newText}:${edit.range.start.line}:${edit.range.start.character}`);
+						}
+					}
+				}
+			}
+			for (const uriString of Object.keys(item?.changes ?? {})) {
+				const uri = vs.Uri.parse(uriString);
+				for (const edit of item!.changes![uriString]) {
+					if ((edit as any).insertTextFormat === ls.InsertTextFormat.Snippet) {
+						snippetTypes.add(`${fsPath(uri)}:${edit.newText}:${edit.range.start.line}:${edit.range.start.character}`);
+					}
+				}
+			}
 
-	const reader = process.stdout.pipe(new LoggingTransform(logger, "<=="));
-	const writer = new LoggingTransform(logger, "==>");
-	writer.pipe(process.stdin);
+			if (snippetTypes.size > 0) {
+				for (const changeset of result.entries()) {
+					const uri = changeset[0];
+					const changes = changeset[1];
+					for (const change of changes) {
+						if (snippetTypes.has(`${fsPath(uri)}:${change.newText}:${change.range.start.line}:${change.range.start.character}`)) {
+							(change as any).insertTextFormat = ls.InsertTextFormat.Snippet;
+						}
+					}
+				}
+			}
 
-	process.stderr.on("data", (data) => logger.error(data.toString()));
-	process.on("exit", (code, signal) => {
-		if (code)
-			reportAnalyzerTerminatedWithError();
-	});
+			return result;
+		}
 
-	return Promise.resolve({ reader, writer });
+		async function asCodeAction(item: ls.CodeAction | undefined | null, token?: vs.CancellationToken): Promise<vs.CodeAction | undefined> {
+			const result = (await originalAsCodeAction(item, token)) as vs.CodeAction | undefined;
+			if (item?.edit !== undefined) {
+				(result as any).edit = await asWorkspaceEdit(item.edit, token);
+			}
+			return result;
+		}
+
+		function asCodeActionResult(items: Array<ls.Command | ls.CodeAction>, token?: vs.CancellationToken): Promise<Array<vs.Command | vs.CodeAction>> {
+			return Promise.all(items.map(async (item) => {
+				if (ls.Command.is(item)) {
+					return p2c.asCommand(item);
+				} else {
+					return asCodeAction(item, token);
+				}
+			}));
+		}
+
+		p2c.asWorkspaceEdit = asWorkspaceEdit;
+		p2c.asCodeAction = asCodeAction;
+		p2c.asCodeActionResult = asCodeActionResult;
+
+		return client;
+	}
+
+	private spawnServer(logger: Logger, sdks: DartSdks, dartCapabilities: DartCapabilities): Promise<StreamInfo> {
+		// TODO: Replace with constructing an Analyzer that passes LSP flag (but still reads config
+		// from paths etc) and provide it's process.
+		const vmPath = path.join(sdks.dart, dartVMPath);
+		const args = getAnalyzerArgs(logger, sdks, dartCapabilities, true);
+
+		logger.info(`Spawning ${vmPath} with args ${JSON.stringify(args)}`);
+		const process = safeToolSpawn(undefined, vmPath, args);
+		// Ensure we terminate the process when shutting down even if the graceful shutdown
+		// doesn't work. Wait a short period to give the graceful shutdown change.
+		this.disposables.push({ dispose: () => { setTimeout(() => process.kill(), 100); } });
+		logger.info(`    PID: ${process.pid}`);
+
+		const reader = process.stdout.pipe(new LoggingTransform(logger, "<=="));
+		const writer = new LoggingTransform(logger, "==>");
+		writer.pipe(process.stdin);
+
+		process.stderr.on("data", (data) => logger.error(data.toString()));
+		process.on("exit", (code, signal) => {
+			if (code)
+				reportAnalyzerTerminatedWithError();
+		});
+
+		return Promise.resolve({ reader, writer });
+	}
 }
 
 class LoggingTransform extends stream.Transform {

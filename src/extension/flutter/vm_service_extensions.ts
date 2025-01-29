@@ -1,12 +1,13 @@
 import * as vs from "vscode";
-import { isWin } from "../../shared/constants";
+import { FlutterCapabilities } from "../../shared/capabilities/flutter";
+import { isDartCodeTestRun, isWin } from "../../shared/constants";
+import { SERVICE_CONTEXT_PREFIX, SERVICE_EXTENSION_CONTEXT_PREFIX } from "../../shared/constants.contexts";
 import { VmService, VmServiceExtension } from "../../shared/enums";
 import { Logger } from "../../shared/interfaces";
-import { getAllProjectFolders } from "../../shared/vscode/utils";
+import { fsPath } from "../../shared/utils/fs";
+import { getDartWorkspaceFolders } from "../../shared/vscode/utils";
+import { WorkspaceContext } from "../../shared/workspace";
 import { DebugCommands, debugSessions } from "../commands/debug";
-import { config } from "../config";
-import { SERVICE_CONTEXT_PREFIX, SERVICE_EXTENSION_CONTEXT_PREFIX } from "../extension";
-import { getExcludedFolders } from "../utils";
 import { DartDebugSessionInformation } from "../utils/vscode/debug";
 
 export const IS_INSPECTING_WIDGET_CONTEXT = "dart-code:flutter.isInspectingWidget";
@@ -24,7 +25,6 @@ const keyValue = "value";
 const toggleExtensionStateKeys: { [key: string]: string } = {
 	[VmServiceExtension.PlatformOverride]: keyValue,
 	[VmServiceExtension.DebugBanner]: keyEnabled,
-	[VmServiceExtension.CheckElevations]: keyEnabled,
 	[VmServiceExtension.DebugPaint]: keyEnabled,
 	[VmServiceExtension.PaintBaselines]: keyEnabled,
 	[VmServiceExtension.InspectorSelectMode]: keyEnabled,
@@ -48,7 +48,12 @@ export class VmServiceExtensions {
 	/// remove it from here.
 	private currentExtensionValues: { [key: string]: any } = {};
 
-	constructor(private readonly logger: Logger, private readonly debugCommands: DebugCommands) {
+	constructor(
+		private readonly logger: Logger,
+		private readonly debugCommands: DebugCommands,
+		private readonly workspaceContext: WorkspaceContext,
+		private readonly flutterCapabilities: FlutterCapabilities,
+	) {
 		this.debugCommands.onWillHotRestart(() => this.markAllServiceExtensionsUnloaded());
 	}
 
@@ -57,26 +62,29 @@ export class VmServiceExtensions {
 		if (e.event === "dart.serviceExtensionAdded") {
 			this.handleServiceExtensionLoaded(session, e.body.extensionRPC as VmServiceExtension, e.body.isolateId as string | null | undefined);
 
-			try {
-				if (e.body.extensionRPC === VmServiceExtension.InspectorSetPubRootDirectories) {
-					const projectFolders = await getAllProjectFolders(this.logger, getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
+			const useAddPubRootDirectories = this.flutterCapabilities.supportsAddPubRootDirectories;
+			const pubRootDirectoriesService = useAddPubRootDirectories
+				? VmServiceExtension.InspectorAddPubRootDirectories
+				: VmServiceExtension.InspectorSetPubRootDirectories;
 
+			try {
+				if (e.body.extensionRPC === pubRootDirectoriesService) {
 					const params: { [key: string]: string } = {
 						// TODO: Is this OK???
 						isolateId: e.body.isolateId,
 					};
 
 					let argNum = 0;
-					for (const projectFolder of projectFolders) {
-						params[`arg${argNum++}`] = projectFolder;
-						if (isWin)
-							params[`arg${argNum++}`] = this.formatPathForPubRootDirectories(projectFolder);
+					for (const workspaceFolder of getDartWorkspaceFolders()) {
+						params[`arg${argNum++}`] = this.formatPathForPubRootDirectories(fsPath(workspaceFolder.uri));
 					}
 
-					await this.callServiceExtension(e.session, VmServiceExtension.InspectorSetPubRootDirectories, params);
+					await this.callServiceExtension(e.session, pubRootDirectoriesService, params);
 				}
-			} catch (e) {
-				this.logger.error(e);
+			} catch (e: any) {
+				if (!this.shouldSilenceError(e)) {
+					this.logger.error(e);
+				}
 			}
 		} else if (e.event === "dart.serviceRegistered") {
 			this.handleServiceRegistered(e.body.service as VmService, e.body.method as string);
@@ -85,12 +93,24 @@ export class VmServiceExtensions {
 		}
 	}
 
-	// TODO: Remove this function (and the call to it) once the fix has rolled to Flutter beta.
-	// https://github.com/flutter/flutter-intellij/issues/2217
+	private shouldSilenceError(e: any) {
+		return isDartCodeTestRun && "message" in e && typeof e.message === "string" && e.message.includes("Service connection disposed");
+	}
+
 	private formatPathForPubRootDirectories(path: string): string {
-		return isWin
-			? path && `file:///${path.replace(/\\/g, "/")}`
-			: path;
+		if (isWin) {
+			return path && `file:///${path.replace(/\\/g, "/")}`;
+		}
+
+		// TODO(helin24): Use DDS for this translation.
+		const search = "/google3/";
+		if (this.workspaceContext.config.forceFlutterWorkspace && path.startsWith("/google") && path.includes(search)) {
+			const idx = path.indexOf(search);
+			const remainingPath = path.substring(idx + search.length);
+			return `google3:///${remainingPath}`;
+		}
+
+		return path;
 	}
 
 	public async overridePlatform() {
@@ -143,9 +163,11 @@ export class VmServiceExtensions {
 	}
 
 	private syncContextStates(id: string, value: any) {
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-enum-comparison
 		if (id === VmServiceExtension.InspectorSelectMode) {
 			/// Keep the context in sync so that the "Cancel Inspect Widget" command is enabled/disabled.
-			vs.commands.executeCommand("setContext", IS_INSPECTING_WIDGET_CONTEXT, !!value);
+			void vs.commands.executeCommand("setContext", IS_INSPECTING_WIDGET_CONTEXT, !!value);
+			this.debugCommands.isInspectingWidget = !!value;
 		}
 	}
 
@@ -184,9 +206,9 @@ export class VmServiceExtensions {
 	}
 
 	/// Tracks registered services and updates contexts to enable VS Code commands.
-	private handleServiceRegistered(service: VmService, method: string) {
+	public handleServiceRegistered(service: VmService, method: string) {
 		this.registeredServices[service] = method;
-		vs.commands.executeCommand("setContext", `${SERVICE_CONTEXT_PREFIX}${service}`, true);
+		void vs.commands.executeCommand("setContext", `${SERVICE_CONTEXT_PREFIX}${service}`, true);
 	}
 
 	/// Tracks loaded service extensions and updates contexts to enable VS Code commands.
@@ -195,7 +217,7 @@ export class VmServiceExtensions {
 		this.loadedServiceExtensions.push(extensionRPC);
 		if (isolateId)
 			this.loadedServiceExtensionIsolateIds.set(extensionRPC, isolateId);
-		vs.commands.executeCommand("setContext", `${SERVICE_EXTENSION_CONTEXT_PREFIX}${extensionRPC}`, true);
+		void vs.commands.executeCommand("setContext", `${SERVICE_EXTENSION_CONTEXT_PREFIX}${extensionRPC}`, true);
 
 		// If this extension is one we have an override value for, then this must be the extension loading
 		// for a new isolate (perhaps after a restart), so send its value.
@@ -204,14 +226,19 @@ export class VmServiceExtensions {
 		const value = this.currentExtensionValues[extensionRPC];
 		const hasValue = value !== undefined;
 
-		if (isTogglableService && hasValue)
-			this.sendExtensionValue(session.session, extensionRPC, value).catch((e) => this.logger.error(e));
+		if (isTogglableService && hasValue) {
+			this.sendExtensionValue(session.session, extensionRPC, value).catch((e) => {
+				if (!this.shouldSilenceError(e)) {
+					this.logger.error(e);
+				}
+			});
+		}
 	}
 
 	/// Marks all services as not-loaded (happens after session ends).
 	public markAllServicesUnloaded() {
 		for (const id of Object.keys(this.registeredServices)) {
-			vs.commands.executeCommand("setContext", `${SERVICE_CONTEXT_PREFIX}${id}`, undefined);
+			void vs.commands.executeCommand("setContext", `${SERVICE_CONTEXT_PREFIX}${id}`, undefined);
 		}
 		this.registeredServices = {};
 	}
@@ -219,7 +246,7 @@ export class VmServiceExtensions {
 	/// Marks all service extensions as not-loaded (happens after session ends or after hot restart).
 	public markAllServiceExtensionsUnloaded() {
 		for (const id of this.loadedServiceExtensions) {
-			vs.commands.executeCommand("setContext", `${SERVICE_EXTENSION_CONTEXT_PREFIX}${id}`, undefined);
+			void vs.commands.executeCommand("setContext", `${SERVICE_EXTENSION_CONTEXT_PREFIX}${id}`, undefined);
 		}
 		this.loadedServiceExtensions.length = 0;
 		this.loadedServiceExtensionIsolateIds.clear();

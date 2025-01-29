@@ -4,6 +4,7 @@ import { Context } from "../../../shared/vscode/workspace";
 export async function showInputBoxWithSettings(
 	context: Context,
 	options: {
+		ignoreFocusOut: boolean,
 		title: string,
 		prompt: string,
 		placeholder: string,
@@ -12,6 +13,7 @@ export async function showInputBoxWithSettings(
 	},
 ): Promise<UserInputOrSettings | undefined> {
 	const input = vs.window.createInputBox();
+	input.ignoreFocusOut = options.ignoreFocusOut;
 	input.title = options.title;
 	input.prompt = options.prompt;
 	input.placeholder = options.placeholder;
@@ -37,7 +39,12 @@ export async function showInputBoxWithSettings(
 			input.hide();
 		});
 
-		input.onDidAccept(() => input.value ? resolve({ value: input.value }) : resolve(undefined));
+		input.onDidAccept(() => {
+			// Don't accept while there's a validation error.
+			if (input.validationMessage)
+				return;
+			input.value ? resolve({ value: input.value }) : resolve(undefined);
+		});
 		input.onDidHide(() => {
 			resolve(undefined);
 		});
@@ -75,30 +82,69 @@ export async function showSimpleSettingsEditor(title: string, placeholder: strin
 
 export async function editSetting(setting: PickableSetting) {
 	const title = setting.label;
-	const placeHolder = `Select an option for ${setting.label} (or 'Escape' to cancel)`;
+	let placeholder = `Select an option for ${setting.label} (or 'Escape' to cancel)`;
 	const prompt = setting.detail;
+	// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 	const value = setting.currentValue;
 	switch (setting.settingKind) {
 		case "STRING":
-			const stringResult = await vs.window.showInputBox({ prompt, title, value });
+			const stringResult = await vs.window.showInputBox({ prompt, title, value: value as string | undefined });
 			if (stringResult !== undefined)
 				await setting.setValue(stringResult);
 			break;
-		case "ENUM":
-			const enumResult = await vs.window.showQuickPick(
-				setting.enumValues!.map((v) => ({ label: v } as vs.QuickPickItem)),
-				{ placeHolder, title },
-			);
+		case "ENUM": {
+			const quickPick = vs.window.createQuickPick();
+			quickPick.placeholder = placeholder;
+			quickPick.title = title;
+			quickPick.items = setting.enumValues!.map((v) => ({ label: v } as vs.QuickPickItem));
+			quickPick.activeItems = quickPick.items.filter((item) => item.label === setting.currentValue);
+
+			const accepted = await new Promise<boolean>((resolve) => {
+				quickPick.onDidAccept(() => resolve(true));
+				quickPick.onDidHide(() => resolve(false));
+				quickPick.show();
+			});
+			const enumResult = accepted && quickPick.activeItems.length ? quickPick.activeItems[0].label : undefined;
+			quickPick.dispose();
+
 			if (enumResult !== undefined)
-				await setting.setValue(enumResult.label);
+				await setting.setValue(enumResult);
 			break;
+		}
+		case "MULTI_ENUM": {
+			placeholder = `Select options for ${setting.label} (or 'Escape' to cancel)`;
+			const quickPick = vs.window.createQuickPick();
+			quickPick.canSelectMany = true;
+			quickPick.placeholder = placeholder;
+			quickPick.title = title;
+			const items: vs.QuickPickItem[] = [];
+			for (const group of setting.enumValues) {
+				items.push({ label: group.group, kind: vs.QuickPickItemKind.Separator } as vs.QuickPickItem);
+				for (const value of group.values) {
+					items.push({ label: value } as vs.QuickPickItem);
+				}
+			}
+			quickPick.items = items;
+			quickPick.selectedItems = quickPick.items.filter((item) => setting.currentValue.find((current) => current === item.label));
+
+			const accepted = await new Promise<boolean>((resolve) => {
+				quickPick.onDidAccept(() => resolve(true));
+				quickPick.onDidHide(() => resolve(false));
+				quickPick.show();
+			});
+			quickPick.dispose();
+
+			if (accepted)
+				await setting.setValue(quickPick.selectedItems.map((item) => item.label));
+			break;
+		}
 		case "BOOL":
 			const boolResult = await vs.window.showQuickPick(
 				[
 					{ label: "enable" } as vs.QuickPickItem,
 					{ label: "disable" } as vs.QuickPickItem,
 				],
-				{ placeHolder, title },
+				{ placeHolder: placeholder, title },
 			);
 			if (boolResult !== undefined)
 				await setting.setValue(boolResult.label === "enable");
@@ -107,9 +153,14 @@ export async function editSetting(setting: PickableSetting) {
 }
 
 type UserInputOrSettings = { value: string } | "SETTINGS";
-export type PickableSetting = vs.QuickPickItem & {
+export type PickableSetting = vs.QuickPickItem & ({
 	settingKind: "STRING" | "ENUM" | "BOOL",
 	currentValue: any,
 	setValue: (newValue: any) => Promise<void>,
 	enumValues?: string[],
-};
+} | {
+	settingKind: "MULTI_ENUM",
+	currentValue: any[],
+	setValue: (newValue: any[]) => Promise<void>,
+	enumValues: Array<{ group?: string, values: string[] }>,
+});

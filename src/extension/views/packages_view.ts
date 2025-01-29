@@ -2,14 +2,14 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vs from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
-import { DART_DEP_DEPENDENCIES_NODE_CONTEXT, DART_DEP_DEPENDENCY_PACKAGE_NODE_CONTEXT, DART_DEP_DEV_DEPENDENCIES_NODE_CONTEXT, DART_DEP_DEV_DEPENDENCY_PACKAGE_NODE_CONTEXT, DART_DEP_FILE_NODE_CONTEXT, DART_DEP_FOLDER_NODE_CONTEXT, DART_DEP_PACKAGE_NODE_CONTEXT, DART_DEP_PROJECT_NODE_CONTEXT, DART_DEP_TRANSITIVE_DEPENDENCIES_NODE_CONTEXT, DART_DEP_TRANSITIVE_DEPENDENCY_PACKAGE_NODE_CONTEXT } from "../../shared/constants";
+import { DART_DEP_DEPENDENCIES_NODE_CONTEXT, DART_DEP_DEPENDENCY_PACKAGE_NODE_CONTEXT, DART_DEP_DEV_DEPENDENCIES_NODE_CONTEXT, DART_DEP_DEV_DEPENDENCY_PACKAGE_NODE_CONTEXT, DART_DEP_FILE_NODE_CONTEXT, DART_DEP_FOLDER_NODE_CONTEXT, DART_DEP_PACKAGE_NODE_CONTEXT, DART_DEP_PROJECT_NODE_CONTEXT, DART_DEP_TRANSITIVE_DEPENDENCIES_NODE_CONTEXT, DART_DEP_TRANSITIVE_DEPENDENCY_PACKAGE_NODE_CONTEXT } from "../../shared/constants.contexts";
 import { DartWorkspaceContext, IAmDisposable, Logger } from "../../shared/interfaces";
-import { PubDeps, PubDepsPackage, ShortestPaths } from "../../shared/pub/deps";
-import { PackageMap } from "../../shared/pub/package_map";
-import { disposeAll } from "../../shared/utils";
+import { PubDeps, PubDepsTreePackageDependency, PubDepsTreePackageTransitiveDependency } from "../../shared/pub/deps";
+import { PackageMap, PackageMapLoader } from "../../shared/pub/package_map";
+import { disposeAll, notNullOrUndefined } from "../../shared/utils";
 import { sortBy } from "../../shared/utils/array";
 import { areSameFolder, fsPath } from "../../shared/utils/fs";
-import { getAllProjectFolders } from "../../shared/vscode/utils";
+import { ProjectFinder } from "../../shared/vscode/utils";
 import { config } from "../config";
 import { getExcludedFolders } from "../utils";
 
@@ -18,6 +18,8 @@ export class DartPackagesProvider implements vs.TreeDataProvider<PackageDep>, IA
 	private onDidChangeTreeDataEmitter: vs.EventEmitter<PackageDep | undefined> = new vs.EventEmitter<PackageDep | undefined>();
 	public readonly onDidChangeTreeData: vs.Event<PackageDep | undefined> = this.onDidChangeTreeDataEmitter.event;
 	private readonly deps: PubDeps;
+	private readonly packageMapLoader: PackageMapLoader;
+	private readonly projectFinder: ProjectFinder;
 
 	private processPackageMapChangeEvents = true;
 
@@ -36,7 +38,9 @@ export class DartPackagesProvider implements vs.TreeDataProvider<PackageDep>, IA
 			setTimeout(() => this.processPackageMapChangeEvents = true, 5000);
 			this.onDidChangeTreeDataEmitter.fire(undefined);
 		});
-		this.deps = new PubDeps(logger, context.sdks, dartCapabilities);
+		this.deps = new PubDeps(logger, context, dartCapabilities);
+		this.packageMapLoader = new PackageMapLoader(logger);
+		this.projectFinder = new ProjectFinder(logger);
 	}
 
 	public getTreeItem(element: PackageDep): vs.TreeItem {
@@ -45,7 +49,7 @@ export class DartPackagesProvider implements vs.TreeDataProvider<PackageDep>, IA
 
 	public async getChildren(element?: PackageDep): Promise<PackageDep[]> {
 		if (!element) {
-			const allProjects = await getAllProjectFolders(this.logger, getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
+			const allProjects = await this.projectFinder.findAllProjectFolders(getExcludedFolders, { requirePubspec: true, sort: true, searchDepth: config.projectSearchDepth });
 
 			const nodes = allProjects.map((folder) => new PackageDepProject(vs.Uri.file(folder)));
 			// If there's only one, just skip over to the deps.
@@ -54,42 +58,29 @@ export class DartPackagesProvider implements vs.TreeDataProvider<PackageDep>, IA
 				: nodes;
 
 		} else if (element instanceof PackageDepProject) {
-			// Try getting dependencies from `pub deps`.
-			let packages: { [key: string]: PubDepsPackage } | undefined;
-			let shortestPaths: ShortestPaths | undefined;
-			if (this.dartCapabilities.supportsPubDepsJson) {
-				// Fetch dependencies with "pub deps --json".
-				const root = await this.deps.getRootDependency(element.projectFolder);
-				packages = root ? this.deps.getPackageMap(root) : undefined;
-				shortestPaths = packages ? this.deps.computeShortestPaths(packages) : undefined;
-			}
+			const rootPackageFolder = element.rootPackageFolder;
+			// Fetch dependencies with "pub deps --json".
+			const packageMap = this.packageMapLoader.loadForProject(rootPackageFolder);
+			const root = await this.deps.getTree(rootPackageFolder);
+			const rootPackage = root?.roots.at(0); // TODO(dantup): Fix this!
 
-			// Get packages from package file.
-			const allPackages = await this.getPackages(element, shortestPaths);
+			const dependencies = rootPackage?.dependencies ?? [];
+			const devDependencies = rootPackage?.devDependencies ?? [];
+			const transitiveDependencies = rootPackage?.transitiveDependencies ?? [];
 
-			if (!packages)
-				return allPackages;
+			const dependenciesNodes = dependencies.map((dep) => this.createDependencyNode(packageMap, rootPackageFolder, dep, DART_DEP_DEPENDENCY_PACKAGE_NODE_CONTEXT)).filter(notNullOrUndefined);
+			const devDependenciesNodes = devDependencies.map((dep) => this.createDependencyNode(packageMap, rootPackageFolder, dep, DART_DEP_DEV_DEPENDENCY_PACKAGE_NODE_CONTEXT)).filter(notNullOrUndefined);
+			const transitiveDependenciesNodes = transitiveDependencies.map((dep) => this.createDependencyNode(packageMap, rootPackageFolder, dep, DART_DEP_TRANSITIVE_DEPENDENCY_PACKAGE_NODE_CONTEXT)).filter(notNullOrUndefined);
 
 			// Split the packages into groups.
-			const directPackages = allPackages.filter((p) => packages![p.packageName]?.kind === "direct");
-			const devPackages = allPackages.filter((p) => packages![p.packageName]?.kind === "dev");
-			const transitivePackages = allPackages.filter((p) => packages![p.packageName]?.kind === "transitive");
-
-			for (const p of directPackages)
-				p.contextValue = DART_DEP_DEPENDENCY_PACKAGE_NODE_CONTEXT;
-			for (const p of devPackages)
-				p.contextValue = DART_DEP_DEV_DEPENDENCY_PACKAGE_NODE_CONTEXT;
-			for (const p of transitivePackages)
-				p.contextValue = DART_DEP_TRANSITIVE_DEPENDENCY_PACKAGE_NODE_CONTEXT;
-
-
 			const nodes: PackageDepProjectPackageGroup[] = [];
-			if (directPackages.length)
-				nodes.push(new PackageDepProjectPackageGroup("direct dependencies", DART_DEP_DEPENDENCIES_NODE_CONTEXT, directPackages));
-			if (devPackages.length)
-				nodes.push(new PackageDepProjectPackageGroup("dev dependencies", DART_DEP_DEV_DEPENDENCIES_NODE_CONTEXT, devPackages));
-			if (transitivePackages.length)
-				nodes.push(new PackageDepProjectPackageGroup("transitive dependencies", DART_DEP_TRANSITIVE_DEPENDENCIES_NODE_CONTEXT, transitivePackages, shortestPaths));
+			if (dependenciesNodes.length)
+				nodes.push(new PackageDepProjectPackageGroup("direct dependencies", DART_DEP_DEPENDENCIES_NODE_CONTEXT, dependenciesNodes));
+			if (devDependenciesNodes.length)
+				nodes.push(new PackageDepProjectPackageGroup("dev dependencies", DART_DEP_DEV_DEPENDENCIES_NODE_CONTEXT, devDependenciesNodes));
+			if (transitiveDependenciesNodes.length)
+				nodes.push(new PackageDepProjectPackageGroup("transitive dependencies", DART_DEP_TRANSITIVE_DEPENDENCIES_NODE_CONTEXT, transitiveDependenciesNodes));
+
 			return nodes;
 		} else if (element instanceof PackageDepProjectPackageGroup) {
 			// For the package groups, we've already computed the children when we split
@@ -107,31 +98,34 @@ export class DartPackagesProvider implements vs.TreeDataProvider<PackageDep>, IA
 		}
 	}
 
-	private async getPackages(project: PackageDepProject, shortestPaths: ShortestPaths | undefined): Promise<PackageDepPackage[]> {
-		const map = PackageMap.loadForProject(this.logger, project.projectFolder);
-		const packages = map.packages;
-		const packageNames = sortBy(Object.keys(packages), (s) => s.toLowerCase());
+	private createDependencyNode(packageMap: PackageMap, rootPackageFolder: string, dependency: PubDepsTreePackageDependency | PubDepsTreePackageTransitiveDependency, contextValue: string): PackageDepPackage | undefined {
+		let dependencyPath = packageMap.getPackagePath(dependency.name);
+		if (!dependencyPath || areSameFolder(dependencyPath, path.join(rootPackageFolder, "lib")))
+			return;
 
-		const packageDepNodes = packageNames
-			.filter((name) => packages[name] && !areSameFolder(packages[name], path.join(project.projectFolder, "lib")))
-			.map((name) => {
-				let packagePath = packages[name];
-				if (path.basename(packagePath) === "lib")
-					packagePath = path.normalize(path.join(packagePath, ".."));
-				const shortestPath = shortestPaths ? shortestPaths[name] : undefined;
-				return new PackageDepPackage(`${name}`, vs.Uri.file(packagePath), project.projectFolder, shortestPath);
-			});
+		if (path.basename(dependencyPath) === "lib")
+			dependencyPath = path.normalize(path.join(dependencyPath, ".."));
 
-		return packageDepNodes;
+		const shortestPath = "shortestPath" in dependency ? dependency.shortestPath : undefined;
+		const node = new PackageDepPackage(`${dependency.name}`, vs.Uri.file(dependencyPath), rootPackageFolder, shortestPath);
+		node.contextValue = contextValue;
+		return node;
 	}
 
-	private getFilesAndFolders(folder: PackageDepFolder): PackageDep[] {
-		const children = sortBy(fs.readdirSync(fsPath(folder.resourceUri!), { withFileTypes: true }), (s) => s.name.toLowerCase());
+	public getFilesAndFolders(folder: PackageDepFolder): PackageDep[] {
+		if (!folder.resourceUri)
+			return [];
+
+		let children: fs.Dirent[];
+		try {
+			children = fs.readdirSync(fsPath(folder.resourceUri), { withFileTypes: true });
+		} catch {
+			return [];
+		}
+		children = sortBy(children, (s) => s.name.toLowerCase());
 		const folders: PackageDepFolder[] = [];
 		const files: PackageDepFile[] = [];
 
-		if (!folder.resourceUri)
-			return [];
 
 		const folderPath = fsPath(folder.resourceUri);
 		children.forEach((child) => {
@@ -148,9 +142,9 @@ export class DartPackagesProvider implements vs.TreeDataProvider<PackageDep>, IA
 
 	private async removeDependency(treeNode: PackageDepPackage) {
 		const packageName = treeNode?.packageName;
-		const projectFolder = treeNode?.projectFolder;
+		const projectFolder = treeNode?.rootPackageFolder;
 		if (packageName && projectFolder)
-			await vs.commands.executeCommand("_dart.removeDependency", treeNode.projectFolder, treeNode.packageName);
+			await vs.commands.executeCommand("_dart.removeDependency", treeNode.rootPackageFolder, treeNode.packageName);
 	}
 
 	public dispose(): any {
@@ -158,6 +152,7 @@ export class DartPackagesProvider implements vs.TreeDataProvider<PackageDep>, IA
 	}
 }
 
+/// A tree node in the packages tree.
 export abstract class PackageDep extends vs.TreeItem {
 	constructor(
 		label: string | undefined,
@@ -175,6 +170,7 @@ export abstract class PackageDep extends vs.TreeItem {
 	}
 }
 
+/// A file  within a dependency.
 export class PackageDepFile extends PackageDep {
 	constructor(
 		resourceUri: vs.Uri,
@@ -189,6 +185,7 @@ export class PackageDepFile extends PackageDep {
 	}
 }
 
+/// A folder within a dependency.
 export class PackageDepFolder extends PackageDep {
 	constructor(
 		resourceUri: vs.Uri,
@@ -198,42 +195,48 @@ export class PackageDepFolder extends PackageDep {
 	}
 }
 
+/// A tree node representing a project in the workspace.
 export class PackageDepProject extends PackageDep {
-	public readonly projectFolder: string;
+	public readonly rootPackageFolder: string;
 	constructor(
-		projectUri: vs.Uri,
+		rootPackageUri: vs.Uri,
 	) {
-		const projectFolder = fsPath(projectUri);
-		super(path.basename(projectFolder), undefined, vs.TreeItemCollapsibleState.Collapsed);
-		this.projectFolder = projectFolder;
-		this.contextValue = DART_DEP_PROJECT_NODE_CONTEXT;
+		const rootPackageFolder = fsPath(rootPackageUri);
+		const wf = vs.workspace.getWorkspaceFolder(rootPackageUri);
+		const label = wf
+			// Show the relative path from the wf unless it is the wf, in which case show its name.
+			? path.relative(fsPath(wf.uri), rootPackageFolder) || path.basename(fsPath(wf.uri))
+			: path.basename(rootPackageFolder);
+		// Show folder name if there is a wf and we're not that folder.
+		const description = wf && path.relative(fsPath(wf.uri), rootPackageFolder)
+			? path.basename(fsPath(wf.uri))
+			: undefined;
 
-		// Calculate relative path to the folder for the description.
-		const wf = vs.workspace.getWorkspaceFolder(projectUri);
-		if (wf) {
-			const workspaceFolder = fsPath(wf.uri);
-			this.description = path.relative(path.dirname(workspaceFolder), path.dirname(projectFolder));
-		}
+		super(label, undefined, vs.TreeItemCollapsibleState.Collapsed);
+		this.rootPackageFolder = rootPackageFolder;
+		this.contextValue = DART_DEP_PROJECT_NODE_CONTEXT;
+		this.description = description;
 	}
 }
 
+/// A tree node representing a group (dependencies, dev dependencies, transitive dependencies).
 export class PackageDepProjectPackageGroup extends PackageDep {
 	constructor(
 		label: string,
 		context: string,
 		public readonly packages: PackageDepPackage[],
-		public readonly shortestPaths?: ShortestPaths,
 	) {
 		super(label, undefined, vs.TreeItemCollapsibleState.Collapsed);
 		this.contextValue = context;
 	}
 }
 
+/// A tree node represending a dependency (of any kind).
 export class PackageDepPackage extends PackageDep {
 	constructor(
 		public readonly packageName: string,
 		resourceUri: vs.Uri,
-		public readonly projectFolder: string,
+		public readonly rootPackageFolder: string,
 		shortestPath: string[] | undefined,
 	) {
 		super(packageName, resourceUri, vs.TreeItemCollapsibleState.Collapsed);

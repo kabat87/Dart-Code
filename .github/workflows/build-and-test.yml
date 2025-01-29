@@ -4,25 +4,30 @@ on:
   push:
   pull_request:
   schedule:
-     - cron: '0 6 * * 1-5'
+     - cron: '0 6 * * 1' # 6am Monday
+  workflow_dispatch:
 
 jobs:
 
 
   build_exclusions:
 
+    permissions:
+      contents: none
     runs-on: ubuntu-latest
     outputs:
       excludes: ${{ join(steps.*.outputs.excludes) }}
     steps:
       - id: no_exclude
         name: Run all builds
-        if: github.event_name == 'schedule'
-        run: echo "::set-output name=excludes::[]"
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        # Exclude the non-LSP bots because we don't support legacy protocol for current stable or later, they will only be tested
+        # as part of the legacy build bots.
+        run: echo "excludes=[{\"build-version\":\"stable\",\"bot\":\"dart\"},{\"build-version\":\"stable\",\"bot\":\"flutter\"},{\"build-version\":\"beta\",\"bot\":\"dart\"},{\"build-version\":\"beta\",\"bot\":\"flutter\"}]" >> $GITHUB_OUTPUT
       - id: exclude
         name: Exclude some builds if not running on schedule
-        if: github.event_name != 'schedule'
-        run: echo "::set-output name=excludes::[{\"build-version\":\"dev\"},{\"os\":\"windows-latest\"},{\"os\":\"macos-latest\"}]"
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
+        run: echo "excludes=[{\"build-version\":\"legacy\"},{\"build-version\":\"beta\"},{\"os\":\"windows-latest\"},{\"os\":\"macos-latest\"},{\"build-version\":\"stable\",\"bot\":\"dart\"},{\"build-version\":\"stable\",\"bot\":\"flutter\"},{\"build-version\":\"beta\",\"bot\":\"dart\"},{\"build-version\":\"beta\",\"bot\":\"flutter\"}]" >> $GITHUB_OUTPUT
 
 
   build:
@@ -38,8 +43,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
-        node-version: [14]
-        build-version: [stable, dev]
+        node-version: [18]
+        # legacy = last Dart SDK we'll support legacy protocol with
+        build-version: [legacy, stable, beta]
         bot: [flutter_debug, flutter_debug_chrome, flutter_debug_sdk_dap, flutter_debug_chrome_sdk_dap, flutter_test_debug, flutter_test_debug_sdk_dap, dart_web_debug, flutter_repo, dart_debug, dart_debug_sdk_dap, dart, dart_lsp, flutter, flutter_lsp, misc]
         include:
           - os: ubuntu-latest
@@ -48,7 +54,7 @@ jobs:
 
     steps:
 
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
 
       # upload-artifact fails if the path does not exist (it only supports
       # silent failure for no-files-found, but the path must exist), so
@@ -56,6 +62,7 @@ jobs:
       # get additional failures reported on the artifact uploads that make
       # it less clear what the failure is.
       - run: |
+          mkdir -p .crash_dumps
           mkdir -p .dart_code_test_logs
           mkdir -p .test_results
           mkdir -p coverage
@@ -66,25 +73,30 @@ jobs:
         run: Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
 
       - name: Setup Node v${{ matrix.node-version }}
-        uses: actions/setup-node@v2
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
 
       - name: Setup Flutter ${{ matrix.build-version }}
         id: flutter
         if: matrix.bot != 'flutter_snap' && !startsWith(matrix.bot, 'dart')
-        uses: DanTup/gh-actions/setup-flutter@v1.1.0
+        uses: DanTup/gh-actions/setup-flutter@0466949d40f4a1be5ee0e0c7ca402a28fb1bae01
         with:
-          channel: ${{ matrix.build-version }}
+          channel: ${{ matrix.build-version == 'legacy' && '3.16.0' || matrix.build-version }}
 
       - name: Setup Dart ${{ matrix.build-version }}
         if: startsWith(matrix.bot, 'dart') || matrix.bot == 'misc'
-        uses: DanTup/gh-actions/setup-dart@v1.1.0
+        uses: dart-lang/setup-dart@v1
         with:
-          channel: ${{ matrix.build-version }}
+          sdk: ${{ matrix.build-version == 'legacy' && '3.2.0' || matrix.build-version }}
 
       - run: sudo snap install flutter --classic
         if: matrix.bot == 'flutter_snap'
+
+      - run: dart --disable-analytics
+
+      - run: flutter config --no-analytics
+        if: matrix.bot != 'flutter_snap' && !startsWith(matrix.bot, 'dart')
 
       - run: flutter update-packages
         if: matrix.bot == 'flutter_repo'
@@ -101,14 +113,17 @@ jobs:
         if: startsWith(matrix.bot, 'flutter') && matrix.bot != 'flutter_snap'
         run: flutter config --enable-web
 
+      - name: Flutter precache
+        if: startsWith(matrix.bot, 'flutter') && matrix.bot != 'flutter_snap'
+        run: flutter precache
+
       - run: |
-          dart pub global activate --no-executables devtools
+          dart pub global activate --no-executables crypto
           dart pub global activate --no-executables webdev
-          dart pub global activate --no-executables stagehand
-          dart pub global activate --no-executables args 1.5.0
-          dart pub global activate --no-executables meta 1.1.6
-          dart pub global activate --no-executables pedantic 1.4.0
-          dart pub global activate --no-executables json_annotation 1.2.0
+          dart pub global activate --no-executables args 2.3.0
+          dart pub global activate --no-executables meta 1.7.0
+          dart pub global activate --no-executables lints 1.0.0
+          dart pub global activate --no-executables json_annotation 4.0.1
         if: matrix.bot != 'flutter_snap'
         shell: pwsh
 
@@ -131,10 +146,40 @@ jobs:
         run: dart pub get
         working-directory: src/test/test_projects/hello_world/example
 
+      - name: dart pub get (dart_nested)
+        if: matrix.bot == 'misc'
+        run: dart pub get
+        working-directory: src/test/test_projects/dart_nested
+
+      - name: dart pub get (dart_nested/nested1)
+        if: matrix.bot == 'misc'
+        run: dart pub get
+        working-directory: src/test/test_projects/dart_nested/nested1
+
+      - name: dart pub get (web/hello_world)
+        if: startsWith(matrix.bot, 'dart_web')
+        run: dart pub get
+        working-directory: src/test/test_projects/web/hello_world
+
+      - name: dart pub get (web/broken)
+        if: startsWith(matrix.bot, 'dart_web')
+        run: dart pub get
+        working-directory: src/test/test_projects/web/broken
+
+      - name: dart pub get (dart_nested/nested1/nested2)
+        if: matrix.bot == 'misc'
+        run: dart pub get
+        working-directory: src/test/test_projects/dart_nested/nested1/nested2
+
       - name: flutter pub get (dart_nested_flutter/nested_flutter_example)
         if: matrix.bot == 'misc'
         run: flutter pub get
         working-directory: src/test/test_projects/dart_nested_flutter/nested_flutter_example
+
+      - name: flutter pub get (dart_nested_flutter2/nested_flutter_example)
+        if: matrix.bot == 'misc'
+        run: flutter pub get
+        working-directory: src/test/test_projects/dart_nested_flutter2/nested_flutter_example
 
       - name: flutter create (flutter_hello_world)
         if: startsWith(matrix.bot, 'flutter') && matrix.bot != 'flutter_snap'
@@ -156,6 +201,10 @@ jobs:
         run: flutter packages get
         working-directory: src/test/test_projects/bazel_workspace/flutter_hello_world_bazel
 
+      - name: ps -x (before)
+        if: matrix.os != 'windows-latest'
+        run: ps -x
+
       - name: npm test
         run: npm test
         env:
@@ -164,45 +213,108 @@ jobs:
           DISPLAY: ":99.0"
           BOT: ${{ matrix.bot }}
           BUILD_VERSION: ${{ matrix.build-version }}
-          LOGS_NAME: ${{ matrix.build-version }}_${{ matrix.build-version }}
+          LOGS_NAME: ${{ matrix.build-version }}
           FLUTTER_REPO_PATH: ${{ steps.flutter.outputs.flutter-sdk }}
 
+      - name: ps -x (after)
+        if: matrix.os != 'windows-latest'
+        run: ps -x
+
       - name: Store logs
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-logs-${{ matrix.os }}
+          name: test-logs-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
           path: .dart_code_test_logs
+          if-no-files-found: ignore
 
       - name: Store test results
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results-${{ matrix.os }}
+          name: test-results-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
           path: .test_results
+          if-no-files-found: ignore
 
       - name: Store coverage
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v4
         if: success() && matrix.build-version == 'stable'
         with:
-          name: coverage-${{ matrix.os }}
+          name: coverage-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
           path: coverage
+          if-no-files-found: ignore
+
+      - name: Store crash dumps
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: crash-dumps-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
+          path: .crash_dumps
+          if-no-files-found: ignore
+
+  merge_artifacts:
+
+    name: Merge Artifacts
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Merge logs
+        uses: actions/upload-artifact/merge@v4
+        if: always()
+        with:
+          name: test-logs
+          pattern: test-logs-*
+          separate-directories: true
+          delete-merged: true
+        continue-on-error: true # fails if empty
+
+      - name: Merge test results
+        uses: actions/upload-artifact/merge@v4
+        if: always()
+        with:
+          name: test-results
+          pattern: test-results-*
+          separate-directories: true
+          delete-merged: true
+        continue-on-error: true # fails if empty
+
+      - name: Merge coverage
+        uses: actions/upload-artifact/merge@v4
+        if: success()
+        with:
+          name: coverage
+          pattern: coverage-*
+          delete-merged: true
+        continue-on-error: true # fails if empty
+
+      - name: Merge crash dumps
+        uses: actions/upload-artifact/merge@v4
+        if: always()
+        with:
+          name: crash-dumps
+          pattern: crash-dumps-*
+          separate-directories: true
+          delete-merged: true
+        continue-on-error: true # fails if empty
 
   upload_coverage:
 
     name: Send Coverage to CodeClimate
-    needs: build
+    needs: merge_artifacts
     if: always() && github.event_name == 'push'
     runs-on: ubuntu-latest
 
     steps:
 
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v4
 
       - name: Fetch Linux coverage
-        uses: actions/download-artifact@v1
+        uses: actions/download-artifact@v4
         with:
-          name: coverage-ubuntu-latest
+          name: coverage
           path: coverage/linux
 
       - name: Upload to CodeClimate
@@ -220,9 +332,11 @@ jobs:
 
   notify_failure:
 
+    permissions:
+      contents: none
     name: Notify Discord of Failure
     needs: build
-    if: failure() && github.event_name == 'push'
+    if: failure() && github.event_name == 'push' || failure() && github.event_name == 'schedule'
     runs-on: ubuntu-latest
 
     steps:

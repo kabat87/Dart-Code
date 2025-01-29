@@ -7,6 +7,7 @@ import { arrayStartsWith } from "../../shared/utils/array";
 import { fsPath, isFlutterProjectFolder, referencesBuildRunner } from "../../shared/utils/fs";
 import { getAllProjectFolders } from "../../shared/vscode/utils";
 import { config } from "../config";
+import { locateBestProjectRoot } from "../project";
 import * as util from "../utils";
 import { getToolEnv } from "../utils/processes";
 import { getFolderToRunCommandIn } from "../utils/vscode/projects";
@@ -39,13 +40,15 @@ export abstract class BaseTaskProvider implements vs.TaskProvider {
 	protected createSharedTasks(workspaceFolder: vs.WorkspaceFolder, projectFolder: vs.Uri): Array<Promise<vs.Task>> {
 		const promises: Array<Promise<vs.Task>> = [];
 
-		promises.push(this.createPubTask(workspaceFolder, projectFolder, ["get"]));
-		promises.push(this.createPubTask(workspaceFolder, projectFolder, ["upgrade"]));
-		if (referencesBuildRunner(fsPath(projectFolder))) {
-			promises.push(this.createPubTask(workspaceFolder, projectFolder, ["run", "build_runner", "watch"]));
-			promises.push(this.createPubTask(workspaceFolder, projectFolder, ["run", "build_runner", "build"]));
-			promises.push(this.createPubTask(workspaceFolder, projectFolder, ["run", "build_runner", "serve"]));
-			promises.push(this.createPubTask(workspaceFolder, projectFolder, ["run", "build_runner", "test"]));
+		if (config.enablePub) {
+			promises.push(this.createPubTask(workspaceFolder, projectFolder, ["get"]));
+			promises.push(this.createPubTask(workspaceFolder, projectFolder, ["upgrade"]));
+			if (referencesBuildRunner(fsPath(projectFolder))) {
+				promises.push(this.createPubTask(workspaceFolder, projectFolder, ["run", "build_runner", "watch"]));
+				promises.push(this.createPubTask(workspaceFolder, projectFolder, ["run", "build_runner", "build"]));
+				promises.push(this.createPubTask(workspaceFolder, projectFolder, ["run", "build_runner", "serve"]));
+				promises.push(this.createPubTask(workspaceFolder, projectFolder, ["run", "build_runner", "test"]));
+			}
 		}
 
 		return promises;
@@ -70,7 +73,7 @@ export abstract class BaseTaskProvider implements vs.TaskProvider {
 			definition.args = (definition.args ?? []).concat((await options?.runtimeArgs()) ?? []);
 		}
 
-		this.injectArgs(definition);
+		await this.injectArgs(definition);
 
 		// We *must* return a new Task here, otherwise the task cannot be customised
 		// in task.json.
@@ -132,7 +135,13 @@ export abstract class BaseTaskProvider implements vs.TaskProvider {
 		return this.resolveTask(task);
 	}
 
-	protected async runTask(uri: vs.Uri, command: string, args: string[]) {
+	protected async runProjectTask(uri: vs.Uri, command: string, args: string[]) {
+		const projectRoot = uri ? locateBestProjectRoot(fsPath(uri)) : undefined;
+		const projectRootUri = projectRoot ? vs.Uri.file(projectRoot) : undefined;
+		return this.runTask(projectRootUri, command, args);
+	}
+
+	protected async runTask(uri: vs.Uri | undefined, command: string, args: string[]) {
 		let projectFolder = uri;
 		let workspaceFolder = uri ? vs.workspace.getWorkspaceFolder(uri) : undefined;
 		if (!workspaceFolder) {
@@ -145,7 +154,7 @@ export abstract class BaseTaskProvider implements vs.TaskProvider {
 		if (!workspaceFolder)
 			return;
 
-		const task = await this.createTask(workspaceFolder, projectFolder, command, args);
+		const task = await this.createTask(workspaceFolder, projectFolder!, command, args);
 
 		return vs.tasks.executeTask(task);
 	}
@@ -188,13 +197,13 @@ export class DartTaskProvider extends BaseTaskProvider {
 	public async provideTasks(token?: vs.CancellationToken): Promise<vs.Task[]> {
 		const projectFolders = await getAllProjectFolders(this.logger, util.getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
 
-		let promises: Array<Promise<vs.Task>> = [];
+		const promises: Array<Promise<vs.Task>> = [];
 		projectFolders.forEach((folder) => {
 			const folderUri = vs.Uri.file(folder);
 			const workspaceFolder = vs.workspace.getWorkspaceFolder(folderUri)!;
 			const isFlutter = isFlutterProjectFolder(folder);
 			if (!isFlutter)
-				promises = promises.concat(this.createSharedTasks(workspaceFolder, folderUri));
+				promises.push(...this.createSharedTasks(workspaceFolder, folderUri));
 			promises.push(this.createTask(workspaceFolder, folderUri, this.dartDocCommand, this.dartDocArguments));
 
 			// For testing...

@@ -1,3 +1,4 @@
+import { minimatch } from "minimatch";
 import * as path from "path";
 import { Uri, workspace } from "vscode";
 import { escapeRegExp } from "../utils";
@@ -5,7 +6,7 @@ import { fsPath, isWithinPathOrEqual } from "../utils/fs";
 
 const debugTypeTokenRegex = new RegExp(escapeRegExp("${debugType}"), "gi");
 
-/// Allows overriding the launch config used by Code Lens "Run"/"Debug" and runs through test runner.
+/// Allows overriding the launch config used by Code Lens "Run"/"Debug", test runner, editor launch buttons, explorer context menu.
 ///
 /// Tries to get the most specific config first (eg. using an explicit `noDebug` flag) and otherwise falls back to
 /// a generic (no `noDebug` specified) one, injecting the value of `debug` inverted as `noDebug`.
@@ -43,7 +44,7 @@ export function getTemplatedLaunchConfigs(documentUri: Uri, fileType: string): T
 	for (const templateType of wantedTemplateTypes) {
 		const relevantLaunchConfigs = runConfigs
 			.filter((c) => c.type === "dart" && isTemplateOfType(c, templateType))
-			.filter((c) => c.codeLens?.path && workspacePath ? isWithinPathOrEqual(filePath, path.join(workspacePath, c.codeLens?.path)) : !c.codeLens?.path);
+			.filter((c) => codeLensIsValidForFile(c.codeLens, workspacePath, filePath));
 		for (const launchConfig of relevantLaunchConfigs) {
 			runFileTemplates.push({
 				...launchConfig,
@@ -66,11 +67,23 @@ export function getTemplatedLaunchConfigs(documentUri: Uri, fileType: string): T
 	return runFileTemplates;
 }
 
+function codeLensIsValidForFile(codeLens: TemplatedLaunchConfig["codeLens"], workspacePath: string | undefined, filePath: string) {
+	if (!codeLens?.path)
+		return true;
+
+	// Handle globs.
+	if (codeLens.path.startsWith("**/"))
+		return minimatch(filePath, codeLens.path, { dot: true });
+
+	// Otherwise, withinPathOrEqual, which requires a workspacePath.
+	return workspacePath ? isWithinPathOrEqual(filePath, path.join(workspacePath, codeLens?.path)) : false;
+}
+
 export function isTemplateOfType(config: TemplatedLaunchConfig, templateType: string): boolean {
 	const template = config.codeLens?.for;
 	return !!template && (
 		(typeof template === "string" && template === templateType)
-		|| (Array.isArray(template) && template.indexOf(templateType) !== -1)
+		|| (Array.isArray(template) && template.includes(templateType))
 	);
 }
 

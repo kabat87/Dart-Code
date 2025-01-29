@@ -1,4 +1,4 @@
-import * as minimatch from "minimatch";
+import { minimatch } from "minimatch";
 import { CancellationToken, DocumentFormattingEditProvider, DocumentSelector, FormattingOptions, languages, OnTypeFormattingEditProvider, Position, Range, TextDocument, TextEdit, window, workspace } from "vscode";
 import * as as from "../../shared/analysis_server_types";
 import { IAmDisposable, Logger } from "../../shared/interfaces";
@@ -10,16 +10,17 @@ import { config } from "../config";
 
 export class DartFormattingEditProvider implements DocumentFormattingEditProvider, OnTypeFormattingEditProvider, IAmDisposable {
 	constructor(private readonly logger: Logger, private readonly analyzer: DasAnalyzerClient, private readonly context: Context) {
-		workspace.onDidChangeConfiguration((e) => {
+		this.otherDisposables.push(workspace.onDidChangeConfiguration((e) => {
 			if (e.affectsConfiguration("dart.enableSdkFormatter")) {
 				if (config.enableSdkFormatter)
 					this.registerAllFormatters();
 				else
 					this.unregisterAllFormatters();
 			}
-		});
+		}));
 	}
 
+	private readonly otherDisposables: IAmDisposable[] = [];
 	private readonly registeredFormatters: IAmDisposable[] = [];
 	private readonly formatterRegisterFuncs: Array<() => void> = [];
 
@@ -57,7 +58,7 @@ export class DartFormattingEditProvider implements DocumentFormattingEditProvide
 		} catch {
 			if (!this.context.hasWarnedAboutFormatterSyntaxLimitation) {
 				this.context.hasWarnedAboutFormatterSyntaxLimitation = true;
-				window.showInformationMessage("The Dart formatter will not run if the file has syntax errors");
+				void window.showInformationMessage("The Dart formatter will not run if the file has syntax errors");
 			}
 			return undefined;
 		}
@@ -110,6 +111,7 @@ export class DartFormattingEditProvider implements DocumentFormattingEditProvide
 	}
 
 	public dispose() {
+		disposeAll(this.otherDisposables);
 		this.unregisterAllFormatters();
 	}
 }

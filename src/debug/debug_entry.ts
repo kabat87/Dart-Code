@@ -1,4 +1,4 @@
-import { DebugSession } from "vscode-debugadapter";
+import { DebugSession } from "@vscode/debugadapter";
 import { DartDebugSession } from "./dart_debug_impl";
 import { DartTestDebugSession } from "./dart_test_debug_impl";
 import { FlutterDebugSession } from "./flutter_debug_impl";
@@ -10,12 +10,16 @@ const args = process.argv.slice(2);
 const debugType = args.length ? args[0] : undefined;
 
 const debuggers: { [key: string]: any } = {
-	"dart": DartDebugSession,
-	"dart_test": DartTestDebugSession,
-	"flutter": FlutterDebugSession,
-	"flutter_test": FlutterTestDebugSession,
-	"web": WebDebugSession,
-	"web_test": WebTestDebugSession,
+	// These IDs are passed as arguments so cannot be renamed to camelCase.
+	dart: DartDebugSession,
+	// eslint-disable-next-line camelcase
+	dart_test: DartTestDebugSession,
+	flutter: FlutterDebugSession,
+	// eslint-disable-next-line camelcase
+	flutter_test: FlutterTestDebugSession,
+	web: WebDebugSession,
+	// eslint-disable-next-line camelcase
+	web_test: WebTestDebugSession,
 };
 
 const dbg = debugType ? debuggers[debugType] as typeof DebugSession : undefined;

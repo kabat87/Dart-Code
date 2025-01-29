@@ -1,6 +1,6 @@
+import { ContinuedEvent, Event, OutputEvent } from "@vscode/debugadapter";
+import { DebugProtocol } from "@vscode/debugprotocol";
 import * as path from "path";
-import { ContinuedEvent, Event, OutputEvent } from "vscode-debugadapter";
-import { DebugProtocol } from "vscode-debugprotocol";
 import { FlutterCapabilities } from "../shared/capabilities/flutter";
 import { debugLaunchProgressId, flutterPath, restartReasonManual } from "../shared/constants";
 import { DartLaunchArgs } from "../shared/debug/interfaces";
@@ -104,7 +104,13 @@ export class FlutterDebugSession extends DartDebugSession {
 		this.runDaemon.registerForAppStarted(async (n) => {
 			this.appHasStarted = true;
 			this.outputCategory = "stdout";
-			await this.connectToVmServiceIfReady();
+			// In modes like Profile, we'll never connect the debugger, so
+			// we should end our progress reporting here.
+			if (!this.vmServiceUri)
+				this.endProgress(debugLaunchProgressId);
+			else
+				await this.connectToVmServiceIfReady();
+			this.sendEvent(new Event("flutter.appStarted"));
 		});
 		this.runDaemon.registerForAppStop((n) => {
 			this.currentRunningAppId = undefined;
@@ -140,7 +146,7 @@ export class FlutterDebugSession extends DartDebugSession {
 	}
 
 	private sendProgressEvent(e: AppProgress) {
-		const progressID = `flutter-${e.appId}-${e.progressId}`;
+		const progressId = `flutter-${e.appId}-${e.progressId}`;
 		if (e.finished) {
 			let finalMessage: string | undefined;
 			if (!finalMessage) {
@@ -149,19 +155,19 @@ export class FlutterDebugSession extends DartDebugSession {
 				else if (e.progressId === "hot.restart")
 					finalMessage = "Hot Restart complete!";
 			}
-			this.endProgress(progressID, finalMessage);
+			this.endProgress(progressId, finalMessage);
 		} else {
-			this.startProgress(progressID, e.message);
+			this.startProgress(progressId, e.message);
 		}
 	}
 
 	private handleLogOutput(msg: string, forceErrorCategory = false) {
 		msg = `${msg.trimRight()}\n`;
-		if (msg.indexOf(flutterExceptionStartBannerPrefix) !== -1) {
+		if (msg.includes(flutterExceptionStartBannerPrefix)) {
 			// Change before logging.
 			this.outputCategory = "stderr";
 			this.logToUser(msg, this.outputCategory);
-		} else if (msg.indexOf(flutterExceptionEndBannerPrefix) !== -1) {
+		} else if (msg.includes(flutterExceptionEndBannerPrefix)) {
 			// Log before changing back.
 			this.logToUser(msg, this.outputCategory);
 			this.outputCategory = "stdout";
@@ -169,7 +175,7 @@ export class FlutterDebugSession extends DartDebugSession {
 			this.logToUser(msg, forceErrorCategory ? "stderr" : this.outputCategory);
 			// This text comes through as stdout and not Progress, so map it over
 			// to progress indicator.
-			if (msg.indexOf("Waiting for connection from") !== -1) {
+			if (msg.includes("Waiting for connection from")) {
 				const instructions = "Please click the Dart Debug extension button in the spawned browser window";
 				this.updateProgress(debugLaunchProgressId, instructions);
 				// Send this delayed, so it appears after the rest of the help text.
@@ -271,9 +277,9 @@ export class FlutterDebugSession extends DartDebugSession {
 					// Request to quit/detach, but don't await it since we sometimes
 					// don't get responses before the process quits.
 					if (this.runDaemon.mode === RunMode.Run)
-						this.runDaemon.stop(this.currentRunningAppId);
+						void this.runDaemon.stop(this.currentRunningAppId);
 					else
-						this.runDaemon.detach(this.currentRunningAppId);
+						void this.runDaemon.detach(this.currentRunningAppId);
 
 					// Now wait for the process to terminate up to 3s.
 					await Promise.race([
@@ -294,8 +300,15 @@ export class FlutterDebugSession extends DartDebugSession {
 	): Promise<void> {
 		this.sendEvent(new Event("dart.hotRestartRequest"));
 		this.sendEvent(new ContinuedEvent(0, true));
+		this.reloadPackageMap();
 		await this.performReload(true, { reason: restartReasonManual });
 		super.restartRequest(response, args);
+	}
+
+	private reloadPackageMap(): void {
+		// Reload the package map in case the user modified the packages.
+		// https://github.com/Dart-Code/Dart-Code/issues/4076.
+		this.packageMap?.reload();
 	}
 
 	private async performReload(hotRestart: boolean, args?: { reason: string, debounce?: boolean }): Promise<any> {
@@ -335,8 +348,10 @@ export class FlutterDebugSession extends DartDebugSession {
 					break;
 
 				case "hotRestart":
-					if (this.currentRunningAppId)
+					if (this.currentRunningAppId) {
+						this.reloadPackageMap();
 						await this.performReload(true, args as { reason: string, debounce?: boolean });
+					}
 					this.sendResponse(response);
 					break;
 
@@ -463,7 +478,7 @@ export class FlutterDebugSession extends DartDebugSession {
 		}
 	}
 
-	private logDiagnosticNodeDescendents(node: DiagnosticsNode, level: number = 0) {
+	private logDiagnosticNodeDescendents(node: DiagnosticsNode, level = 0) {
 		if (node.style === DiagnosticsNodeStyle.Shallow)
 			return;
 

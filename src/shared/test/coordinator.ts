@@ -1,8 +1,12 @@
+import { URI } from "vscode-uri";
 import { Outline } from "../analysis/lsp/custom_protocol";
+import { isWin } from "../constants";
 import { IAmDisposable, Logger, Range } from "../interfaces";
 import { ErrorNotification, GroupNotification, Notification, PrintNotification, SuiteNotification, TestDoneNotification, TestStartNotification } from "../test_protocol";
-import { disposeAll, uriToFilePath } from "../utils";
+import { disposeAll, maybeUriToFilePath, uriToFilePath } from "../utils";
+import { normalizeSlashes } from "../utils/fs";
 import { LspTestOutlineVisitor } from "../utils/outline_lsp";
+import { isSetupOrTeardownTestName } from "../utils/test";
 import { SuiteData, TestModel, TestSource } from "./test_model";
 
 /// Handles results from a test debug session and provides them to the test model.
@@ -30,12 +34,11 @@ export class TestSessionCoordinator implements IAmDisposable {
 	/// jump over them.
 	private phantomGroupParents: { [key: string]: { [key: number]: number | null | undefined } } = {};
 
-	constructor(private readonly logger: Logger, private readonly data: TestModel, private readonly fileTracker: { getOutlineFor(file: { fsPath: string } | string): Outline | undefined } | undefined) { }
+	constructor(private readonly logger: Logger, private readonly data: TestModel, private readonly fileTracker: { getOutlineFor(uri: URI): Outline | undefined } | undefined) { }
 
 	public handleDebugSessionCustomEvent(debugSessionID: string, dartCodeDebugSessionID: string | undefined, event: string, body?: any) {
 		if (event === "dart.testNotification") {
-			// tslint:disable-next-line: no-floating-promises
-			this.handleNotification(debugSessionID, dartCodeDebugSessionID ?? `untagged-session-${debugSessionID}`, body as Notification).catch((e) => this.logger.error(e));
+			void this.handleNotification(debugSessionID, dartCodeDebugSessionID ?? `untagged-session-${debugSessionID}`, body as Notification).catch((e) => this.logger.error(e));
 		}
 	}
 
@@ -48,7 +51,7 @@ export class TestSessionCoordinator implements IAmDisposable {
 
 		// End them all and remove from the lookup.
 		for (const suitePath of suitePaths) {
-			this.handleSuiteEnd(dartCodeDebugSessionID, this.data.suites[suitePath]);
+			this.handleSuiteEnd(dartCodeDebugSessionID, this.data.suites.getForPath(suitePath)!);
 			this.owningDebugSessions[suitePath] = undefined;
 			delete this.owningDebugSessions[suitePath];
 		}
@@ -67,7 +70,14 @@ export class TestSessionCoordinator implements IAmDisposable {
 			// 	this.handleAllSuitesNotification(evt as AllSuitesNotification);
 			// 	break;
 			case "suite":
-				this.handleSuiteNotification(dartCodeDebugSessionID, evt as SuiteNotification);
+				const event = evt as SuiteNotification;
+				// HACK: Handle paths with wrong slashes.
+				// https://github.com/Dart-Code/Dart-Code/issues/4441
+				if (isWin)
+					event.suite.path = normalizeSlashes(event.suite.path);
+
+				this.owningDebugSessions[event.suite.path] = debugSessionID;
+				this.handleSuiteNotification(dartCodeDebugSessionID, event);
 				break;
 			case "testStart":
 				this.handleTestStartNotification(dartCodeDebugSessionID, evt as TestStartNotification);
@@ -98,7 +108,7 @@ export class TestSessionCoordinator implements IAmDisposable {
 
 		const suiteData = this.data.suiteDiscovered(dartCodeDebugSessionID, evt.suite.path);
 
-		this.debugSessionLookups[dartCodeDebugSessionID]!.suiteForID[evt.suite.id] = suiteData;
+		this.debugSessionLookups[dartCodeDebugSessionID].suiteForID[evt.suite.id] = suiteData;
 
 		// Also capture the test nodes from the outline so that we can look up the full range for a test (instead of online its line/col)
 		// to provide to VS Code to better support "run test at cursor".
@@ -108,7 +118,7 @@ export class TestSessionCoordinator implements IAmDisposable {
 	private captureTestOutlne(path: string) {
 		const visitor = new LspTestOutlineVisitor(this.logger, path);
 		this.suiteOutlineVisitors[path] = visitor;
-		const outline = this.fileTracker?.getOutlineFor(path);
+		const outline = this.fileTracker?.getOutlineFor(URI.file(path));
 		if (outline)
 			visitor.visit(outline);
 	}
@@ -125,9 +135,15 @@ export class TestSessionCoordinator implements IAmDisposable {
 		}
 		this.debugSessionLookups[dartCodeDebugSessionID]!.suiteForTestID[evt.test.id] = suite;
 
-		const path = (evt.test.root_url || evt.test.url) ? uriToFilePath(evt.test.root_url || evt.test.url!) : undefined;
-		const line = evt.test.root_line || evt.test.line;
-		const character = evt.test.root_column || evt.test.column;
+		/// We prefer the root location (the location inside the executed test suite) for normal tests, but for
+		// setup/tearDown we want to consider them in their actual locations so that failures will be attributed
+		// to them correctly.
+		// https://github.com/Dart-Code/Dart-Code/issues/4681#issuecomment-1671191742
+		const useRootLocation = !isSetupOrTeardownTestName(evt.test.name) && !!evt.test.root_url && !!evt.test.root_line && !!evt.test.root_column;
+
+		const path = maybeUriToFilePath(useRootLocation ? evt.test.root_url : evt.test.url);
+		const line = useRootLocation ? evt.test.root_line : evt.test.line;
+		const character = useRootLocation ? evt.test.root_column : evt.test.column;
 
 		const range = this.getRangeForNode(suite, line, character);
 		const groupID = evt.test.groupIDs?.length ? evt.test.groupIDs[evt.test.groupIDs.length - 1] : undefined;
@@ -220,6 +236,15 @@ export class TestSessionCoordinator implements IAmDisposable {
 		if (!test)
 			return;
 
+		// Flutter emits an error when tests fail which when reported to the VS Code API will result in not-so-useful text
+		// in the Test Error Peek window, so we suppress messages that match this pattern.
+		const pattern = new RegExp(`
+Test failed. See exception logs above.
+The test description was: .*
+`.trim());
+		if (pattern.test(evt.error.trim()))
+			return;
+
 		test.outputEvents.push(evt);
 		this.data.testErrorOutput(dartCodeDebugSessionID, suite.path, evt.testID, evt.isFailure, evt.error, evt.stackTrace);
 	}
@@ -228,14 +253,24 @@ export class TestSessionCoordinator implements IAmDisposable {
 		if (!line || !character)
 			return;
 
+		// VS Code is zero-based, but package:test is 1-based.
+		const zeroBasedLine = line - 1;
+		const zeroBasedCharacter = character - 1;
+
 		// In test notifications, we only get the start line/column but we need to give VS Code the full range for "Run Test at Cursor" to work.
 		// The outline data was captured when the suite started, so we can assume it's reasonable accurate, so try to look up the node
 		// there and use its range. Otherwise, just make a range that goes from the start position to the next line (assuming the rest
 		// of the line is the test name, and we can at least support running it there).
-		const testsOnLine = line ? this.suiteOutlineVisitors[suite.path]?.testsByLine[line - 1] : undefined;
-		const test = testsOnLine ? testsOnLine.find((t) => t.range.start.character === character - 1) : undefined;
+		const testsOnLine = line ? this.suiteOutlineVisitors[suite.path]?.testsByLine[zeroBasedLine] : undefined;
+		const test = testsOnLine ? testsOnLine.find((t) => t.range.start.character === zeroBasedCharacter) : undefined;
 
-		const range = line && character ? test?.range ?? { start: { line, character }, end: { line: line + 1, character } } : undefined;
+		const range = line && character
+			? test?.range ?? {
+				end: { line: zeroBasedLine + 1, character: zeroBasedCharacter },
+				start: { line: zeroBasedLine, character: zeroBasedCharacter },
+			} as Range
+			: undefined;
+
 		return range;
 	}
 

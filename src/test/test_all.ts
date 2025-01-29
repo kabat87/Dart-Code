@@ -4,26 +4,24 @@ import * as path from "path";
 
 let exitCode = 0;
 const cwd = process.cwd();
-const testEnv = Object.create(process.env);
+const testEnv = Object.create(process.env) as NodeJS.Dict<string>;
 
-async function runTests(testFolder: string, workspaceFolder: string, logSuffix?: string, env?: any): Promise<void> {
-	console.log(
-		`Running ${testFolder} tests folder in workspace ${workspaceFolder}`);
+async function runTests(testFolder: string, workspaceFolder: string, logSuffix?: string, env?: NodeJS.Dict<string>): Promise<void> {
+	console.log(`Running ${testFolder} tests folder in workspace ${workspaceFolder}`);
 
 	const logsName = process.env.LOGS_NAME;
-	const testRunName = `${testFolder.replace("/", "_")}${logSuffix ? `_${logSuffix}` : ""}_${logsName}`;
+	const testRunName = `${testFolder.replace(/\//g, "_")}${logSuffix ? `_${logSuffix}` : ""}_${logsName}`;
 	const logPath = path.join(cwd, ".dart_code_test_logs", `${testRunName}`);
 
 	testEnv.TEST_RUN_NAME = testRunName;
 	testEnv.DC_TEST_LOGS = logPath;
 	testEnv.COVERAGE_OUTPUT = path.join(cwd, ".nyc_output", `${testRunName}.json`);
 	testEnv.TEST_XML_OUTPUT = path.join(path.join(cwd, ".test_results"), `${testRunName}.xml`);
-	testEnv.TEST_CSV_SUMMARY = path.join(path.join(cwd, ".test_results"), `${testRunName}_summary.csv`);
 
 	if (!fs.existsSync(logPath))
 		fs.mkdirSync(logPath);
 
-	const codeVersion = process.env.BUILD_VERSION === "dev" ? "insiders" : process.env.BUILD_VERSION;
+	const codeVersion = (!process.env.BUILD_VERSION || process.env.BUILD_VERSION === "stable" || process.env.BUILD_VERSION === "legacy") ? "stable" : "insiders";
 
 	// The VS Code download is often flaky on GH Actions, so we want to retry
 	// if required - however we don't want to re-run tests if they fail, so do
@@ -54,8 +52,9 @@ async function runTests(testFolder: string, workspaceFolder: string, logSuffix?:
 				path.isAbsolute(workspaceFolder)
 					? workspaceFolder
 					: path.join(cwd, "src", "test", "test_projects", workspaceFolder),
-				"--user-data-dir",
-				path.join(cwd, ".dcud", testFolder),
+				"--profile-temp",
+				"--crash-reporter-directory",
+				path.join(cwd, ".crash_dumps", testFolder),
 				// Disable the Git extensions as these may be causing test failures on GitHub Actions:
 				// https://github.com/Dart-Code/Dart-Code/runs/2297610200?check_suite_focus=true#step:23:121
 				"--disable-extension",
@@ -81,8 +80,8 @@ async function runTests(testFolder: string, workspaceFolder: string, logSuffix?:
 }
 
 async function runAllTests(): Promise<void> {
-	testEnv.DART_CODE_IS_TEST_RUN = true;
-	testEnv.MOCHA_FORBID_ONLY = true;
+	testEnv.DART_CODE_IS_TEST_RUN = "true";
+	testEnv.MOCHA_FORBID_ONLY = "true";
 
 	// Ensure any necessary folders exist.
 	if (!fs.existsSync(".nyc_output"))
@@ -111,21 +110,21 @@ async function runAllTests(): Promise<void> {
 			await runTests("dart_debug", "hello_world", undefined, { DART_CODE_FORCE_SDK_DAP: "false" });
 		}
 		if (!process.env.BOT || process.env.BOT === "dart_debug_sdk_dap") {
-			await runTests("dart_debug", "hello_world", undefined, { DART_CODE_FORCE_SDK_DAP: "true" });
+			await runTests("dart_debug", "hello_world", "sdk_dap", { DART_CODE_FORCE_SDK_DAP: "true" });
 		}
 		if (!process.env.BOT || process.env.BOT === "dart_web_debug") {
 			await runTests("web_debug", "web");
 		}
 		if (!process.env.BOT || process.env.BOT === "flutter_debug") {
 			await runTests("flutter_debug", "flutter_hello_world", undefined, { DART_CODE_FORCE_SDK_DAP: "false" });
-			await runTests("flutter_bazel", "bazel_workspace/flutter_hello_world_bazel", undefined, { DART_CODE_FORCE_SDK_DAP: "false" });
+			await runTests("flutter_bazel", "bazel.code-workspace", undefined, { DART_CODE_FORCE_SDK_DAP: "false" });
 		}
 		if (!process.env.BOT || process.env.BOT === "flutter_debug_chrome") {
 			await runTests("flutter_debug", "flutter_hello_world", "chrome", { FLUTTER_TEST_DEVICE_ID: "chrome", DART_CODE_FORCE_SDK_DAP: "false" });
 		}
 		if (!process.env.BOT || process.env.BOT === "flutter_debug_sdk_dap") {
-			await runTests("flutter_debug", "flutter_hello_world", undefined, { DART_CODE_FORCE_SDK_DAP: "true" });
-			await runTests("flutter_bazel", "bazel_workspace/flutter_hello_world_bazel", "sdk_dap", { DART_CODE_FORCE_SDK_DAP: "true" });
+			await runTests("flutter_debug", "flutter_hello_world", "sdk_dap", { DART_CODE_FORCE_SDK_DAP: "true" });
+			await runTests("flutter_bazel", "bazel.code-workspace", "sdk_dap", { DART_CODE_FORCE_SDK_DAP: "true" });
 		}
 		if (!process.env.BOT || process.env.BOT === "flutter_debug_chrome_sdk_dap") {
 			await runTests("flutter_debug", "flutter_hello_world", "chrome_sdk_dap", { FLUTTER_TEST_DEVICE_ID: "chrome", DART_CODE_FORCE_SDK_DAP: "true" });
@@ -143,7 +142,9 @@ async function runAllTests(): Promise<void> {
 			await runTests("multi_project_folder", "");
 			await runTests("not_activated/flutter_create", "empty");
 			await runTests("flutter_create_tests", "flutter_create_tests.code-workspace");
+			await runTests("dart_nested", "dart_nested");
 			await runTests("dart_nested_flutter", "dart_nested_flutter");
+			await runTests("dart_nested_flutter2", "dart_nested_flutter2");
 		}
 		if (!process.env.BOT || process.env.BOT === "flutter_repo") {
 			if (process.env.FLUTTER_REPO_PATH) {
@@ -159,5 +160,4 @@ async function runAllTests(): Promise<void> {
 	}
 }
 
-// tslint:disable-next-line: no-floating-promises
-runAllTests().then(() => process.exit(exitCode));
+void runAllTests().then(() => process.exit(exitCode));

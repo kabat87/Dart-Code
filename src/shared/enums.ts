@@ -22,11 +22,11 @@ export enum TestStatus {
 export enum VmServiceExtension {
 	PlatformOverride = "ext.flutter.platformOverride",
 	DebugBanner = "ext.flutter.debugAllowBanner",
-	CheckElevations = "ext.flutter.debugCheckElevationsEnabled",
 	DebugPaint = "ext.flutter.debugPaint",
 	Driver = "ext.flutter.driver",
 	PaintBaselines = "ext.flutter.debugPaintBaselinesEnabled",
 	InspectorSelectMode = "ext.flutter.inspector.show",
+	InspectorAddPubRootDirectories = "ext.flutter.inspector.addPubRootDirectories",
 	InspectorSetPubRootDirectories = "ext.flutter.inspector.setPubRootDirectories",
 	BrightnessOverride = "ext.flutter.brightnessOverride",
 	RepaintRainbow = "ext.flutter.repaintRainbow",
@@ -37,7 +37,6 @@ export enum VmServiceExtension {
 /// The service extensions we know about and allow toggling via commands.
 export enum VmService {
 	HotReload = "reloadSources",
-	HotRestart = "hotRestart",
 	LaunchDevTools = "launchDevTools",
 }
 
@@ -62,6 +61,7 @@ export enum LogCategory {
 	FlutterTest,
 	VmService,
 	WebDaemon,
+	DartToolingDaemon,
 }
 
 export enum LogSeverity {

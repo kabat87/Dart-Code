@@ -1,38 +1,46 @@
 import * as path from "path";
 import * as vs from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
-import { iUnderstandAction } from "../../shared/constants";
+import { iUnderstandAction, tenSecondsInMs } from "../../shared/constants";
 import { DartWorkspaceContext, Logger } from "../../shared/interfaces";
 import { uniq } from "../../shared/utils";
 import { fsPath } from "../../shared/utils/fs";
+import { getPubWorkspaceStatus, isValidPubGetTarget, promptToRunPubGet, promptToRunPubUpgrade, runPubGet } from "../../shared/vscode/pub";
 import { getAllProjectFolders } from "../../shared/vscode/utils";
 import { Context } from "../../shared/vscode/workspace";
 import { config } from "../config";
-import { isPubGetProbablyRequired, promptToRunPubGet } from "../pub/pub";
 import * as util from "../utils";
+import { getExcludedFolders } from "../utils";
 import { getFolderToRunCommandIn } from "../utils/vscode/projects";
 import { BaseSdkCommands, commandState } from "./sdk";
 
 let isFetchingPackages = false;
-let runPubGetDelayTimer: NodeJS.Timer | undefined;
+let runPubGetDelayTimer: NodeJS.Timeout | undefined;
+
+/// The reason for the last pubspec save. Resets to undefined after 1s so can
+/// be used to tell if a watcher event was likely the result of an explicit in-IDE
+/// save versus modified externally.
 let lastPubspecSaveReason: vs.TextDocumentSaveReason | undefined;
 
 export class PackageCommands extends BaseSdkCommands {
 	constructor(logger: Logger, context: Context, workspace: DartWorkspaceContext, dartCapabilities: DartCapabilities) {
 		super(logger, context, workspace, dartCapabilities);
 		this.disposables.push(vs.commands.registerCommand("dart.getPackages", this.getPackages, this));
+		this.disposables.push(vs.commands.registerCommand("dart.getPackages.all", this.getPackagesForAllProjects, this));
 		this.disposables.push(vs.commands.registerCommand("dart.listOutdatedPackages", this.listOutdatedPackages, this));
 		this.disposables.push(vs.commands.registerCommand("dart.upgradePackages", this.upgradePackages, this));
 		this.disposables.push(vs.commands.registerCommand("dart.upgradePackages.majorVersions", this.upgradePackagesMajorVersions, this));
 
 		// Pub commands.
 		this.disposables.push(vs.commands.registerCommand("pub.get", (selection) => vs.commands.executeCommand("dart.getPackages", selection)));
+		this.disposables.push(vs.commands.registerCommand("pub.get.all", (selection) => vs.commands.executeCommand("dart.getPackages.all", selection)));
 		this.disposables.push(vs.commands.registerCommand("pub.upgrade", (selection) => vs.commands.executeCommand("dart.upgradePackages", selection)));
 		this.disposables.push(vs.commands.registerCommand("pub.upgrade.majorVersions", (selection) => vs.commands.executeCommand("dart.upgradePackages.majorVersions", selection)));
 		this.disposables.push(vs.commands.registerCommand("pub.outdated", (selection) => vs.commands.executeCommand("dart.listOutdatedPackages", selection)));
 
 		// Flutter commands.
 		this.disposables.push(vs.commands.registerCommand("flutter.packages.get", (selection) => vs.commands.executeCommand("dart.getPackages", selection)));
+		this.disposables.push(vs.commands.registerCommand("flutter.packages.get.all", (selection) => vs.commands.executeCommand("dart.getPackages.all", selection)));
 		this.disposables.push(vs.commands.registerCommand("flutter.packages.upgrade", (selection) => vs.commands.executeCommand("dart.upgradePackages", selection)));
 		this.disposables.push(vs.commands.registerCommand("flutter.packages.upgrade.majorVersions", (selection) => vs.commands.executeCommand("dart.upgradePackages.majorVersions", selection)));
 		this.disposables.push(vs.commands.registerCommand("flutter.packages.outdated", (selection) => vs.commands.executeCommand("dart.listOutdatedPackages", selection)));
@@ -41,7 +49,17 @@ export class PackageCommands extends BaseSdkCommands {
 		this.setupPubspecWatcher();
 	}
 
-	private async getPackages(uri: string | vs.Uri | undefined) {
+	private async getPackages(uri: string | vs.Uri | vs.Uri[] | undefined) {
+		if (!config.enablePub)
+			return;
+
+		if (Array.isArray(uri)) {
+			for (const item of uri) {
+				await this.getPackages(item);
+			}
+			return;
+		}
+
 		if (!uri || !(uri instanceof vs.Uri)) {
 			uri = await getFolderToRunCommandIn(this.logger, "Select which folder to get packages for");
 			// If the user cancelled, bail out (otherwise we'll prompt them again below).
@@ -51,7 +69,15 @@ export class PackageCommands extends BaseSdkCommands {
 		if (typeof uri === "string")
 			uri = vs.Uri.file(uri);
 
-		const additionalArgs = config.offline ? ["--offline"] : [];
+		// Exclude folders we should never run pub get for.
+		if (!isValidPubGetTarget(uri).valid)
+			return;
+
+		const additionalArgs = [];
+		if (config.offline)
+			additionalArgs.push("--offline");
+		if (this.dartCapabilities.needsNoExampleForPubGet)
+			additionalArgs.push("--no-example");
 
 		if (util.isInsideFlutterProject(uri)) {
 			return this.runFlutter(["pub", "get", ...additionalArgs], uri);
@@ -60,7 +86,19 @@ export class PackageCommands extends BaseSdkCommands {
 		}
 	}
 
+	private async getPackagesForAllProjects() {
+		if (!config.enablePub)
+			return;
+
+		const allFolders = await getAllProjectFolders(this.logger, getExcludedFolders, { requirePubspec: true, sort: true, searchDepth: config.projectSearchDepth });
+		const uriFolders = allFolders.map((f) => vs.Uri.file(f));
+		await vs.commands.executeCommand("dart.getPackages", uriFolders);
+	}
+
 	private async listOutdatedPackages(uri: string | vs.Uri | undefined) {
+		if (!config.enablePub)
+			return;
+
 		if (!uri || !(uri instanceof vs.Uri)) {
 			uri = await getFolderToRunCommandIn(this.logger, "Select which folder to check for outdated packages");
 			// If the user cancelled, bail out (otherwise we'll prompt them again below).
@@ -76,7 +114,17 @@ export class PackageCommands extends BaseSdkCommands {
 			return this.runPub(["outdated"], uri, true);
 	}
 
-	private async upgradePackages(uri: string | vs.Uri | undefined) {
+	private async upgradePackages(uri: string | vs.Uri | vs.Uri[] | undefined) {
+		if (!config.enablePub)
+			return;
+
+		if (Array.isArray(uri)) {
+			for (const item of uri) {
+				await this.upgradePackages(item);
+			}
+			return;
+		}
+
 		if (!uri || !(uri instanceof vs.Uri)) {
 			uri = await getFolderToRunCommandIn(this.logger, "Select which folder to upgrade packages in");
 			// If the user cancelled, bail out (otherwise we'll prompt them again below).
@@ -85,6 +133,11 @@ export class PackageCommands extends BaseSdkCommands {
 		}
 		if (typeof uri === "string")
 			uri = vs.Uri.file(uri);
+
+		// Exclude folders we should never run pub get for.
+		if (!isValidPubGetTarget(uri).valid)
+			return;
+
 		if (util.isInsideFlutterProject(uri))
 			return this.runFlutter(["pub", "upgrade"], uri);
 		else
@@ -92,8 +145,11 @@ export class PackageCommands extends BaseSdkCommands {
 	}
 
 	private async upgradePackagesMajorVersions(uri: string | vs.Uri | undefined) {
+		if (!config.enablePub)
+			return;
+
 		if (!this.dartCapabilities.supportsPubUpgradeMajorVersions) {
-			vs.window.showErrorMessage("Your current Dart SDK does not support 'pub upgrade --major-versions'");
+			void vs.window.showErrorMessage("Your current Dart SDK does not support 'pub upgrade --major-versions'");
 			return;
 		}
 
@@ -120,21 +176,30 @@ export class PackageCommands extends BaseSdkCommands {
 	}
 
 	private setupPubspecWatcher() {
+		// Create the watcher regardless of enablePub setting, because the handler will check
+		// and then we don't have to create/destroy as settings change.
 		this.disposables.push(vs.workspace.onWillSaveTextDocument((e) => {
-			if (path.basename(fsPath(e.document.uri)).toLowerCase() === "pubspec.yaml")
+			const name = path.basename(fsPath(e.document.uri)).toLowerCase();
+			if (name === "pubspec.yaml" || name === "pubspec_overrides.yaml") {
 				lastPubspecSaveReason = e.reason;
+				setTimeout(() => lastPubspecSaveReason = undefined, 1000);
+			}
 		}));
-		const watcher = vs.workspace.createFileSystemWatcher("**/pubspec.yaml");
+		const watcher = vs.workspace.createFileSystemWatcher("**/pubspec{,_overrides}.yaml");
 		this.disposables.push(watcher);
 		watcher.onDidChange(this.handlePubspecChange, this);
 		watcher.onDidCreate(this.handlePubspecChange, this);
 	}
 
 	private handlePubspecChange(uri: vs.Uri) {
+		if (!config.enablePub)
+			return;
+
+		const isManualSave = !!lastPubspecSaveReason;
 		const filePath = fsPath(uri);
 
 		// Never do anything for files inside hidden or build folders.
-		if (filePath.includes(`${path.sep}.`) || filePath.includes(`${path.sep}build${path.sep}`)) {
+		if (filePath.includes(`${path.sep}.`) || (!isManualSave && filePath.includes(`${path.sep}build${path.sep}`))) {
 			this.logger.info(`Skipping pubspec change for ignored folder ${filePath}`);
 			return;
 		}
@@ -143,14 +208,14 @@ export class PackageCommands extends BaseSdkCommands {
 		const conf = config.for(uri);
 
 		// Don't do anything if we're disabled.
-		if (!conf.runPubGetOnPubspecChanges) {
+		if (conf.runPubGetOnPubspecChanges === "never") {
 			this.logger.info(`Automatically running "pub get" is disabled`);
 			return;
 		}
 
 		// Or if the workspace config says we shouldn't run.
-		if (this.workspace.config.disableAutomaticPackageGet) {
-			this.logger.info(`Workspace suppresses automatic "pub get"`);
+		if (this.workspace.config.disableAutomaticPub) {
+			this.logger.info(`Workspace suppresses automatic "pub"`);
 			return;
 		}
 
@@ -172,20 +237,27 @@ export class PackageCommands extends BaseSdkCommands {
 			? 10000
 			: 1000;
 
+		const projectUri = vs.Uri.file(path.dirname(filePath));
 		runPubGetDelayTimer = setTimeout(() => {
 			runPubGetDelayTimer = undefined;
 			lastPubspecSaveReason = undefined;
-			// tslint:disable-next-line: no-floating-promises
-			this.fetchPackagesOrPrompt(uri);
+			void this.fetchPackagesOrPrompt(projectUri, { alwaysPrompt: conf.runPubGetOnPubspecChanges === "prompt" });
 		}, debounceDuration); // TODO: Does this need to be configurable?
 	}
 
-	public async fetchPackagesOrPrompt(uri: vs.Uri | undefined, options?: { alwaysPrompt?: boolean }): Promise<void> {
+	public async fetchPackagesOrPrompt(uri: vs.Uri | undefined, options?: { alwaysPrompt?: boolean, upgradeOnSdkChange?: boolean }): Promise<void> {
+		if (!config.enablePub)
+			return;
+
 		if (isFetchingPackages) {
 			this.logger.info(`Already running pub get, skipping!`);
 			return;
 		}
 		isFetchingPackages = true;
+		// VS Code will hide any prompt after 10seconds, so if the user didn't respond within 10s we assume this prompt is not
+		// going to be responded to and should clear the flag to avoid run-pub-get-on-save not working.
+		setTimeout(() => isFetchingPackages = false, tenSecondsInMs);
+
 		// TODO: Extract this into a Pub class with the things in pub.ts.
 
 		try {
@@ -196,21 +268,50 @@ export class PackageCommands extends BaseSdkCommands {
 			//   0 - then just use Uri
 			//   1 - then just do that one
 			//   more than 1 - prompt to do all
-			const folders = await getAllProjectFolders(this.logger, util.getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
-			const foldersRequiringPackageGet = uniq(folders)
-				.map(vs.Uri.file)
-				.filter((uri) => config.for(uri).promptToGetPackages)
-				.filter((uri) => isPubGetProbablyRequired(this.sdks, this.logger, uri));
-			this.logger.info(`Found ${foldersRequiringPackageGet.length} folders requiring "pub get":${foldersRequiringPackageGet.map((uri) => `\n    ${fsPath(uri)}`).join("")}`);
-			if (!forcePrompt && foldersRequiringPackageGet.length === 0)
-				await vs.commands.executeCommand("dart.getPackages", uri);
-			else if (!forcePrompt && foldersRequiringPackageGet.length === 1)
-				await vs.commands.executeCommand("dart.getPackages", foldersRequiringPackageGet[0]);
-			else if (foldersRequiringPackageGet.length)
-				promptToRunPubGet(foldersRequiringPackageGet);
+			const projectFolders = await getAllProjectFolders(this.logger, util.getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
+			const pubStatuses = getPubWorkspaceStatus(
+				this.sdks,
+				this.logger,
+				uniq(projectFolders).map(vs.Uri.file).filter((uri) => config.for(uri).promptToGetPackages)
+			)
+				.filter((result) => result.pubRequired);
+			this.logger.info(`Found pub status for ${pubStatuses.length} folders:${pubStatuses.map((result) => `\n    ${fsPath(result.folderUri)} (pubRequired?: ${result.pubRequired}, reason: ${result.reason})`).join("")}`);
+
+			const someProjectsRequirePubUpgrade = pubStatuses.some((result) => result.pubRequired === "UPGRADE");
+			const projectsRequiringPub = pubStatuses.map((result) => result.folderUri);
+
+			if (options?.upgradeOnSdkChange && someProjectsRequirePubUpgrade)
+				await promptToRunPubUpgrade(projectsRequiringPub);
+			else if (!forcePrompt && projectsRequiringPub.length === 0 && uri)
+				await this.runPubGetWithRelatives(projectFolders, uri);
+			else if (!forcePrompt && projectsRequiringPub.length === 1)
+				await this.runPubGetWithRelatives(projectFolders, projectsRequiringPub[0]);
+			else if (projectsRequiringPub.length)
+				await promptToRunPubGet(projectsRequiringPub);
 		} finally {
 			isFetchingPackages = false;
 		}
 	}
 
+	private async runPubGetWithRelatives(allProjectFolders: string[], triggeredProjectUri: vs.Uri) {
+		const triggeredProjectFolder = fsPath(triggeredProjectUri);
+
+		const walkDirection = config.runPubGetOnNestedProjects;
+
+		const fetchBoth = walkDirection === "both";
+		const fetchUp = walkDirection === "above" || fetchBoth;
+		const fetchDown = walkDirection === "below" || fetchBoth;
+		let projectsToFetch = [triggeredProjectFolder];
+		if (walkDirection) {
+			for (const projectFolder of allProjectFolders) {
+				if (fetchUp && triggeredProjectFolder.startsWith(projectFolder))
+					projectsToFetch.push(projectFolder);
+				if (fetchDown && projectFolder.startsWith(triggeredProjectFolder))
+					projectsToFetch.push(projectFolder);
+			}
+		}
+
+		projectsToFetch = uniq(projectsToFetch);
+		await runPubGet(projectsToFetch.map((path) => vs.Uri.file(path)));
+	}
 }

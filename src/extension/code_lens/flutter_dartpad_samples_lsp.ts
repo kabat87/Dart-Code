@@ -16,14 +16,19 @@ export class LspFlutterDartPadSamplesCodeLensProvider implements CodeLensProvide
 	private readonly flutterPackagesFolder: string;
 
 	constructor(private readonly logger: Logger, private readonly analyzer: LspAnalyzer, private readonly sdks: FlutterSdks) {
-		this.disposables.push(this.analyzer.fileTracker.onOutline.listen(() => {
+		this.disposables.push(this.analyzer.fileTracker.onOutline(() => {
 			this.onDidChangeCodeLensesEmitter.fire();
 		}));
 
 		this.disposables.push(commands.registerCommand("_dart.openDartPadSample", async (sample: DartPadSampleInfo) => {
 			// Link down to first code snippet.
 			const fragment = `#${sample.libraryName}.${sample.className}.1`;
-			const url = `https://api.flutter.dev/flutter/${sample.libraryName}/${sample.className}-class.html${fragment}`;
+			const suffix = sample.elementKind === "MIXIN"
+				? "mixin"
+				: sample.elementKind === "EXTENSION"
+					? "extension-type"
+					: "class";
+			const url = `https://api.flutter.dev/flutter/${sample.libraryName}/${sample.className}-${suffix}.html${fragment}`;
 			await envUtils.openInBrowser(url);
 		}));
 
@@ -75,6 +80,7 @@ export class LspFlutterDartPadSamplesCodeLensProvider implements CodeLensProvide
 export interface DartPadSampleInfo {
 	libraryName: string;
 	className: string;
+	elementKind: string;
 	offset: number;
 	length: number;
 }

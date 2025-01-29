@@ -1,4 +1,5 @@
 import { strict as assert } from "assert";
+import * as sinon from "sinon";
 import { commands, window } from "vscode";
 import { DaemonCapabilities } from "../../shared/capabilities/flutter";
 import { runFlutterCreatePrompt, yesAction } from "../../shared/constants";
@@ -6,18 +7,31 @@ import * as f from "../../shared/flutter/daemon_interfaces";
 import { CustomEmulatorDefinition, IAmDisposable, IFlutterDaemon } from "../../shared/interfaces";
 import { UnknownResponse } from "../../shared/services/interfaces";
 import { FlutterDeviceManager, PickableDevice } from "../../shared/vscode/device_manager";
-import { logger, sb } from "../helpers";
+import { activateWithoutAnalysis, delay, extApi, logger, sb } from "../helpers";
 import { FakeProcessStdIOService } from "../services/fake_stdio_service";
-import sinon = require("sinon");
 
 describe("device_manager", () => {
 	let dm: FlutterDeviceManager;
 	let daemon: FakeFlutterDaemon;
 
+	beforeEach(() => activateWithoutAnalysis());
 	beforeEach(() => {
+		extApi.context.workspaceLastFlutterDeviceId = undefined;
 		daemon = new FakeFlutterDaemon();
 		// TODO: Tests for custom emulators.
-		dm = new FlutterDeviceManager(logger, daemon, { flutterCustomEmulators: customEmulators, flutterSelectDeviceWhenConnected: true, flutterShowEmulators: "local", projectSearchDepth: 3 });
+		dm = new FlutterDeviceManager(
+			logger,
+			daemon,
+			{
+				flutterCustomEmulators: customEmulators,
+				flutterRememberSelectedDevice: true,
+				flutterSelectDeviceWhenConnected: true,
+				flutterShowEmulators: "local",
+				projectSearchDepth: 3,
+			},
+			extApi.workspaceContext,
+			extApi.context,
+		);
 	});
 
 	afterEach(() => {
@@ -65,6 +79,22 @@ describe("device_manager", () => {
 		assert.deepStrictEqual(dm.currentDevice, emulatedAndroidMobile);
 		assert.deepStrictEqual(dm.labelForDevice(dm.currentDevice), androidEmulator.name);
 		assert.deepStrictEqual(dm.labelForDevice(dm.currentDevice, { withIcon: true }), "$(device-mobile) " + androidEmulator.name);
+	});
+
+	it("does not include bogus emulators", async () => {
+		const rawEmulatorLabels = (await daemon.getEmulators()).map((e) => e.name);
+		const emulatorLabels = (await dm.getPickableEmulators(false)).map((e) => e.label);
+		assert.deepStrictEqual(rawEmulatorLabels, [
+			androidEmulator.name,
+			androidBogusEmulatorId.name,
+			androidBogusEmulatorName.name,
+			androidEmulatorToOverride.name,
+		]);
+		assert.deepStrictEqual(emulatorLabels, [
+			androidEmulator.name,
+			customEmulator2.name,
+			customEmulator1.name,
+		]);
 	});
 
 	it("uses the standard device name for iOS simulator devices", async () => {
@@ -195,6 +225,17 @@ describe("device_manager", () => {
 		assert.deepStrictEqual(dm.currentDevice, physicalAndroidMobile);
 	});
 
+	it("will auto-select a non-ephemeral device if it is preferred", async () => {
+		await daemon.enablePlatform(desktop.platformType); // Ensure Desktop is valid before anything is cached.
+		await daemon.connect(physicalAndroidMobile, true);
+		assert.deepStrictEqual(dm.currentDevice, physicalAndroidMobile);
+
+		// Connecting desktop does change the selected device.
+		extApi.context.workspaceLastFlutterDeviceId = desktop.id;
+		await daemon.connect(desktop, true);
+		assert.deepStrictEqual(dm.currentDevice, desktop);
+	});
+
 	it("shows unsupported platforms and prompts to run flutter create if selected", async () => {
 		await daemon.connect(desktop, false);
 		const devices = dm.getPickableDevices(["android"]);
@@ -218,25 +259,48 @@ describe("device_manager", () => {
 		// Check we prompted, and when we said yes, we called the command.
 		assert.equal(runCreatePrompt.called, true);
 		assert.equal(flutterCreateCommand.called, true);
+	});
 
+	it("tryGetSupportedPlatforms returns platforms", async () => {
+		daemon.supportedPlatforms = ["a", "b"];
+		const platforms = await dm.tryGetSupportedPlatforms("fake");
+		assert.deepStrictEqual(platforms?.platforms, ["a", "b"]);
+	});
+
+	it("handles errors in tryGetSupportedPlatforms", async () => {
+		daemon.supportedPlatforms = ["a", "b"];
+		const platforms = await dm.tryGetSupportedPlatforms(""); // throws because falsy path
+		assert.equal(platforms, undefined);
+	});
+
+	it("handles unresponsive tryGetSupportedPlatforms", async () => {
+		daemon.supportedPlatforms = ["a", "b"];
+		daemon.supportedPlatformsDelaySeconds = 10;
+		const platforms = await dm.tryGetSupportedPlatforms("fake");
+		assert.equal(platforms, undefined);
 	});
 });
 
 class FakeFlutterDaemon extends FakeProcessStdIOService<unknown> implements IFlutterDaemon {
 	public capabilities = DaemonCapabilities.empty;
 	public supportedPlatforms: f.PlatformType[] | undefined;
+	public supportedPlatformsDelaySeconds: number | undefined;
+	public daemonStarted = Promise.resolve();
 
 	public async enablePlatformGlobally(platformType: string): Promise<void> { }
+
+	public async enablePlatform(platformType: string): Promise<void> {
+		this.supportedPlatforms = this.supportedPlatforms ?? [];
+		this.supportedPlatforms.push(platformType);
+	}
 
 	public async checkIfPlatformGloballyDisabled(platformType: string): Promise<boolean> {
 		return false;
 	}
 
 	public async connect(d: f.Device, markTypeAsValid: boolean): Promise<void> {
-		if (markTypeAsValid && d.platformType) {
-			this.supportedPlatforms = this.supportedPlatforms ?? [];
-			this.supportedPlatforms.push(d.platformType);
-		}
+		if (markTypeAsValid && d.platformType)
+			await this.enablePlatform(d.platformType);
 
 		await this.notify(this.deviceAddedSubscriptions, d);
 	}
@@ -260,7 +324,7 @@ class FakeFlutterDaemon extends FakeProcessStdIOService<unknown> implements IFlu
 		throw new Error("Method not implemented.");
 	}
 	public async getEmulators(): Promise<f.FlutterEmulator[]> {
-		return [androidEmulator, androidEmulatorToOverride];
+		return [androidEmulator, androidBogusEmulatorId, androidBogusEmulatorName, androidEmulatorToOverride];
 	}
 	public launchEmulator(emulatorId: string): Thenable<void> {
 		throw new Error("Method not implemented.");
@@ -271,6 +335,9 @@ class FakeFlutterDaemon extends FakeProcessStdIOService<unknown> implements IFlu
 	public async getSupportedPlatforms(projectRoot: string): Promise<f.SupportedPlatformsResponse> {
 		if (!projectRoot)
 			throw new Error("projectRoot must be specified!");
+
+		if (this.supportedPlatformsDelaySeconds)
+			await delay(this.supportedPlatformsDelaySeconds * 1000);
 
 		return { platforms: this.supportedPlatforms ?? ["android", "ios"] };
 	}
@@ -369,6 +436,20 @@ const androidEmulatorToOverride: f.FlutterEmulator = {
 	category: "mobile",
 	id: "my_emulator_id_to_override",
 	name: "WILL BE OVERRIDEN EMULATOR",
+	platformType: "android",
+};
+
+const androidBogusEmulatorName: f.FlutterEmulator = {
+	category: "mobile",
+	id: "my_bogus_emulator",
+	name: "INFO     | my error message https://github.com/Dart-Code/Dart-Code/issues/5052",
+	platformType: "android",
+};
+
+const androidBogusEmulatorId: f.FlutterEmulator = {
+	category: "mobile",
+	id: "INFO     | my_bogus_emulator",
+	name: "My bogus emulator",
 	platformType: "android",
 };
 

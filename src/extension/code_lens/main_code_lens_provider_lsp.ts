@@ -14,7 +14,7 @@ export class LspMainCodeLensProvider implements CodeLensProvider, IAmDisposable 
 	public readonly onDidChangeCodeLenses: Event<void> = this.onDidChangeCodeLensesEmitter.event;
 
 	constructor(private readonly logger: Logger, private readonly analyzer: LspAnalyzer) {
-		this.disposables.push(this.analyzer.fileTracker.onOutline.listen(() => {
+		this.disposables.push(this.analyzer.fileTracker.onOutline(() => {
 			this.onDidChangeCodeLensesEmitter.fire();
 		}));
 	}
@@ -43,15 +43,15 @@ export class LspMainCodeLensProvider implements CodeLensProvider, IAmDisposable 
 		if (!templatesHaveDebug)
 			results.push(this.createCodeLens(document, mainFunction, "Debug", true));
 		if (fileType === "file" && !templatesHaveProfile && isInsideFlutterProject(document.uri))
-			results.push(this.createCodeLens(document, mainFunction, "Profile", false, { "flutterMode": "profile", "openDevTools": "performance" }));
+			results.push(this.createCodeLens(document, mainFunction, "Profile", false, { flutterMode: "profile", openDevTools: "performance" }));
 		return results.concat(templates.map((t) => this.createCodeLens(document, mainFunction, t.name, !t.noDebug, t)));
 	}
 
 	private createCodeLens(document: TextDocument, mainFunction: Outline, name: string, debug: boolean, template?: { [key: string]: string }): CodeLens {
 		return new CodeLens(
-			lspToRange(mainFunction.range),
+			lspToRange(mainFunction.codeRange),
 			{
-				arguments: template ? [document.uri, template] : [document.uri],
+				arguments: [{ resource: document.uri, launchTemplate: template }],
 				command: debug ? "dart.startDebugging" : "dart.startWithoutDebugging",
 				title: name,
 			}

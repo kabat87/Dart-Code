@@ -1,20 +1,22 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as vs from "vscode";
-import { DART_CREATE_PROJECT_TRIGGER_FILE, flutterExtensionIdentifier, FLUTTER_CREATE_PROJECT_TRIGGER_FILE, installFlutterExtensionPromptKey, isWin, noAction, recommendedSettingsUrl, showRecommendedSettingsAction, useRecommendedSettingsPromptKey, userPromptContextPrefix, yesAction } from "../shared/constants";
+import { DartCapabilities } from "../shared/capabilities/dart";
+import { DART_CREATE_PROJECT_TRIGGER_FILE, FLUTTER_CREATE_PROJECT_TRIGGER_FILE, installFlutterExtensionPromptKey, isWin, noAction, recommendedSettingsUrl, showRecommendedSettingsAction, useRecommendedSettingsPromptKey, userPromptContextPrefix, yesAction } from "../shared/constants";
 import { LogCategory } from "../shared/enums";
 import { WebClient } from "../shared/fetch";
 import { Analytics, DartProjectTemplate, FlutterCreateCommandArgs, FlutterCreateTriggerData, Logger } from "../shared/interfaces";
 import { fsPath } from "../shared/utils/fs";
-import { checkHasFlutterExtension, extensionVersion, hasFlutterExtension, isDevExtension, isPreReleaseExtension } from "../shared/vscode/extension_utils";
-import { showFlutterSurveyNotificationIfAppropriate } from "../shared/vscode/user_prompts";
+import { checkHasFlutterExtension, extensionVersion, getExtensionVersionForReleaseNotes, hasFlutterExtension, isDevExtension } from "../shared/vscode/extension_utils";
+import { showFlutterSurveyNotificationIfAppropriate, showSdkDeprecationNoticeIfAppropriate } from "../shared/vscode/user_prompts";
 import { envUtils, getDartWorkspaceFolders } from "../shared/vscode/utils";
 import { Context } from "../shared/vscode/workspace";
 import { WorkspaceContext } from "../shared/workspace";
 import { markProjectCreationEnded, markProjectCreationStarted } from "./commands/sdk";
-import { promptToReloadExtension } from "./utils";
+import { config } from "./config";
+import { ExtensionRecommentations } from "./recommendations/recommendations";
 
-export async function showUserPrompts(logger: Logger, context: Context, webClient: WebClient, analytics: Analytics, workspaceContext: WorkspaceContext): Promise<void> {
+export async function showUserPrompts(logger: Logger, context: Context, webClient: WebClient, analytics: Analytics, workspaceContext: WorkspaceContext, dartCapabilities: DartCapabilities, extensionRecommendations: ExtensionRecommentations): Promise<void> {
 	if (workspaceContext.config.disableStartupPrompts)
 		return;
 
@@ -31,13 +33,16 @@ export async function showUserPrompts(logger: Logger, context: Context, webClien
 		prompt().then((res) => context.update(stateKey, res), error);
 	}
 
+	if (await showSdkDeprecationNoticeIfAppropriate(logger, context, workspaceContext, dartCapabilities))
+		return; // We showed it, so skip any more.
+
 	if (workspaceContext.hasAnyFlutterProjects && !hasFlutterExtension && !shouldSuppress(installFlutterExtensionPromptKey)) {
 		// It's possible that we got here when the user installed the Flutter extension, because it causes Dart to install
 		// first and activate. So, before showing this prompt we'll wait 30 seconds and then check if we still don't
 		// have the Flutter extension, and then show the prompt.
 		await new Promise((resolve) => setTimeout(resolve, 20000));
 		if (!checkHasFlutterExtension())
-			return showPrompt(installFlutterExtensionPromptKey, promptToInstallFlutterExtension);
+			return showPrompt(installFlutterExtensionPromptKey, () => extensionRecommendations.promptToInstallFlutterExtension());
 	}
 
 	// Check the user hasn't installed Flutter in a forbidden location that will cause issues.
@@ -56,21 +61,21 @@ export async function showUserPrompts(logger: Logger, context: Context, webClien
 
 			if (installedForbiddenLocation) {
 				logger.error(`Flutter is installed in protected folder: ${installedForbiddenLocation}`);
-				vs.window.showErrorMessage("The Flutter SDK is installed in a protected folder and may not function correctly. Please move the SDK to a location that is user-writable without Administration permissions and restart.");
+				void vs.window.showErrorMessage("The Flutter SDK is installed in a protected folder and may not function correctly. Please move the SDK to a location that is user-writable without Administration permissions and restart.");
 			}
 		}
 	}
 
+	const extensionVersionForReleaseNotes = getExtensionVersionForReleaseNotes();
 	const lastSeenVersionNotification = context.lastSeenVersion;
 	if (!lastSeenVersionNotification) {
 		// If we've not got a stored version, this is the first install, so just
 		// stash the current version and don't show anything.
-		context.lastSeenVersion = extensionVersion;
-	} else if (!isDevExtension && !isPreReleaseExtension && lastSeenVersionNotification !== extensionVersion) {
-		const versionLink = extensionVersion.split(".").slice(0, 2).join(".").replace(".", "-");
-		// tslint:disable-next-line: no-floating-promises
-		promptToShowReleaseNotes(extensionVersion, versionLink).then(() =>
-			context.lastSeenVersion = extensionVersion,
+		context.lastSeenVersion = extensionVersionForReleaseNotes;
+	} else if (!isDevExtension && lastSeenVersionNotification !== extensionVersionForReleaseNotes) {
+		const versionLink = extensionVersionForReleaseNotes.split(".").slice(0, 2).join(".").replace(".", "-");
+		void promptToShowReleaseNotes(extensionVersion, versionLink).then(() =>
+			context.lastSeenVersion = extensionVersionForReleaseNotes,
 		);
 		return;
 	}
@@ -80,12 +85,22 @@ export async function showUserPrompts(logger: Logger, context: Context, webClien
 			return; // Bail if we showed it, so we won't show any other notifications.
 	}
 
-	if (!shouldSuppress(useRecommendedSettingsPromptKey)) {
+	if (!shouldSuppress(useRecommendedSettingsPromptKey) && !hasAnyExistingDartSettings()) {
 		showPrompt(useRecommendedSettingsPromptKey, promptToUseRecommendedSettings);
 		return;
 	}
+}
 
-	// (though, there are no other notifications right now...)
+function hasAnyExistingDartSettings(): boolean {
+	const topLevelConfig = vs.workspace.getConfiguration("", null);
+	for (const configKey of ["dart", "[dart]"]) {
+		const dartConfig = topLevelConfig.inspect(configKey);
+		if (dartConfig?.globalValue || dartConfig?.globalLanguageValue
+			|| dartConfig?.workspaceValue || dartConfig?.workspaceLanguageValue
+			|| dartConfig?.workspaceFolderValue || dartConfig?.workspaceFolderLanguageValue)
+			return true;
+	}
+	return false;
 }
 
 async function promptToUseRecommendedSettings(): Promise<boolean> {
@@ -103,30 +118,6 @@ async function promptToUseRecommendedSettings(): Promise<boolean> {
 	return true;
 }
 
-async function promptToInstallFlutterExtension(): Promise<boolean> {
-	const installExtension = "Install Flutter Extension";
-	const res = await vs.window.showInformationMessage(
-		"The Flutter extension is required to work with Flutter projects.",
-		installExtension,
-	);
-	if (res === installExtension) {
-		await vs.window.withProgress({ location: vs.ProgressLocation.Notification },
-			(progress) => {
-				progress.report({ message: "Installing Flutter extension" });
-
-				return new Promise<void>((resolve) => {
-					vs.extensions.onDidChange((e) => resolve());
-					vs.commands.executeCommand("workbench.extensions.installExtension", flutterExtensionIdentifier);
-				});
-			},
-		);
-		// tslint:disable-next-line: no-floating-promises
-		promptToReloadExtension();
-	}
-
-	return false;
-}
-
 async function promptToShowReleaseNotes(versionDisplay: string, versionLink: string): Promise<boolean> {
 	const res = await vs.window.showInformationMessage(
 		`Dart Code has been updated to v${versionDisplay}`,
@@ -139,23 +130,23 @@ async function promptToShowReleaseNotes(versionDisplay: string, versionLink: str
 }
 
 function error(err: any) {
-	vs.window.showErrorMessage(`${err.message ?? err}`);
+	void vs.window.showErrorMessage(`${err.message ?? err}`);
 }
 
 export async function handleNewProjects(logger: Logger, context: Context): Promise<void> {
 	await Promise.all(getDartWorkspaceFolders().map(async (wf) => {
 		try {
-			await handleStagehandTrigger(logger, wf, DART_CREATE_PROJECT_TRIGGER_FILE);
+			await handleDartCreateTrigger(logger, wf, DART_CREATE_PROJECT_TRIGGER_FILE);
 			await handleFlutterCreateTrigger(wf);
 		} catch (e) {
 			logger.error("Failed to create project");
 			logger.error(e);
-			vs.window.showErrorMessage("Failed to create project");
+			void vs.window.showErrorMessage("Failed to create project");
 		}
 	}));
 }
 
-async function handleStagehandTrigger(logger: Logger, wf: vs.WorkspaceFolder, triggerFilename: string): Promise<void> {
+async function handleDartCreateTrigger(logger: Logger, wf: vs.WorkspaceFolder, triggerFilename: string): Promise<void> {
 	const triggerFile = path.join(fsPath(wf.uri), triggerFilename);
 	if (!fs.existsSync(triggerFile))
 		return;
@@ -165,9 +156,9 @@ async function handleStagehandTrigger(logger: Logger, wf: vs.WorkspaceFolder, tr
 	try {
 		template = JSON.parse(templateJson);
 	} catch (e) {
-		logger.error("Failed to get Stagehand templates");
+		logger.error("Failed to get project templates");
 		logger.error(e);
-		vs.window.showErrorMessage("Failed to run Stagehand to create project");
+		void vs.window.showErrorMessage("Failed to get project templates to create project");
 		return;
 	}
 	fs.unlinkSync(triggerFile);
@@ -225,9 +216,9 @@ function handleFlutterWelcome(workspaceFolder: vs.WorkspaceFolder, triggerData: 
 	const entryFile = path.join(fsPath(workspaceFolder.uri), "lib/main.dart");
 	openFile(entryFile);
 	if (triggerData?.sample)
-		vs.window.showInformationMessage(`${triggerData.sample} sample ready! Press F5 to start running.`);
+		void vs.window.showInformationMessage(`${triggerData.sample} sample ready! Press F5 to start running.`);
 	else
-		vs.window.showInformationMessage("Your Flutter project is ready! Press F5 to start running.");
+		void vs.window.showInformationMessage("Your Flutter project is ready! Press F5 to start running.");
 }
 
 function handleDartWelcome(workspaceFolder: vs.WorkspaceFolder, template: DartProjectTemplate) {
@@ -235,7 +226,57 @@ function handleDartWelcome(workspaceFolder: vs.WorkspaceFolder, template: DartPr
 	const projectName = path.basename(workspacePath);
 	const entryFile = path.join(workspacePath, template.entrypoint.replace("__projectName__", projectName));
 	openFile(entryFile);
-	vs.window.showInformationMessage(`${template.label} project ready!`);
+	void vs.window.showInformationMessage(`${template.label} project ready!`);
+}
+
+
+let checkForLargeNumberOfTodosHasPromptedAboutManyTodosThisSession = false;
+
+/**
+ * Checks if there are a large number of TODO diagnostics in the workspace and if so, prompts
+ * to turn them off.
+ *
+ * Does nothing if there is already an explicit setting or we've asked this session. If they choose
+ * "Keep Enabled" when we'll write an explicit true into the settings which effectively suppresses.
+ */
+export async function checkForLargeNumberOfTodos(diagnostics: vs.DiagnosticCollection | undefined) {
+	if (config.hasExplicitShowTodosSetting)
+		return;
+
+	if (checkForLargeNumberOfTodosHasPromptedAboutManyTodosThisSession)
+		return;
+
+	const threshold = 100;
+	let numTodos = 0;
+	diagnostics?.forEach((uri, diagnostics) => {
+		if (numTodos >= threshold)
+			return;
+		for (const diagnostic of diagnostics) {
+			if (diagnostic.code === "todo") {
+				numTodos++;
+				if (numTodos >= threshold)
+					return;
+			}
+		}
+	});
+	if (numTodos >= threshold) {
+		checkForLargeNumberOfTodosHasPromptedAboutManyTodosThisSession = true;
+		const disableInWorkspace = "Disable for Workspace";
+		const disableGlobally = "Disable Everywhere";
+		const keepEnabled = "Keep Enabled";
+		const action = await vs.window.showInformationMessage(`Workspace has over ${threshold} TODO comments. Disable showing TODOs as diagnostics?`, disableInWorkspace, disableGlobally, keepEnabled);
+		switch (action) {
+			case disableGlobally:
+				void config.setShowTodos(false, vs.ConfigurationTarget.Global);
+				break;
+			case disableInWorkspace:
+				void config.setShowTodos(false, vs.ConfigurationTarget.Workspace);
+				break;
+			case keepEnabled:
+				void config.setShowTodos(true, vs.ConfigurationTarget.Global);
+				break;
+		}
+	}
 }
 
 /// Opens a file, but does it in a setTimeout to work around VS Code reveal bug
@@ -246,6 +287,6 @@ function openFile(entryFile: string) {
 
 	// TODO: Remove this setTimeout when it's no longer required.
 	setTimeout(() => {
-		vs.commands.executeCommand("vscode.open", vs.Uri.file(entryFile));
+		void vs.commands.executeCommand("vscode.open", vs.Uri.file(entryFile));
 	}, 100);
 }

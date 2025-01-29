@@ -1,15 +1,22 @@
 import * as path from "path";
+import { URI } from "vscode-uri";
 import { BasicDebugConfiguration } from "../../shared/debug/interfaces";
 import { escapeRegExp } from "../../shared/utils";
-import { OpenedFileInformation } from "../interfaces";
+import { OpenedFileInformation, Position } from "../interfaces";
+import { GroupNode, SuiteNode, TestNode, TreeNode } from "../test/test_model";
+import { fsPath } from "./fs";
+import { TestOutlineInfo } from "./outline_das";
 
-export function getLaunchConfig(noDebug: boolean, path: string, testNames: TestName[] | undefined, runSkippedTests?: boolean, template?: any | undefined): BasicDebugConfiguration {
+
+export function getLaunchConfig(noDebug: boolean, path: string, testSelection: TestSelection[] | undefined, shouldRunTestByLine: boolean, runSkippedTests?: boolean, template?: any | undefined): { program: string } & BasicDebugConfiguration {
+	let programString = path;
 	let toolArgs: string[] = [];
 	if (template?.toolArgs)
 		toolArgs = toolArgs.concat(template?.toolArgs as []);
-	if (testNames) {
-		toolArgs.push("--name");
-		toolArgs.push(makeRegexForTests(testNames));
+	if (testSelection) {
+		const execInfo = getTestExecutionInfo(programString, testSelection, shouldRunTestByLine);
+		programString = getProgramString(execInfo.programUri);
+		toolArgs.push(...execInfo.args);
 	}
 	if (runSkippedTests)
 		toolArgs.push("--run-skipped");
@@ -25,23 +32,30 @@ export function getLaunchConfig(noDebug: boolean, path: string, testNames: TestN
 		template,
 		{
 			args: template?.args,
-			expectSingleTest: testNames?.length === 1 && !testNames[0].name.includes("$") && !testNames[0].isGroup,
-			program: path,
+			expectSingleTest: testSelection?.length === 1 && !testSelection[0].name.includes("$") && !testSelection[0].isGroup,
+			program: programString,
 			toolArgs,
 		},
 	);
 }
 
-export interface TestName { name: string, isGroup: boolean }
+export interface TestSelection { name: string, isGroup: boolean, position: Position | undefined }
 
 const regexEscapedInterpolationExpressionPattern = /\\\$(?:(?:\w+)|(?:\\\{.*\\\}))/g;
-export function makeRegexForTests(names: TestName[]) {
+export function makeRegexForTests(names: TestSelection[]) {
 	const regexSegments: string[] = [];
 	for (const name of names) {
 		const prefix = "^";
 		// We can't anchor to the end for groups, as we want them to run all children.
 		const suffix = name.isGroup ? "" : "( \\(variant: .*\\))?$";
-		const escapedName = escapeRegExp(name.name);
+		let escapedName = escapeRegExp(name.name);
+
+		// Replace any literal newlines with \n because literals can cause
+		// issues in the shell.
+		// https://github.com/Dart-Code/Dart-Code/issues/4007
+		escapedName = escapedName
+			.replace(/\n/g, "\\n")
+			.replace(/\r/g, "\\r");
 
 		// If a test name contains interpolated expressions, passing the exact
 		// name won't match. So we just replace them out with wildcards. We'll need
@@ -52,6 +66,48 @@ export function makeRegexForTests(names: TestName[]) {
 	}
 
 	return regexSegments.join("|");
+}
+
+export function getTestExecutionInfo(programPath: string, tests: TestSelection[], shouldRunTestByLine: boolean): { programUri: URI, args: string[] } {
+	if (shouldRunTestByLine && tests.length && tests.every((test) => test.position)) {
+		return {
+			// VS Code lines are 0-based, but Dart is 1-based.
+			args: tests.slice(1).map(((test) => `${programPath}?line=${test.position!.line + 1}`)),
+			programUri: URI.file(programPath).with({ query: `?line=${tests[0].position!.line + 1}` }),
+		};
+	}
+	return {
+		args: ["--name", makeRegexForTests(tests)],
+		programUri: URI.file(programPath),
+	};
+}
+
+export function getProgramString(programUri: URI) {
+	return programUri.query ? `${fsPath(programUri)}${programUri.query}` : fsPath(programUri);
+}
+
+export function getProgramPath(program: string) {
+	return program.split("?")[0];
+}
+
+export function getTestSelectionForNodes(nodes: TreeNode[]): TestSelection[] | undefined {
+	if (nodes.find((node) => node instanceof SuiteNode))
+		return undefined;
+
+	return (nodes as Array<GroupNode | TestNode>).map((node) => getTestSelectionForNode(node));
+}
+
+export function getTestSelectionForNode(treeNode: GroupNode | TestNode): TestSelection {
+	return { name: treeNode.name!, isGroup: treeNode instanceof GroupNode, position: treeNode.range?.start };
+}
+
+export function getTestSelectionForOutline(test: TestOutlineInfo): TestSelection {
+	// We only support running by lines for LSP because we don't have the position for DAS
+	// without an async opening of the document (to map offset -> position).
+	const position = "range" in test
+		? test.range.start
+		: undefined;
+	return { name: test.fullName, isGroup: test.isGroup, position };
 }
 
 export const createTestFileAction = (file: string) => `Create ${path.basename(file)}`;
@@ -110,4 +166,8 @@ export function extractTestNameFromOutline(elementName: string): string | undefi
 		elementName = elementName.substring(1, elementName.length - 1);
 
 	return elementName;
+}
+
+export function isSetupOrTeardownTestName(testName: string | undefined): boolean {
+	return !!((testName?.startsWith("(setUp") || testName?.startsWith("(tearDown")) && testName?.endsWith(")"));
 }

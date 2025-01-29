@@ -6,10 +6,11 @@ import { fsPath } from "../../shared/utils/fs";
 import { PubPackage } from "../commands/add_dependency";
 import { locateBestProjectRoot } from "../project";
 import { isAnalyzableAndInWorkspace } from "../utils";
+import { getDiagnosticErrorCode } from "../utils/vscode/diagnostics";
 import { RankedCodeActionProvider } from "./ranking_code_action_provider";
 
-const applicableErrorCodes = ["uri_does_not_exist", "conditional_uri_does_not_exist"];
-const packageUriSourceCodePattern = new RegExp(`r?['"]+package:(.*)\\/`);
+const applicableErrorCodes = ["uri_does_not_exist", "conditional_uri_does_not_exist", "depend_on_referenced_packages"];
+const packageUriSourceCodePattern = new RegExp(`r?['"]+package:([\\w\\-]+)\\/`);
 
 export class AddDependencyCodeActionProvider implements RankedCodeActionProvider {
 	constructor(public readonly selector: DocumentSelector) { }
@@ -54,6 +55,23 @@ export class AddDependencyCodeActionProvider implements RankedCodeActionProvider
 		diagnosticsWithPackageNames = diagnosticsWithPackageNames
 			.filter((obj) => obj.packageName && !pubspecContent.includes(`  ${obj.packageName}`));
 
+		// Next, remove any diagnostics that have the same package name and overlap with the same range.
+		// https://github.com/Dart-Code/Dart-Code/issues/4896
+		for (let i = 0; i < diagnosticsWithPackageNames.length; i++) {
+			const packageName = diagnosticsWithPackageNames[i].packageName;
+			const range = diagnosticsWithPackageNames[i].diagnostic.range;
+
+			for (let j = i + 1; j < diagnosticsWithPackageNames.length; j++) {
+				const packageName2 = diagnosticsWithPackageNames[i].packageName;
+				const range2 = diagnosticsWithPackageNames[i].diagnostic.range;
+
+				if (packageName === packageName2 && !range.intersection(range2)?.isEmpty) {
+					diagnosticsWithPackageNames.splice(j, 1);
+					j--;
+				}
+			}
+		}
+
 		if (!diagnosticsWithPackageNames.length)
 			return;
 
@@ -63,15 +81,7 @@ export class AddDependencyCodeActionProvider implements RankedCodeActionProvider
 	/// Checks if the diagnostic is a uri_does_not_exist and the URI is a package:
 	/// URI and returns the package name.
 	private extractPackageNameForUriNotFoundDiagnostic(document: TextDocument, diag: Diagnostic): string | undefined {
-		const code = diag.code;
-		if (!code)
-			return;
-
-		const errorCode = typeof code === "string" || typeof code === "number"
-			? code.toString()
-			: ("value" in code)
-				? code.value.toString()
-				: undefined;
+		const errorCode = getDiagnosticErrorCode(diag);
 		if (!errorCode)
 			return;
 
@@ -96,7 +106,7 @@ export class AddDependencyCodeActionProvider implements RankedCodeActionProvider
 			action.command = {
 				arguments: [
 					document.uri,
-					{ packageName } as PubPackage,
+					{ packageNames: packageName } as PubPackage,
 					isDevDependency,
 				],
 				command: "_dart.addDependency",

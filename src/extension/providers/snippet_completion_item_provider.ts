@@ -1,14 +1,14 @@
 import * as path from "path";
-import { CancellationToken, CompletionContext, CompletionItem, CompletionItemKind, CompletionItemProvider, CompletionList, MarkdownString, Position, SnippetString, TextDocument, Uri } from "vscode";
+import { CancellationToken, CompletionContext, CompletionItem, CompletionItemKind, CompletionItemProvider, CompletionList, Position, SnippetString, TextDocument, Uri } from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
-import { extensionPath, readJson } from "../../shared/vscode/extension_utils";
+import { createMarkdownString, extensionPath, readJson } from "../../shared/vscode/extension_utils";
 import { config } from "../config";
 
 export class SnippetCompletionItemProvider implements CompletionItemProvider {
 	private completions = new CompletionList();
 	private shouldRender: (uri: Uri) => boolean;
 
-	constructor(private readonly dartCapabilities: DartCapabilities, filename: string, shouldRender: (uri: Uri) => boolean) {
+	constructor(private readonly isLsp: boolean, private readonly dartCapabilities: DartCapabilities, filename: string, shouldRender: (uri: Uri) => boolean) {
 		this.shouldRender = shouldRender;
 		const snippets = readJson(path.join(extensionPath, filename)) as { [key: string]: { [key: string]: { prefix: string, description: string | undefined, body: string | string[] } } };
 		for (const snippetType of Object.keys(snippets)) {
@@ -22,7 +22,7 @@ export class SnippetCompletionItemProvider implements CompletionItemProvider {
 						: snippet.body,
 				);
 				completionItem.detail = snippet.description;
-				completionItem.documentation = new MarkdownString().appendCodeblock(completionItem.insertText.value);
+				completionItem.documentation = createMarkdownString("").appendCodeblock(completionItem.insertText.value);
 				completionItem.sortText = "zzzzzzzzzzzzzzzzzzzzzz";
 				this.completions.items.push(completionItem);
 			}
@@ -35,7 +35,7 @@ export class SnippetCompletionItemProvider implements CompletionItemProvider {
 		if (!config.enableSnippets)
 			return;
 
-		if (config.enableServerSnippets && this.dartCapabilities.supportsServerSnippets)
+		if (config.enableServerSnippets && this.dartCapabilities.supportsServerSnippets && this.isLsp)
 			return;
 
 		const line = document.lineAt(position.line).text.slice(0, position.character);
@@ -55,7 +55,7 @@ export class SnippetCompletionItemProvider implements CompletionItemProvider {
 		// Don't provide completions after comment markers. This isn't perfect since it'll
 		// suppress them for ex if // appears inside strings, but it's a reasonable
 		// approximation given we don't have a reliable way to tell that.
-		if (line.indexOf("//") !== -1)
+		if (line.includes("//"))
 			return false;
 
 		// Otherwise, allow through.

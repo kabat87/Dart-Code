@@ -1,6 +1,6 @@
+import { Event, OutputEvent } from "@vscode/debugadapter";
+import { DebugProtocol } from "@vscode/debugprotocol";
 import * as path from "path";
-import { Event, OutputEvent } from "vscode-debugadapter";
-import { DebugProtocol } from "vscode-debugprotocol";
 import { dartVMPath, debugTerminatingProgressId, pubSnapshotPath, vmServiceHttpLinkPattern } from "../shared/constants";
 import { DartLaunchArgs } from "../shared/debug/interfaces";
 import { LogCategory } from "../shared/enums";
@@ -101,7 +101,7 @@ export class DartTestDebugSession extends DartDebugSession {
 		runner.registerForUnhandledMessages((msg) => {
 			// Hack: Would be better to have an event for this.
 			// https://github.com/dart-lang/test/issues/1216
-			if (msg.toLowerCase().indexOf("waiting for current test(s) to finish") !== -1)
+			if (msg.toLowerCase().includes("waiting for current test(s) to finish"))
 				this.updateProgress(debugTerminatingProgressId, `${msg.trim()}`);
 			this.logToUserIfAppropriate(msg, "stdout");
 		});
@@ -113,7 +113,7 @@ export class DartTestDebugSession extends DartDebugSession {
 			// is currently being produced on the bots running against Flutter
 			// master).
 			if (n.observatoryUri && n.observatoryUri !== "null")
-				this.initDebugger(`${n.observatoryUri}ws`);
+				void this.initDebugger(`${n.observatoryUri}ws`);
 		});
 		runner.registerForAllTestNotifications(async (n) => {
 			try {
@@ -197,7 +197,7 @@ export class DartTestDebugSession extends DartDebugSession {
 				this.logToUser(`${error.stackTrace}\n`, "stderr");
 				break;
 			case "done":
-				if (this.expectSingleTest && this.sourceFileForArgs) {
+				if (this.expectSingleTest) {
 					const testNames = Object.keys(this.testCounts);
 					const firstTestWithMultipleRuns = testNames.find((name) => this.testCounts[name] > 1);
 					// It's possible that we ran multiple tests because of a variant argument in Flutter, so only actually report
@@ -243,7 +243,7 @@ export class DartTestDebugSession extends DartDebugSession {
 		if (suitePath) {
 			this.sendEvent(new Event(
 				"dart.testNotification",
-				notification ,
+				notification,
 			));
 		}
 	}

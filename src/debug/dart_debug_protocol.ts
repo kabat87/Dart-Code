@@ -1,5 +1,4 @@
-/* eslint-disable id-blacklist */
-import * as WebSocket from "ws";
+import { default as WebSocket } from "ws";
 import { PromiseCompleter } from "../shared/utils";
 
 export class DebuggerResult {
@@ -67,7 +66,7 @@ export interface VMIsolateRef extends VMResponse {
 }
 
 export interface VMIsolate extends VMResponse, VMIsolateRef {
-	number: string;
+	number: string; // eslint-disable-line id-blacklist
 	runnable: boolean;
 	pauseEvent: VMEvent;
 	libraries: VMLibraryRef[];
@@ -115,6 +114,10 @@ export interface VMSourceLocation extends VMResponse {
 	tokenPos: number;
 	// The last token of the location if this is a range.
 	endTokenPos?: number;
+	// The line number for [tokenPos].
+	line?: number;
+	// The column number for [tokenPos].
+	column?: number;
 }
 
 export interface VMUnresolvedSourceLocation extends VMResponse {
@@ -179,7 +182,8 @@ export interface VMClass extends VMObj {
 }
 
 export interface VMBoundField {
-	decl: VMFieldRef;
+	decl: VMFieldRef | undefined;
+	name: string | number;
 	value: VMInstanceRef | VMSentinel;
 }
 
@@ -396,7 +400,7 @@ export class RPCError {
 	}
 
 	public details(): string | undefined {
-		return this.data ? this.data.details : undefined;
+		return this.data ? this.data.details as string : undefined;
 	}
 
 	public toString(): string {
@@ -417,7 +421,7 @@ export class VmServiceConnection {
 			uri = url.toString();
 		}
 		this.socket = new WebSocket(uri, { followRedirects: true });
-		this.socket.on("message", (data) => this.handleData(data.toString()));
+		this.socket.on("message", (data: Buffer) => this.handleData(data.toString()));
 	}
 
 	public onOpen(cb: () => void) {
@@ -461,9 +465,12 @@ export class VmServiceConnection {
 		return this.callMethod("addBreakpointWithScriptUri", data);
 	}
 
-	// None, Unhandled, and All
-	public setExceptionPauseMode(isolateId: string, mode: string): Promise<DebuggerResult> {
+	public setExceptionPauseMode(isolateId: string, mode: VmExceptionMode): Promise<DebuggerResult> {
 		return this.callMethod("setExceptionPauseMode", { isolateId, mode });
+	}
+
+	public setIsolatePauseMode(isolateId: string, modes: { exceptionPauseMode?: VmExceptionMode, shouldPauseOnExit?: boolean }): Promise<DebuggerResult> {
+		return this.callMethod("setIsolatePauseMode", { isolateId, ...modes });
 	}
 
 	public removeBreakpoint(isolateId: string, breakpointId: string) {
@@ -532,7 +539,7 @@ export class VmServiceConnection {
 		return this.callMethod("setLibraryDebuggable", { isolateId, libraryId, isDebuggable });
 	}
 
-	public nextId: number = 0;
+	public nextId = 0;
 
 	public callMethod(method: string, params?: any): Promise<DebuggerResult> {
 		const id = `${this.nextId++}`;
@@ -620,3 +627,5 @@ export interface FlutterServiceExtensionStateChangedData {
 	extension: string;
 	value: any;
 }
+
+export type VmExceptionMode = "None" | "Unhandled" | "All";

@@ -67,7 +67,6 @@ describe("web debugger", () => {
 		);
 
 		await waitForResult(() => extApi.debugCommands.vmServices.serviceIsRegistered(VmService.HotReload) === false); // TODO: Make true when supported!
-		await waitForResult(() => extApi.debugCommands.vmServices.serviceIsRegistered(VmService.HotRestart) === true);
 
 		await waitAllThrowIfTerminates(dc,
 			dc.waitForEvent("terminated"),
@@ -75,7 +74,6 @@ describe("web debugger", () => {
 		);
 
 		await waitForResult(() => extApi.debugCommands.vmServices.serviceIsRegistered(VmService.HotReload) === false);
-		await waitForResult(() => extApi.debugCommands.vmServices.serviceIsRegistered(VmService.HotRestart) === false);
 	});
 
 	it("expected debugger services are available in noDebug mode", async () => {
@@ -87,7 +85,6 @@ describe("web debugger", () => {
 		);
 
 		await waitForResult(() => extApi.debugCommands.vmServices.serviceIsRegistered(VmService.HotReload) === false); // TODO: Make true when supported!
-		await waitForResult(() => extApi.debugCommands.vmServices.serviceIsRegistered(VmService.HotRestart) === true);
 
 		await waitAllThrowIfTerminates(dc,
 			dc.waitForEvent("terminated"),
@@ -95,7 +92,6 @@ describe("web debugger", () => {
 		);
 
 		await waitForResult(() => extApi.debugCommands.vmServices.serviceIsRegistered(VmService.HotReload) === false);
-		await waitForResult(() => extApi.debugCommands.vmServices.serviceIsRegistered(VmService.HotRestart) === false);
 	});
 
 	// Skipped because this is super-flaky. If we quit to early, the processes are not
@@ -213,7 +209,7 @@ describe("web debugger", () => {
 
 	const numReloads = 1;
 	it(`stops at a breakpoint after each reload (${numReloads})`, async function () {
-		if (!extApi.dartCapabilities.webSupportsDebugging || !extApi.dartCapabilities.webSupportsHotReload) {
+		if (!extApi.dartCapabilities.webSupportsHotReload) {
 			this.skip();
 			return;
 		}
@@ -222,7 +218,7 @@ describe("web debugger", () => {
 		const config = await startDebugger(dc, webHelloWorldIndexFile);
 		const expectedLocation = {
 			line: positionOf("^// BREAKPOINT1").line,
-			path: fsPath(webHelloWorldMainFile),
+			path: dc.isUsingUris ? webHelloWorldMainFile.toString() : fsPath(webHelloWorldMainFile),
 		};
 		// TODO: Remove the last parameter here (and the other things below) when we are mapping breakpoints in org-dartland-app
 		// URIs back to the correct file system paths.
@@ -231,7 +227,7 @@ describe("web debugger", () => {
 		// const stack = await dc.getStack();
 		// const frames = stack.body.stackFrames;
 		// assert.equal(frames[0].name, "main");
-		// assert.equal(frames[0].source!.path, expectedLocation.path);
+		// dc.assertPath(frames[0].source!.path, expectedLocation.path);
 		// assert.equal(frames[0].source!.name, "package:hello_world/main.dart");
 
 		await watchPromise("stops_at_a_breakpoint->resume", dc.resume());
@@ -256,7 +252,7 @@ describe("web debugger", () => {
 						// const stack = await watchPromise(`stops_at_a_breakpoint->reload:${i}->getStack`, dc.getStack());
 						// const frames = stack.body.stackFrames;
 						// assert.equal(frames[0].name, "MyHomePage.build");
-						// assert.equal(frames[0].source!.path, expectedLocation.path);
+						// dc.assertPath(frames[0].source!.path, expectedLocation.path);
 						// assert.equal(frames[0].source!.name, "package:hello_world/main.dart");
 					})
 					.then(() => watchPromise(`stops_at_a_breakpoint->reload:${i}->resume`, dc.resume())),
@@ -266,18 +262,13 @@ describe("web debugger", () => {
 	});
 
 	describe("can evaluate at breakpoint", () => {
-		it("simple expressions", async function () {
-			if (!extApi.dartCapabilities.webSupportsEvaluation) {
-				this.skip();
-				return;
-			}
-
+		it("simple expressions", async () => {
 			await openFile(webHelloWorldMainFile);
 			const config = await startDebugger(dc, webHelloWorldIndexFile);
 			await waitAllThrowIfTerminates(dc,
 				dc.hitBreakpoint(config, {
 					line: positionOf("^// BREAKPOINT1").line, // positionOf is 0-based, and seems to want 1-based, BUT comment is on next line!
-					path: fsPath(webHelloWorldMainFile),
+					path: dc.isUsingUris ? webHelloWorldMainFile.toString() : fsPath(webHelloWorldMainFile),
 				}, {}),
 			);
 
@@ -287,19 +278,14 @@ describe("web debugger", () => {
 			assert.equal(evaluateResult.variablesReference, 0);
 		});
 
-		it("complex expression expressions", async function () {
-			if (!extApi.dartCapabilities.webSupportsEvaluation) {
-				this.skip();
-				return;
-			}
-
+		it("complex expressions", async () => {
 			await openFile(webHelloWorldMainFile);
 			const config = await startDebugger(dc, webHelloWorldIndexFile);
 			await waitAllThrowIfTerminates(dc,
 				dc.hitBreakpoint(config, {
 					line: positionOf("^// BREAKPOINT1").line, // positionOf is 0-based, and seems to want 1-based, BUT comment is on next line!
-					path: fsPath(webHelloWorldMainFile),
-				}),
+					path: dc.isUsingUris ? webHelloWorldMainFile.toString() : fsPath(webHelloWorldMainFile),
+				}, {}),
 			);
 
 			const evaluateResult = await dc.evaluateForFrame(`(new DateTime.now()).year`);
@@ -308,19 +294,14 @@ describe("web debugger", () => {
 			assert.equal(evaluateResult.variablesReference, 0);
 		});
 
-		it("an expression that returns a variable", async function () {
-			if (!extApi.dartCapabilities.webSupportsEvaluation) {
-				this.skip();
-				return;
-			}
-
+		it("an expression that returns a variable", async () => {
 			await openFile(webHelloWorldMainFile);
 			const config = await startDebugger(dc, webHelloWorldIndexFile);
 			await waitAllThrowIfTerminates(dc,
 				dc.hitBreakpoint(config, {
 					line: positionOf("^// BREAKPOINT1").line, // positionOf is 0-based, and seems to want 1-based, BUT comment is on next line!
-					path: fsPath(webHelloWorldMainFile),
-				}),
+					path: dc.isUsingUris ? webHelloWorldMainFile.toString() : fsPath(webHelloWorldMainFile),
+				}, {}),
 			);
 
 			const evaluateResult = await dc.evaluateForFrame(`new DateTime.now()`);
@@ -330,19 +311,14 @@ describe("web debugger", () => {
 			assert.ok(evaluateResult.variablesReference);
 		});
 
-		it("complex expression expressions when in a top level function", async function () {
-			if (!extApi.dartCapabilities.webSupportsEvaluation) {
-				this.skip();
-				return;
-			}
-
+		it("complex expressions when in a top level function", async () => {
 			await openFile(webHelloWorldMainFile);
 			const config = await startDebugger(dc, webHelloWorldIndexFile);
 			await waitAllThrowIfTerminates(dc,
 				dc.hitBreakpoint(config, {
 					line: positionOf("^// BREAKPOINT2").line,
-					path: fsPath(webHelloWorldMainFile),
-				}),
+					path: dc.isUsingUris ? webHelloWorldMainFile.toString() : fsPath(webHelloWorldMainFile),
+				}, {}),
 			);
 
 			const evaluateResult = await dc.evaluateForFrame(`(new DateTime.now()).year`);
@@ -352,26 +328,25 @@ describe("web debugger", () => {
 		});
 	});
 
-	// Skipped due to https://github.com/flutter/flutter/issues/17007.
-	it("stops on exception", async function () {
-		if (!extApi.dartCapabilities.webSupportsEvaluation) {
-			this.skip();
-			return;
-		}
-
-		await openFile(webBrokenIndexFile);
+	// Skipped because of:
+	// - https://github.com/dart-lang/webdev/issues/2381
+	// - https://github.com/dart-lang/webdev/issues/2382
+	it.skip("stops on exception", async () => {
+		await openFile(webBrokenMainFile);
 		const config = await startDebugger(dc, webBrokenIndexFile);
 		await waitAllThrowIfTerminates(dc,
 			dc.configurationSequence(),
 			dc.assertStoppedLocation("exception", {
 				line: positionOf("^Oops").line + 1, // positionOf is 0-based, but seems to want 1-based
-				path: fsPath(webBrokenIndexFile),
+				path: dc.isUsingUris ? webBrokenMainFile.toString() : fsPath(webBrokenMainFile),
 			}),
 			dc.launch(config),
 		);
 	});
 
-	// Skipped because unable to set break-on-exceptions without start-paused
+	// Skipped because of:
+	// - https://github.com/dart-lang/webdev/issues/2381
+	// - https://github.com/dart-lang/webdev/issues/2382
 	it.skip("provides exception details when stopped on exception", async () => {
 		await openFile(webBrokenMainFile);
 		const config = await startDebugger(dc, webBrokenIndexFile);
@@ -379,7 +354,7 @@ describe("web debugger", () => {
 			dc.configurationSequence(),
 			dc.assertStoppedLocation("exception", {
 				line: positionOf("^Oops").line + 1, // positionOf is 0-based, but seems to want 1-based
-				path: fsPath(webBrokenIndexFile),
+				path: dc.isUsingUris ? webBrokenMainFile.toString() : fsPath(webBrokenMainFile),
 			}),
 			dc.launch(config),
 		);
@@ -388,13 +363,7 @@ describe("web debugger", () => {
 		ensureVariable(variables, "$_threadException.message", "message", `"(TODO WHEN UNSKIPPING)"`);
 	});
 
-	// Skipped because unable to set logpoints reliably without start-paused
-	it.skip("logs expected text (and does not stop) at a logpoint", async function () {
-		if (!extApi.dartCapabilities.webSupportsEvaluation) {
-			this.skip();
-			return;
-		}
-
+	it("logs expected text (and does not stop) at a logpoint", async () => {
 		await openFile(webHelloWorldMainFile);
 		const config = await watchPromise("logs_expected_text->startDebugger", startDebugger(dc, webHelloWorldIndexFile));
 		await waitAllThrowIfTerminates(dc,
@@ -417,7 +386,7 @@ describe("web debugger", () => {
 	it.skip("writes failure output", async () => {
 		// This test really wants to check stderr, but since the widgets library catches the exception is
 		// just comes via stdout.
-		await openFile(webBrokenIndexFile);
+		await openFile(webBrokenMainFile);
 		const config = await startDebugger(dc, webBrokenIndexFile);
 		await waitAllThrowIfTerminates(dc,
 			watchPromise("writes_failure_output->configurationSequence", dc.configurationSequence()),
@@ -426,9 +395,9 @@ describe("web debugger", () => {
 		);
 	});
 
-	// Skipped due to https://github.com/dart-lang/webdev/issues/379
+	// Skipped due to https://github.com/dart-lang/webdev/issues/837.
 	it.skip("moves known files from call stacks to metadata", async () => {
-		await openFile(webBrokenIndexFile);
+		await openFile(webBrokenMainFile);
 		const config = await startDebugger(dc, webBrokenIndexFile);
 		await waitAllThrowIfTerminates(dc,
 			watchPromise("writes_failure_output->configurationSequence", dc.configurationSequence()),
@@ -438,7 +407,7 @@ describe("web debugger", () => {
 					.then((event) => {
 						assert.equal(event.body.output.indexOf("package:broken/main.dart"), -1);
 						assert.equal(event.body.source!.name, "package:broken/main.dart");
-						assert.equal(event.body.source!.path, fsPath(webBrokenIndexFile));
+						dc.assertPath(event.body.source!.path, dc.isUsingUris ? webBrokenMainFile.toString() : fsPath(webBrokenMainFile));
 						assert.equal(event.body.line, positionOf("^Oops").line + 1); // positionOf is 0-based, but seems to want 1-based
 						assert.equal(event.body.column, 5);
 					}),

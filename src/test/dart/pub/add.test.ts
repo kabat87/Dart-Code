@@ -15,7 +15,7 @@ describe("pub add", () => {
 
 	function pubspecContainsPackage(packageName: string) {
 		const contents = fs.readFileSync(pubspecPath);
-		return contents.includes(`  ${packageName}:`);
+		return contents.includes(`\n  ${packageName}:`);
 	}
 
 	function pubspecContainsText(text: string) {
@@ -30,6 +30,18 @@ describe("pub add", () => {
 		await vs.commands.executeCommand("dart.addDependency");
 		await waitFor(() => pubspecContainsPackage("collection"));
 		assert.equal(pubspecContainsPackage("collection"), true);
+	});
+
+	it("can add multiple dependencies using command", async () => {
+		assert.equal(pubspecContainsPackage("path"), false);
+		assert.equal(pubspecContainsPackage("crypto"), false);
+		sb.stub(extApi.addDependencyCommand, "promptForPackageInfo").resolves("path, crypto");
+
+		await vs.commands.executeCommand("dart.addDependency");
+		await waitFor(() => pubspecContainsPackage("path"));
+		await waitFor(() => pubspecContainsPackage("crypto"));
+		assert.equal(pubspecContainsPackage("path"), true);
+		assert.equal(pubspecContainsPackage("crypto"), true);
 	});
 
 	it("can add a dependency with trailing whitespace using command", async () => {
@@ -50,7 +62,12 @@ describe("pub add", () => {
 		assert.equal(pubspecContainsPackage("collection"), true);
 	});
 
-	it("can add a dependency by URL by pasting", async () => {
+	it("can add a dependency by URL by pasting", async function () {
+		// We don't support setting specific versions here and the latest versions of the packages
+		// we're testing don't work on the legacy SDK versions, so skip this test for legacy bots.
+		if (process.env.BUILD_VERSION === "legacy")
+			this.skip();
+
 		assert.equal(pubspecContainsPackage("timing"), false);
 		sb.stub(extApi.addDependencyCommand, "promptForPackageInfo").resolves("https://github.com/dart-lang/timing");
 		sb.stub(extApi.addDependencyCommand, "promptForPackageName").resolves("timing");
@@ -63,7 +80,12 @@ describe("pub add", () => {
 		assert.equal(pubspecContainsText("git: https://github.com/dart-lang/timing"), true);
 	});
 
-	it("can add a dependency by URL by selecting the GIT option", async () => {
+	it("can add a dependency by URL by selecting the GIT option", async function () {
+		// We don't support setting specific versions here and the latest versions of the packages
+		// we're testing don't work on the legacy SDK versions, so skip this test for legacy bots.
+		if (process.env.BUILD_VERSION === "legacy")
+			this.skip();
+
 		assert.equal(pubspecContainsPackage("timing"), false);
 		sb.stub(extApi.addDependencyCommand, "promptForPackageInfo").resolves({ marker: "GIT" });
 		sb.stub(extApi.addDependencyCommand, "promptForGitUrl").resolves("https://github.com/dart-lang/timing");
@@ -78,14 +100,18 @@ describe("pub add", () => {
 	});
 
 	it("can add from a quick fix if not listed in pubspec.yaml", async () => {
+		// Because we've enabled the depend_on_referenced_packages lint, we'll get two diagnostics
+		// for this, but expect only one fix.
 		const packageName = "built_value";
 		assert.equal(pubspecContainsPackage(packageName), false);
-		await waitForNextAnalysis(() => setTestContent(`import 'package:${packageName}/${packageName}.dart'`));
+		await waitForNextAnalysis(() => setTestContent(`import 'package:${packageName}/${packageName}.dart';`));
 
 		const fixResults = await vs.commands.executeCommand<vs.CodeAction[]>("vscode.executeCodeActionProvider", currentDoc().uri, rangeOf(`|package:${packageName}|`));
-		const addDependency = fixResults.find((r) => r.title.indexOf(`Add '${packageName}' to dependencies`) !== -1)!;
+		const addDependencyFixes = fixResults.filter((r) => r.title.includes(`Add '${packageName}' to dependencies`));
+		assert.equal(addDependencyFixes.length, 1);
+		const addDependencyFix = addDependencyFixes[0];
 
-		await vs.commands.executeCommand(addDependency.command!.command, ...addDependency.command!.arguments!); // eslint-disable-line @typescript-eslint/no-unsafe-argument
+		await vs.commands.executeCommand(addDependencyFix.command!.command, ...addDependencyFix.command!.arguments!); // eslint-disable-line @typescript-eslint/no-unsafe-argument
 		await waitFor(() => pubspecContainsText(packageName));
 		assert.equal(pubspecContainsPackage(packageName), true);
 	});
@@ -93,10 +119,10 @@ describe("pub add", () => {
 	it("cannot add from a quick fix if already listed in pubspec.yaml", async () => {
 		const packageName = "convert";
 		assert.equal(pubspecContainsPackage(packageName), true);
-		await waitForNextAnalysis(() => setTestContent(`import 'package:${packageName}/${packageName}.dart'`));
+		await waitForNextAnalysis(() => setTestContent(`import 'package:${packageName}/${packageName}.dart';`));
 
 		const fixResults = await vs.commands.executeCommand<vs.CodeAction[]>("vscode.executeCodeActionProvider", currentDoc().uri, rangeOf(`|package:${packageName}|`));
-		const addDependency = fixResults.find((r) => r.title.indexOf(`Add '${packageName}' to dependencies`) !== -1);
-		assert.equal(!!addDependency, false);
+		const addDependencyFixes = fixResults.filter((r) => r.title.includes(`Add '${packageName}' to dependencies`));
+		assert.equal(addDependencyFixes.length, 0);
 	});
 });

@@ -11,6 +11,7 @@ import { getIconForSymbolKind } from "../../shared/vscode/mappings";
 import { lspToPosition, lspToRange, toRange, treeLabel } from "../../shared/vscode/utils";
 import { DasAnalyzer, getSymbolKindForElementKind } from "../analysis/analyzer_das";
 import { LspAnalyzer } from "../analysis/analyzer_lsp";
+import { Analytics } from "../analytics";
 import { flutterOutlineCommands } from "../commands/flutter_outline";
 import { isAnalyzable } from "../utils";
 
@@ -24,16 +25,18 @@ export abstract class FlutterOutlineProvider implements vs.TreeDataProvider<Flut
 	protected abstract flutterOutline: unknown;
 	protected rootNode: FlutterWidgetItem | undefined;
 	protected treeNodesByLine: { [key: number]: FlutterWidgetItem[]; } = [];
-	protected updateTimeout: NodeJS.Timer | undefined;
+	protected updateTimeout: NodeJS.Timeout | undefined;
 	protected onDidChangeTreeDataEmitter: vs.EventEmitter<FlutterWidgetItem | undefined> = new vs.EventEmitter<FlutterWidgetItem | undefined>();
 	public readonly onDidChangeTreeData: vs.Event<FlutterWidgetItem | undefined> = this.onDidChangeTreeDataEmitter.event;
 	protected lastSelectedWidget: FlutterWidgetItem | undefined;
+	public isSelectingBecauseOfEditor = false;
+
+	constructor(private readonly analytics: Analytics) { }
 
 	protected setTrackingFile(editor: vs.TextEditor | undefined) {
 		if (editor && isAnalyzable(editor.document)) {
 			this.activeEditor = editor;
-			// tslint:disable-next-line: no-floating-promises
-			this.loadExistingOutline();
+			void this.loadExistingOutline();
 		} else if (editor && editor.document.uri.scheme === "file") {
 			// HACK: We can't currently reliably tell when editors are changed that are only real
 			// text editors (debug window is considered an editor) so we should only hide the tree
@@ -56,37 +59,42 @@ export abstract class FlutterOutlineProvider implements vs.TreeDataProvider<Flut
 
 	protected abstract loadExistingOutline(): Promise<void>;
 
-	public async setContexts(selection: readonly FlutterWidgetItem[] | undefined) {
+	public async handleSelection(selection: readonly FlutterWidgetItem[] | undefined) {
 		// Unmark the old node as being selected.
 		if (this.lastSelectedWidget) {
-			this.lastSelectedWidget.contextValue = undefined;
-			this.refresh(this.lastSelectedWidget);
+			const widget = this.lastSelectedWidget;
+			widget.contextValue = undefined;
+			// If we refresh immediately, we may cause "actual command not found" for the
+			// navigation command.
+			setTimeout(() => this.refresh(widget), 200);
 		}
 
 		// Clear all contexts that enabled refactors.
 		for (const refactor of flutterOutlineCommands) {
-			vs.commands.executeCommand("setContext", WIDGET_SUPPORTS_CONTEXT_PREFIX + refactor, false);
+			void vs.commands.executeCommand("setContext", WIDGET_SUPPORTS_CONTEXT_PREFIX + refactor, false);
 		}
 
 		// Set up the new contexts for our node and mark is as current.
 		if (this.activeEditor && selection && selection.length === 1 && isWidget(selection[0].outline)) {
 			const fixes = (await getFixes(this.activeEditor, selection[0].outline))
 				.filter((f): f is vs.CodeAction => f instanceof vs.CodeAction)
-				.filter((ca) => ca.kind && ca.kind.value && flutterOutlineCommands.indexOf(ca.kind.value) !== -1);
+				.filter((ca) => ca.kind && ca.kind.value && flutterOutlineCommands.includes(ca.kind.value));
 
 			// Stash the fixes, as we may need to call them later.
 			selection[0].fixes = fixes;
 
 			for (const fix of fixes)
-				vs.commands.executeCommand("setContext", WIDGET_SUPPORTS_CONTEXT_PREFIX + (fix.kind ? fix.kind.value : "NOKIND"), true);
+				void vs.commands.executeCommand("setContext", WIDGET_SUPPORTS_CONTEXT_PREFIX + (fix.kind ? fix.kind.value : "NOKIND"), true);
 
 			// Used so we can show context menu if you right-click the selected one.
 			// We can't support arbitrary context menus, because we can't get the fixes up-front (see
 			// https://github.com/dart-lang/sdk/issues/32462) so we fetch when you select an item
 			// and then just support it if it's selected.
 			selection[0].contextValue = WIDGET_SELECTED_CONTEXT;
-			this.lastSelectedWidget = selection[0];
-			this.refresh(selection[0]);
+			const widget = this.lastSelectedWidget = selection[0];
+			// If we refresh immediately, we may cause "actual command not found" for the
+			// navigation command.
+			setTimeout(() => this.refresh(widget), 200);
 		}
 	}
 
@@ -132,7 +140,7 @@ export abstract class FlutterOutlineProvider implements vs.TreeDataProvider<Flut
 	}
 
 	private static setTreeVisible(visible: boolean) {
-		vs.commands.executeCommand("setContext", DART_SHOW_FLUTTER_OUTLINE, visible);
+		void vs.commands.executeCommand("setContext", DART_SHOW_FLUTTER_OUTLINE, visible);
 	}
 
 	public static showTree() { this.setTreeVisible(true); }
@@ -146,8 +154,8 @@ export abstract class FlutterOutlineProvider implements vs.TreeDataProvider<Flut
 
 export class DasFlutterOutlineProvider extends FlutterOutlineProvider {
 	protected flutterOutline: as.FlutterOutline | undefined;
-	constructor(private readonly analyzer: DasAnalyzer) {
-		super();
+	constructor(analytics: Analytics, private readonly analyzer: DasAnalyzer) {
+		super(analytics);
 		this.analyzer.client.registerForServerConnected((c) => {
 			if (analyzer.client.capabilities.supportsFlutterOutline) {
 				this.analyzer.client.registerForFlutterOutline((n) => {
@@ -158,8 +166,7 @@ export class DasFlutterOutlineProvider extends FlutterOutlineProvider {
 						if (this.updateTimeout)
 							clearTimeout(this.updateTimeout);
 						if (!this.rootNode)
-							// tslint:disable-next-line: no-floating-promises
-							this.update();
+							void this.update();
 						else
 							this.updateTimeout = setTimeout(() => this.update(), 200);
 					}
@@ -223,9 +230,9 @@ export class DasFlutterOutlineProvider extends FlutterOutlineProvider {
 
 export class LspFlutterOutlineProvider extends FlutterOutlineProvider {
 	protected flutterOutline: FlutterOutline | undefined;
-	constructor(private readonly analyzer: LspAnalyzer) {
-		super();
-		this.analyzer.fileTracker.onFlutterOutline.listen((n) => {
+	constructor(analytics: Analytics, private readonly analyzer: LspAnalyzer) {
+		super(analytics);
+		this.analyzer.fileTracker.onFlutterOutline((n) => {
 			if (this.activeEditor && fsPath(vs.Uri.parse(n.uri)) === fsPath(this.activeEditor.document.uri)) {
 				this.flutterOutline = n.outline;
 				this.treeNodesByLine = [];
@@ -233,8 +240,7 @@ export class LspFlutterOutlineProvider extends FlutterOutlineProvider {
 				if (this.updateTimeout)
 					clearTimeout(this.updateTimeout);
 				if (!this.rootNode)
-					// tslint:disable-next-line: no-floating-promises
-					this.update();
+					void this.update();
 				else
 					this.updateTimeout = setTimeout(() => this.update(), 200);
 			}

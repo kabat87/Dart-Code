@@ -1,7 +1,6 @@
 import { Range } from "vscode-languageclient";
 import { Outline } from "../analysis/lsp/custom_protocol";
 import { Logger } from "../interfaces";
-import { TestOutlineInfo } from "./outline_das";
 import { extractTestNameFromOutline } from "./test";
 
 export abstract class LspOutlineVisitor {
@@ -41,6 +40,9 @@ export abstract class LspOutlineVisitor {
 				break;
 			case "ENUM_CONSTANT":
 				this.visitEnumConstant(outline);
+				break;
+			case "EXTENSION":
+				this.visitExtension(outline);
 				break;
 			case "FIELD":
 				this.visitField(outline);
@@ -111,6 +113,7 @@ export abstract class LspOutlineVisitor {
 	protected visitContructorInvocation(outline: Outline): void { this.visitChildren(outline); }
 	protected visitEnum(outline: Outline): void { this.visitChildren(outline); }
 	protected visitEnumConstant(outline: Outline): void { this.visitChildren(outline); }
+	protected visitExtension(outline: Outline): void { this.visitChildren(outline); }
 	protected visitField(outline: Outline): void { this.visitChildren(outline); }
 	protected visitFile(outline: Outline): void { this.visitChildren(outline); }
 	protected visitFunction(outline: Outline): void { this.visitChildren(outline); }
@@ -186,7 +189,10 @@ export class LspTestOutlineVisitor extends LspOutlineVisitor {
 	}
 }
 
-export interface LspTestOutlineInfo extends TestOutlineInfo {
+export interface LspTestOutlineInfo {
+	fullName: string;
+	file: string;
+	isGroup: boolean;
 	range: Range;
 }
 
@@ -208,6 +214,7 @@ export class LspClassOutlineVisitor extends LspOutlineVisitor {
 		this.classes.push({
 			className: outline.element.name,
 			codeRange: outline.codeRange,
+			elementKind: outline.element.kind,
 			range: outline.range,
 		});
 	}
@@ -215,6 +222,7 @@ export class LspClassOutlineVisitor extends LspOutlineVisitor {
 
 export interface LspClassInfo {
 	className: string;
+	elementKind: string;
 	range: Range;
 	codeRange: Range;
 }

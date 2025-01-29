@@ -4,7 +4,7 @@ import * as vs from "vscode";
 import { dartVMPath, flutterPath } from "../../shared/constants";
 import { Logger, Sdks } from "../../shared/interfaces";
 import { versionIsAtLeast } from "../../shared/utils";
-import { getChildFolders, getSdkVersion } from "../../shared/utils/fs";
+import { getChildFolders, getSdkVersion, homeRelativePath } from "../../shared/utils/fs";
 import { config } from "../config";
 
 abstract class SdkManager {
@@ -16,13 +16,14 @@ abstract class SdkManager {
 	protected abstract get configName(): string;
 	protected abstract get executablePath(): string;
 	protected abstract getLabel(version: string): string;
-	protected abstract setSdk(folder: string | undefined): void;
+	protected abstract clearWorkspaceSdk(): void;
+	protected abstract setSdk(folder: string | undefined, target: vs.ConfigurationTarget): void;
 
 	public changeSdk() {
 		if (this.sdkPaths)
 			this.searchForSdks(this.sdkPaths).catch((e) => console.error(e));
 		else
-			vs.window.showWarningMessage("Set `${configName}` to enable fast SDK switching.");
+			void vs.window.showWarningMessage("Set `${configName}` to enable fast SDK switching.");
 	}
 
 	public async searchForSdks(sdkPaths: string[]) {
@@ -34,7 +35,7 @@ abstract class SdkManager {
 		}
 
 		// Add in the current path if it's not there.
-		if (this.currentSdk && allPaths.indexOf(this.currentSdk) === -1)
+		if (this.currentSdk && !allPaths.includes(this.currentSdk))
 			allPaths.push(this.currentSdk);
 
 		const sdkFolders = allPaths
@@ -44,7 +45,7 @@ abstract class SdkManager {
 			.filter((f) => fs.existsSync(path.join(f, this.executablePath))); // Only those that look like SDKs.
 
 		const sdkItems: SdkPickItem[] = sdkFolders.map((f) => {
-			// Resolve synlinks so we look in correct folder for version file.
+			// Resolve symlinks so we look in correct folder for version file.
 			const actualBinary = fs.realpathSync(path.join(f, this.executablePath));
 			// Then we need to take the executable name and /bin back off
 			const actualFolder = path.dirname(path.dirname(actualBinary));
@@ -52,7 +53,7 @@ abstract class SdkManager {
 			const version = getSdkVersion(this.logger, { sdkRoot: actualFolder });
 			return {
 				description: f === this.currentSdk && this.configuredSdk ? "Current setting" : "",
-				detail: f,
+				detail: homeRelativePath(f),
 				folder: f,
 				label: version ? this.getLabel(version) : "Unknown version",
 				version,
@@ -71,8 +72,20 @@ abstract class SdkManager {
 			version: undefined,
 		} as SdkPickItem].concat(sdkItems);
 
-		vs.window.showQuickPick(items, { placeHolder: "Select an SDK to use" })
-			.then((sdk) => { if (sdk) this.setSdk(sdk.folder); });
+		void vs.window.showQuickPick(items, { placeHolder: "Select an SDK to use" })
+			.then((sdk) => {
+				if (!sdk)
+					return;
+
+				const folder = homeRelativePath(sdk.folder);
+				if (config.sdkSwitchingTarget === "global") {
+					// Clear any existing workspace setting first.
+					this.clearWorkspaceSdk();
+					this.setSdk(folder, vs.ConfigurationTarget.Global);
+				} else {
+					this.setSdk(folder, vs.ConfigurationTarget.Workspace);
+				}
+			});
 	}
 }
 
@@ -85,7 +98,13 @@ export class DartSdkManager extends SdkManager {
 	protected getLabel(version: string) {
 		return `Dart SDK ${version}`;
 	}
-	protected setSdk(folder: string | undefined) { config.setSdkPath(folder); }
+	protected clearWorkspaceSdk() {
+		if (config.workspaceSdkPath)
+			void config.setSdkPath(undefined, vs.ConfigurationTarget.Workspace);
+	}
+	protected setSdk(folder: string | undefined, target: vs.ConfigurationTarget) {
+		void config.setSdkPath(folder, target);
+	}
 }
 
 export class FlutterSdkManager extends SdkManager {
@@ -97,7 +116,13 @@ export class FlutterSdkManager extends SdkManager {
 	protected getLabel(version: string) {
 		return `Flutter SDK ${version}`;
 	}
-	protected setSdk(folder: string | undefined) { config.setFlutterSdkPath(folder); }
+	protected clearWorkspaceSdk() {
+		if (config.workspaceFlutterSdkPath)
+			void config.setFlutterSdkPath(undefined, vs.ConfigurationTarget.Workspace);
+	}
+	protected setSdk(folder: string | undefined, target: vs.ConfigurationTarget) {
+		void config.setFlutterSdkPath(folder, target);
+	}
 }
 
 interface SdkPickItem {

@@ -13,6 +13,12 @@ module.exports = {
 		"project": "tsconfig.json",
 		"sourceType": "module"
 	},
+	"ignorePatterns": [
+		".eslintrc.js",
+		"webpack.config.js",
+		"lints/**/*.*",
+		"out/**/*.*",
+	],
 	"plugins": [
 		"@typescript-eslint",
 		"@typescript-eslint/tslint"
@@ -112,8 +118,7 @@ module.exports = {
 		],
 		"prefer-const": "error",
 		"quote-props": [
-			// TODO: Set back to error when fixed.
-			"off",
+			"warn",
 			"consistent-as-needed"
 		],
 		"radix": "off",
@@ -181,40 +186,37 @@ module.exports = {
 				}
 			}
 		],
+		"@typescript-eslint/no-base-to-string": "off",
 		"@typescript-eslint/no-empty-function": "off",
 		"@typescript-eslint/no-empty-interface": "off",
+		"@typescript-eslint/no-namespace": "off",
 		"@typescript-eslint/no-explicit-any": "off",
-		// TODO: Re-enable this when fixed.
-		"@typescript-eslint/no-floating-promises": "off",
-		// TODO: Re-enable this when fixed.
+		"@typescript-eslint/no-redundant-type-constituents": "off",
+		// TODO: Re-enable this when fixed (124 issues).
 		"@typescript-eslint/no-unsafe-assignment": "off",
-		// TODO: Re-enable this when fixed.
+		// TODO: Re-enable this when fixed (20 issues).
 		"@typescript-eslint/no-unsafe-call": "off",
-		// TODO: Re-enable this when fixed.
+		// TODO: Re-enable this when fixed (325 issues).
 		"@typescript-eslint/no-unsafe-member-access": "off",
-		// TODO: Re-enable this when fixed.
+		// TODO: Re-enable this when fixed (35 issues).
 		"@typescript-eslint/no-unsafe-return": "off",
-		// TODO: Re-enable this when fixed.
-		"@typescript-eslint/no-inferrable-types": "off",
+		"@typescript-eslint/no-inferrable-types": "warn",
 		"@typescript-eslint/no-misused-promises": [
 			"error",
 			{
 				"checksVoidReturn": false
 			}
 		],
-		// TODO: Re-enable this when fixed.
+		// TODO: Re-enable this when fixed (443 problems).
 		"@typescript-eslint/no-non-null-assertion": "off",
-		"@typescript-eslint/no-parameter-properties": "off",
-		// TODO: Re-enable this when fixed.
 		"@typescript-eslint/no-unused-vars": "off",
 		"@typescript-eslint/no-use-before-define": "off",
 		"@typescript-eslint/prefer-for-of": "error",
 		"@typescript-eslint/prefer-function-type": "error",
-		// TODO: Re-enable this when fixed.
-		"@typescript-eslint/prefer-includes": "off",
-		// TODO: Enable this when fixed
+		"@typescript-eslint/prefer-includes": "warn",
+		// TODO: Enable this when fixed (95 problems).
 		"@typescript-eslint/restrict-template-expressions": "off",
-		// TODO: Re-enable this when fixed.
+		// TODO: Re-enable this when fixed (68 problems).
 		"@typescript-eslint/require-await": "off",
 		"@typescript-eslint/quotes": [
 			"error",

@@ -20,18 +20,19 @@ export class FlutterTaskProvider extends BaseTaskProvider {
 
 	constructor(logger: Logger, context: vs.ExtensionContext, sdks: DartSdks, private readonly flutterCapabilities: FlutterCapabilities) {
 		super(logger, context, sdks);
+		context.subscriptions.push(vs.commands.registerCommand("flutter.task.genl10n", (uri: vs.Uri) => this.runProjectTask(uri, "flutter", ["gen-l10n"])));
 	}
 
 	public async provideTasks(token?: vs.CancellationToken): Promise<vs.Task[]> {
 		const projectFolders = await getAllProjectFolders(this.logger, util.getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
 
-		let promises: Array<Promise<vs.Task>> = [];
+		const promises: Array<Promise<vs.Task>> = [];
 		projectFolders.forEach((folder) => {
 			const folderUri = vs.Uri.file(folder);
 			const workspaceFolder = vs.workspace.getWorkspaceFolder(folderUri)!;
 			const isFlutter = isFlutterProjectFolder(folder);
 			if (isFlutter) {
-				promises = promises.concat(this.createSharedTasks(workspaceFolder, folderUri));
+				promises.push(...this.createSharedTasks(workspaceFolder, folderUri));
 
 				promises.push(this.createTask(workspaceFolder, folderUri, "flutter", ["build", "aar"]));
 				promises.push(this.createTask(workspaceFolder, folderUri, "flutter", ["build", "apk"]));
@@ -50,6 +51,7 @@ export class FlutterTaskProvider extends BaseTaskProvider {
 				}
 
 				promises.push(this.createTask(workspaceFolder, folderUri, "flutter", ["install"]));
+				promises.push(this.createTask(workspaceFolder, folderUri, "flutter", ["gen-l10n"]));
 			}
 		});
 

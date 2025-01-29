@@ -2,9 +2,9 @@ name: hello_world
 description: An absolute bare-bones web app.
 
 environment:
-  sdk: '>=2.12.0 <3.0.0'
+  sdk: '>=2.12.0 <4.0.0'
 
 dev_dependencies:
   build_runner:
-  build_web_compilers: ^2.12.0-dev.1
-  pedantic:
+  build_web_compilers:
+

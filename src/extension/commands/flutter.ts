@@ -5,7 +5,7 @@ import * as vs from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
 import { FlutterCapabilities } from "../../shared/capabilities/flutter";
 import { vsCodeVersion } from "../../shared/capabilities/vscode";
-import { defaultLaunchJson } from "../../shared/constants";
+import { CommandSource, defaultLaunchJson, flutterCreateAvailablePlatforms, flutterCreateTemplatesSupportingPlatforms } from "../../shared/constants";
 import { DartWorkspaceContext, FlutterCreateCommandArgs, FlutterCreateTriggerData, FlutterProjectTemplate, Logger } from "../../shared/interfaces";
 import { sortBy } from "../../shared/utils/array";
 import { stripMarkdown } from "../../shared/utils/dartdocs";
@@ -15,6 +15,7 @@ import { FlutterDeviceManager } from "../../shared/vscode/device_manager";
 import { createFlutterSampleInTempFolder } from "../../shared/vscode/flutter_samples";
 import { FlutterSampleSnippet } from "../../shared/vscode/interfaces";
 import { Context } from "../../shared/vscode/workspace";
+import { Analytics } from "../analytics";
 import { config } from "../config";
 import { getFlutterSnippets } from "../sdk/flutter_docs_snippets";
 import { SdkUtils } from "../sdk/utils";
@@ -26,15 +27,17 @@ import { BaseSdkCommands, commandState, packageNameRegex } from "./sdk";
 export class FlutterCommands extends BaseSdkCommands {
 	private flutterScreenshotPath?: string;
 
-	constructor(logger: Logger, context: Context, workspace: DartWorkspaceContext, private readonly sdkUtils: SdkUtils, dartCapabilities: DartCapabilities, private readonly flutterCapabilities: FlutterCapabilities, private readonly deviceManager: FlutterDeviceManager | undefined) {
+	constructor(logger: Logger, context: Context, workspace: DartWorkspaceContext, private readonly sdkUtils: SdkUtils, dartCapabilities: DartCapabilities, private readonly flutterCapabilities: FlutterCapabilities, private readonly deviceManager: FlutterDeviceManager | undefined, private readonly analytics: Analytics) {
 		super(logger, context, workspace, dartCapabilities);
 
 		this.disposables.push(vs.commands.registerCommand("flutter.clean", this.flutterClean, this));
 		this.disposables.push(vs.commands.registerCommand("_flutter.screenshot.touchBar", (args: any) => vs.commands.executeCommand("flutter.screenshot", args)));
 		this.disposables.push(vs.commands.registerCommand("flutter.screenshot", this.flutterScreenshot, this));
 		this.disposables.push(vs.commands.registerCommand("flutter.doctor", this.flutterDoctor, this));
+		this.disposables.push(vs.commands.registerCommand("flutter.doctor.sidebar", () => this.flutterDoctor({ commandSource: CommandSource.sidebarTitle })));
 		this.disposables.push(vs.commands.registerCommand("flutter.upgrade", this.flutterUpgrade, this));
 		this.disposables.push(vs.commands.registerCommand("flutter.createProject", this.createFlutterProject, this));
+		this.disposables.push(vs.commands.registerCommand("flutter.createProject.sidebar", () => this.createFlutterProject({ commandSource: CommandSource.sidebarTitle })));
 		this.disposables.push(vs.commands.registerCommand("_dart.flutter.createSampleProject", this.createFlutterSampleProject, this));
 		this.disposables.push(vs.commands.registerCommand("_flutter.create", this.flutterCreate, this));
 		this.disposables.push(vs.commands.registerCommand("_flutter.clean", this.flutterClean, this));
@@ -81,11 +84,11 @@ export class FlutterCommands extends BaseSdkCommands {
 
 		const debugSession = vs.debug.activeDebugSession;
 		if (!debugSession) {
-			vs.window.showErrorMessage("You must have an active Flutter debug session to take screenshots");
+			void vs.window.showErrorMessage("You must have an active Flutter debug session to take screenshots");
 			return;
 		}
 		if (debugSession.type !== "dart") {
-			vs.window.showErrorMessage("The active debug session is not a Flutter app");
+			void vs.window.showErrorMessage("The active debug session is not a Flutter app");
 			return;
 		}
 
@@ -108,11 +111,14 @@ export class FlutterCommands extends BaseSdkCommands {
 		}
 	}
 
-	public flutterDoctor() {
+	public flutterDoctor(options?: { commandSource?: string }) {
 		if (!this.workspace.sdks.flutter) {
 			this.sdkUtils.showFlutterActivationFailure("flutter.doctor");
 			return;
 		}
+
+		this.analytics.logFlutterDoctor(options?.commandSource);
+
 		const tempDir = path.join(os.tmpdir(), "dart-code-cmd-run");
 		if (!fs.existsSync(tempDir))
 			fs.mkdirSync(tempDir);
@@ -140,13 +146,24 @@ export class FlutterCommands extends BaseSdkCommands {
 				return;
 		}
 
+		const template = triggerData?.template;
+		const templateSupportsPlatform = template === undefined || !!flutterCreateTemplatesSupportingPlatforms.find((t) => t === template ?? "app");
+		const defaultPlatforms = config.flutterCreatePlatforms;
+
 		const args = ["create"];
 		if (config.flutterCreateOffline || config.offline) {
 			args.push("--offline");
 		}
-		if (platform) {
-			args.push("--platforms");
-			args.push(platform);
+		if (templateSupportsPlatform) {
+			if (platform) {
+				args.push("--platforms");
+				args.push(platform);
+			} else if (defaultPlatforms) {
+				for (const platform of defaultPlatforms) {
+					args.push("--platforms");
+					args.push(platform);
+				}
+			}
 		}
 		if (projectName) {
 			args.push("--project-name");
@@ -156,7 +173,7 @@ export class FlutterCommands extends BaseSdkCommands {
 			args.push("--org");
 			args.push(config.flutterCreateOrganization);
 		}
-		if (config.flutterCreateIOSLanguage && config.flutterCreateIOSLanguage !== "swift") {
+		if (config.flutterCreateIOSLanguage && config.flutterCreateIOSLanguage !== "swift" && this.flutterCapabilities.supportsIOSLanguage) {
 			args.push("--ios-language");
 			args.push(config.flutterCreateIOSLanguage);
 		}
@@ -169,9 +186,11 @@ export class FlutterCommands extends BaseSdkCommands {
 			args.push(triggerData.sample);
 			args.push("--overwrite");
 		}
-		if (triggerData?.template) {
+		if (template) {
 			args.push("--template");
-			args.push(triggerData.template);
+			args.push(template);
+			if (triggerData?.empty && this.flutterCapabilities.supportsCreateEmpty)
+				args.push("--empty");
 			args.push("--overwrite");
 		}
 		args.push(".");
@@ -194,64 +213,79 @@ export class FlutterCommands extends BaseSdkCommands {
 		}
 	}
 
-	private getFlutterTemplates(): Array<vs.QuickPickItem & { template: FlutterProjectTemplate }> {
-		const templates = [
+	private getFlutterTemplates(): Array<vs.QuickPickItem & { template?: FlutterProjectTemplate }> {
+		const templates: Array<vs.QuickPickItem & { template?: FlutterProjectTemplate }> = [
 			{
-				detail: "Generate a Flutter application.",
+				kind: vs.QuickPickItemKind.Separator,
+				label: "Applications",
+			},
+			{
+				detail: "A Flutter application with descriptive comments and tests.",
 				label: "Application",
 				template: { id: "app" },
 			},
 			{
-				detail: "Generate a project to add a Flutter module to an existing Android or iOS application.",
+				condition: this.flutterCapabilities.supportsCreateEmpty,
+				detail: "A Flutter application without descriptive comments or tests.",
+				label: "Empty Application",
+				template: { id: "app", empty: true },
+			},
+			{
+				condition: this.flutterCapabilities.supportsCreateSkeleton,
+				detail: "A List View / Detail View Flutter application that follows community best practices.",
+				label: "Skeleton Application",
+				template: { id: "skeleton" },
+			},
+			{
+				kind: vs.QuickPickItemKind.Separator,
+				label: "Other Project Types",
+			},
+			{
+				detail: "A project to add a Flutter module to an existing Android or iOS application.",
 				label: "Module",
 				template: { id: "module" },
 			},
 			{
-				detail: "Generate a shareable Flutter project containing modular Dart code.",
+				detail: "A shareable Flutter project containing modular Dart code.",
 				label: "Package",
 				template: { id: "package" },
 			},
 			{
-				detail: "Generate a shareable Flutter project containing an API in Dart code with a platform-specific implementation for Android, for iOS code, or for both.",
+				detail: "A shareable Flutter project containing an API in Dart code with a platform-specific implementation for Android, for iOS code, or for both.",
 				label: "Plugin",
 				template: { id: "plugin" },
 			},
-		];
-
-		if (this.flutterCapabilities.supportsCreateSkeleton) {
-			templates.push({
-				detail: "Generate a List View / Detail View Flutter application that follows community best practices.",
-				label: "Skeleton",
-				template: { id: "skeleton" },
-			});
-		}
+		].filter((t) => t.condition !== false);
 
 		return templates;
 	}
 
-	private async createFlutterProject(): Promise<vs.Uri | undefined> {
+	private async createFlutterProject(options?: { commandSource?: string }): Promise<vs.Uri | undefined> {
 		if (!this.sdks || !this.sdks.flutter) {
 			this.sdkUtils.showFlutterActivationFailure("flutter.createProject");
 			return;
 		}
+
+		this.analytics.logFlutterNewProject(options?.commandSource);
 
 		const pickItems = this.getFlutterTemplates();
 
 		const selectedTemplate = await vs.window.showQuickPick(
 			pickItems,
 			{
+				ignoreFocusOut: true,
 				matchOnDescription: true,
 				placeHolder: "Which Flutter template?",
 			},
 		);
 
-		if (!selectedTemplate)
+		if (!selectedTemplate?.template)
 			return;
 
-		return this.createFlutterProjectForTemplate(selectedTemplate.template.id);
+		return this.createFlutterProjectForTemplate(selectedTemplate.template);
 	}
 
-	private async createFlutterProjectForTemplate(template: string): Promise<vs.Uri | undefined> {
+	private async createFlutterProjectForTemplate(template: FlutterProjectTemplate): Promise<vs.Uri | undefined> {
 		if (!this.sdks || !this.sdks.flutter) {
 			this.sdkUtils.showFlutterActivationFailure("flutter.createProject");
 			return;
@@ -268,7 +302,8 @@ export class FlutterCommands extends BaseSdkCommands {
 		const folderPath = fsPath(folders[0]);
 		this.context.lastUsedNewProjectPath = folderPath;
 
-		const defaultName = nextAvailableFilename(folderPath, "flutter_application_");
+		const projectKind = this.getProjectKind(template.id);
+		const defaultName = nextAvailableFilename(folderPath, `flutter_${projectKind}_`);
 		const name = await this.promptForNameWithSettings(defaultName, folderPath);
 		if (!name)
 			return;
@@ -277,21 +312,23 @@ export class FlutterCommands extends BaseSdkCommands {
 		const projectFolderPath = fsPath(projectFolderUri);
 
 		if (fs.existsSync(projectFolderPath)) {
-			vs.window.showErrorMessage(`A folder named ${name} already exists in ${folderPath}`);
+			void vs.window.showErrorMessage(`A folder named ${name} already exists in ${folderPath}`);
 			return;
 		}
 
 		// Create the empty folder so we can open it.
 		fs.mkdirSync(projectFolderPath);
 
-		const triggerData: FlutterCreateTriggerData | undefined = template ? { template } : undefined;
+		const triggerData: FlutterCreateTriggerData | undefined = template
+			? { template: template.id, empty: template.empty }
+			: undefined;
 		writeFlutterTriggerFile(projectFolderPath, triggerData);
 
 		// If we're using a custom SDK, we need to apply it to the new project too.
 		if (config.workspaceFlutterSdkPath)
 			writeFlutterSdkSettingIntoProject(config.workspaceFlutterSdkPath, projectFolderPath);
 
-		vs.commands.executeCommand("vscode.openFolder", projectFolderUri);
+		void vs.commands.executeCommand("vscode.openFolder", projectFolderUri);
 
 		return projectFolderUri;
 	}
@@ -301,6 +338,7 @@ export class FlutterCommands extends BaseSdkCommands {
 			const response = await showInputBoxWithSettings(
 				this.context,
 				{
+					ignoreFocusOut: true,
 					placeholder: defaultName,
 					prompt: "Enter a name for your new project",
 					title: "Project Name",
@@ -335,7 +373,7 @@ export class FlutterCommands extends BaseSdkCommands {
 		try {
 			snippets = await getFlutterSnippets(this.logger, this.sdks, this.flutterCapabilities);
 		} catch {
-			vs.window.showErrorMessage("Unable to retrieve Flutter documentation snippets");
+			void vs.window.showErrorMessage("Unable to retrieve Flutter documentation snippets");
 			return;
 		}
 
@@ -349,6 +387,7 @@ export class FlutterCommands extends BaseSdkCommands {
 				snippet: s,
 			})),
 			{
+				ignoreFocusOut: true,
 				matchOnDescription: true,
 				placeHolder: "Which Flutter sample?",
 			},
@@ -363,12 +402,23 @@ export class FlutterCommands extends BaseSdkCommands {
 		if (!packageNameRegex.test(input))
 			return "Flutter project names should be all lowercase, with underscores to separate words";
 
-		const bannedNames = ["flutter", "flutter_test", "test", "integration_test"];
+		const bannedNames = ["flutter", "flutter_test", "test", "integration_test", "this"];
 		if (bannedNames.includes(input))
 			return `You may not use ${input} as the name for a flutter project`;
 
 		if (fs.existsSync(path.join(folderDir, input)))
 			return `A project with this name already exists within the selected directory`;
+	}
+
+	private getProjectKind(templateName: string) {
+		if (templateName.includes("module"))
+			return "module";
+		if (templateName.includes("package"))
+			return "package";
+		if (templateName.includes("plugin"))
+			return "plugin";
+
+		return "application";
 	}
 }
 
@@ -394,19 +444,39 @@ function getCurrentFlutterCreateSettings(): PickableSetting[] {
 		{
 			currentValue: config.flutterCreateIOSLanguage || "swift",
 			description: config.flutterCreateIOSLanguage || "swift",
-			detail: "The language to use for iOS-specific code, either ObjectiveC (legacy) or Swift (recommended).",
+			detail: "The language to use for iOS-specific code (Flutter <= 3.22 only), either ObjectiveC (legacy) or Swift (recommended).",
 			enumValues: ["swift", "objc"],
 			label: "iOS Language",
 			setValue: (newValue: "swift" | "objc" | undefined) => config.setFlutterCreateIOSLanguage(newValue),
 			settingKind: "ENUM",
 		},
 		{
-			currentValue: config.flutterCreateOffline ? "enabled" : "not enabled",
-			description: config.flutterCreateOffline ? "enabled" : "not enabled",
-			detail: "When \"flutter pub get\" is run by the create command, this indicates whether to run it in offline mode or not. In offline mode, it will need to have all dependencies already available in the pub cache to succeed.",
-			label: "Create Projects Offline",
-			setValue: (newValue: boolean | undefined) => config.setFlutterCreateOffline(newValue),
+			currentValue: config.offline ? "enabled" : "not enabled",
+			description: config.offline ? "enabled" : "not enabled",
+			detail: "When commands like \"flutter pub get\" or \"flutter create\" are run, this indicates whether to run in offline mode or not. In offline mode, it will need to have all dependencies already available in the pub cache to succeed.",
+			label: "Offline Mode",
+			setValue: (newValue: boolean | undefined) => config.setOffline(newValue),
 			settingKind: "BOOL",
+		},
+		{
+			currentValue: config.flutterCreatePlatforms ?? flutterCreateAvailablePlatforms,
+			description: config.flutterCreatePlatforms ? config.flutterCreatePlatforms.join(", ") : "all",
+			detail: "The platforms that should be enabled for new Flutter applications.",
+			enumValues: [{
+				values: flutterCreateAvailablePlatforms,
+			},
+			/* {
+				group: "Defaults",
+				values: ["Set as default..."],
+			} */ ],
+			label: "Platforms",
+			setValue: async (newValues: any[]) => {
+				const valueToSave = newValues.length === flutterCreateAvailablePlatforms.length
+					? undefined // all
+					: newValues;
+				await config.setFlutterCreatePlatforms(valueToSave);
+			},
+			settingKind: "MULTI_ENUM",
 		},
 	];
 }

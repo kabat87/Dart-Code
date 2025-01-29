@@ -8,7 +8,7 @@ import { extensionVersion } from "../../shared/vscode/extension_utils";
 import { isRunningLocally } from "../../shared/vscode/utils";
 import { config } from "../config";
 
-export function getAnalyzerArgs(logger: Logger, sdks: DartSdks, dartCapabilities: DartCapabilities, isLsp: boolean, vmServicePort: number | undefined) {
+export function getAnalyzerArgs(logger: Logger, sdks: DartSdks, dartCapabilities: DartCapabilities, isLsp: boolean) {
 	const analyzerPath = config.analyzerPath || (
 		dartCapabilities.supportsLanguageServerCommand
 			? "language-server"
@@ -19,34 +19,42 @@ export function getAnalyzerArgs(logger: Logger, sdks: DartSdks, dartCapabilities
 	// might not exist on the local machine.
 	if (!config.analyzerSshHost && analyzerPath !== "language-server" && !fs.existsSync(analyzerPath)) {
 		const msg = "Could not find a Dart Analysis Server at " + analyzerPath;
-		vs.window.showErrorMessage(msg);
+		void vs.window.showErrorMessage(msg);
 		logger.error(msg);
 		throw new Error(msg);
 	}
 
-	return buildAnalyzerArgs(analyzerPath, dartCapabilities, isLsp, vmServicePort);
+	return buildAnalyzerArgs(analyzerPath, dartCapabilities, isLsp);
 }
 
-function buildAnalyzerArgs(analyzerPath: string, dartCapabilities: DartCapabilities, isLsp: boolean, vmServicePort: number | undefined) {
+function buildAnalyzerArgs(analyzerPath: string, dartCapabilities: DartCapabilities, isLsp: boolean) {
 	let analyzerArgs = [];
 
 	// Optionally start the VM service for the analyzer.
+	const vmServicePort = config.analyzerVmServicePort;
 	if (vmServicePort) {
 		analyzerArgs.push(`--enable-vm-service=${vmServicePort}`);
 		// When using LSP, printing the VM Service URI will break the protocol and
 		// stop the client from working, so it needs to be hidden.
 		analyzerArgs.push(`-DSILENT_OBSERVATORY=true`);
+		analyzerArgs.push(`-DSILENT_VM_SERVICE=true`);
 		analyzerArgs.push(`--disable-service-auth-codes`);
 		analyzerArgs.push(`--no-dds`);
 		if (dartCapabilities.supportsNoServeDevTools)
 			analyzerArgs.push("--no-serve-devtools");
 	}
 
+	// Allow arbitrary VM args to be passed to the analysis server.
+	if (config.analyzerVmAdditionalArgs)
+		analyzerArgs = analyzerArgs.concat(config.analyzerVmAdditionalArgs);
+
 	analyzerArgs.push(analyzerPath);
 
 	if (analyzerPath === "language-server") {
 		if (!isLsp)
 			analyzerArgs.push("--protocol=analyzer");
+		else
+			analyzerArgs.push("--protocol=lsp");
 	} else {
 		if (isLsp)
 			analyzerArgs.push("--lsp");

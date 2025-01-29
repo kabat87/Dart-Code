@@ -1,6 +1,6 @@
 import { EventEmitter } from "./events";
 import { IAmDisposable, Logger } from "./interfaces";
-import { disposeAll, PromiseCompleter } from "./utils";
+import { PromiseCompleter, disposeAll } from "./utils";
 import { resolvedPromise } from "./utils/promises";
 
 export abstract class Analyzer implements IAmDisposable {
@@ -21,19 +21,17 @@ export abstract class Analyzer implements IAmDisposable {
 	public readonly onAnalysisStatusChange = this.onAnalysisStatusChangeEmitter.event;
 	private isAnalyzing = false;
 
-	public abstract vmServicePort: number | undefined;
 	public abstract getDiagnosticServerPort(): Promise<{ port: number }>;
 	public abstract forceReanalyze(): Promise<void>;
 
 	constructor(protected readonly logger: Logger) {
 		this.disposables.push(this.onAnalysisStatusChangeEmitter);
-		// tslint:disable-next-line: no-floating-promises
-		this.setup();
+		void this.setup();
 	}
 
 	private async setup(): Promise<void> {
 		await this.onReady;
-		this.onAnalysisStatusChange.listen((status) => {
+		this.onAnalysisStatusChange((status) => {
 			this.isAnalyzing = status.isAnalyzing;
 			if (!status.isAnalyzing) {
 				this.onAnalysisCompleteCompleter.resolve();

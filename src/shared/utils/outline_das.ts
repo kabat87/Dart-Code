@@ -1,5 +1,6 @@
 import * as as from "../analysis_server_types";
 import { Logger } from "../interfaces";
+import { LspTestOutlineInfo } from "./outline_lsp";
 import { extractTestNameFromOutline } from "./test";
 
 export abstract class OutlineVisitor {
@@ -39,6 +40,9 @@ export abstract class OutlineVisitor {
 				break;
 			case "ENUM_CONSTANT":
 				this.visitEnumConstant(outline);
+				break;
+			case "EXTENSION":
+				this.visitExtension(outline);
 				break;
 			case "FIELD":
 				this.visitField(outline);
@@ -109,6 +113,7 @@ export abstract class OutlineVisitor {
 	protected visitContructorInvocation(outline: as.Outline): void { this.visitChildren(outline); }
 	protected visitEnum(outline: as.Outline): void { this.visitChildren(outline); }
 	protected visitEnumConstant(outline: as.Outline): void { this.visitChildren(outline); }
+	protected visitExtension(outline: as.Outline): void { this.visitChildren(outline); }
 	protected visitField(outline: as.Outline): void { this.visitChildren(outline); }
 	protected visitFile(outline: as.Outline): void { this.visitChildren(outline); }
 	protected visitFunction(outline: as.Outline): void { this.visitChildren(outline); }
@@ -162,13 +167,12 @@ export class TestOutlineVisitor extends OutlineVisitor {
 	}
 }
 
-export interface TestOutlineInfo {
+export type TestOutlineInfo = DasTestOutlineInfo | LspTestOutlineInfo;
+
+export interface DasTestOutlineInfo {
 	fullName: string;
 	file: string;
 	isGroup: boolean;
-}
-
-export interface DasTestOutlineInfo extends TestOutlineInfo {
 	offset: number;
 	length: number;
 }
@@ -192,6 +196,7 @@ export class ClassOutlineVisitor extends OutlineVisitor {
 			className: outline.element.name,
 			codeLength: outline.codeLength,
 			codeOffset: outline.codeOffset,
+			elementKind: outline.element.kind,
 			length: outline.length,
 			offset: outline.offset,
 		});
@@ -200,6 +205,7 @@ export class ClassOutlineVisitor extends OutlineVisitor {
 
 export interface ClassInfo {
 	className: string;
+	elementKind: string;
 	offset: number;
 	length: number;
 	codeOffset: number;

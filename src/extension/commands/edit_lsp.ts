@@ -25,6 +25,7 @@ export class LspEditCommands implements vs.Disposable {
 		return vs.commands.executeCommand("editor.action.codeAction", { kind: action, apply: "ifSingle" });
 	}
 
+	// TODO(dantup): Is this wired up?!
 	private async completeStatement(): Promise<void> {
 		const editor = this.getActiveEditor();
 		if (!editor || !editor.selection)
@@ -39,13 +40,13 @@ export class LspEditCommands implements vs.Disposable {
 
 		if (edit) {
 			if (await this.validDocumentVersionsStillMatch(edit)) {
-				const codeEdit = this.analyzer.client.protocol2CodeConverter.asWorkspaceEdit(edit);
+				const codeEdit = await this.analyzer.client.protocol2CodeConverter.asWorkspaceEdit(edit);
 
 				if (!await vs.workspace.applyEdit(codeEdit)) {
-					vs.window.showErrorMessage("VS Code failed to apply edits");
+					void vs.window.showErrorMessage("VS Code failed to apply edits");
 				}
 			} else {
-				vs.window.showErrorMessage("Documents have been modified so edits could not be applied");
+				void vs.window.showErrorMessage("Documents have been modified so edits could not be applied");
 			}
 		}
 	}

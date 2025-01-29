@@ -1,27 +1,55 @@
 import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import { URL } from "url";
 import * as vs from "vscode";
-import { CodeActionKind, env as vsEnv, ExtensionKind, extensions, Position, Range, Selection, TextDocument, TextEditor, TextEditorRevealType, Uri, workspace, WorkspaceFolder } from "vscode";
+import { CodeActionKind, ExtensionKind, Position, Range, Selection, TextDocument, TextEditor, TextEditorRevealType, Uri, WorkspaceFolder, extensions, env as vsEnv, workspace } from "vscode";
 import * as lsp from "vscode-languageclient";
-import { dartCodeExtensionIdentifier } from "../constants";
+import * as YAML from "yaml";
+import { dartCodeExtensionIdentifier, projectSearchCacheTimeInMs, projectSearchProgressNotificationDelayInMs, projectSearchProgressText } from "../constants";
 import { EventEmitter } from "../events";
 import { Location, Logger } from "../interfaces";
 import { nullLogger } from "../logging";
-import { flatMap, notUndefined } from "../utils";
-import { findProjectFolders, forceWindowsDriveLetterToUppercase, fsPath } from "../utils/fs";
+import { PromiseCompleter, flatMap, notUndefined } from "../utils";
+import { SimpleTimeBasedCache } from "../utils/cache";
+import { findProjectFolders, forceWindowsDriveLetterToUppercase, fsPath, isWithinPathOrEqual } from "../utils/fs";
 import { isKnownCloudIde } from "./utils_cloud";
 
 export const SourceSortMembersCodeActionKind = CodeActionKind.Source.append("sortMembers");
 
 const dartExtension = extensions.getExtension(dartCodeExtensionIdentifier);
+export const hostKind = getHostKind();
+
+export interface ProjectFolderSearchResults { projectFolders: string[], excludedFolders: Set<string> };
+
+const projectFolderCache = new SimpleTimeBasedCache<ProjectFolderSearchResults>();
+let inProgressProjectFolderSearch: Promise<void> | undefined;
 
 // The extension kind is declared as Workspace, but VS Code will return UI in the
 // case that there is no remote extension host.
 export const isRunningLocally =
 	// Some cloud IDEs mis-report the extension kind, so if we _know_ something is a cloud IDE,
 	// override that.
-	!isKnownCloudIde
+	!isKnownCloudIde(vs.env.appName)
 	&& (!dartExtension || dartExtension.extensionKind === ExtensionKind.UI);
+
+export function resolvePaths<T extends string | undefined>(p: T): string | (undefined extends T ? undefined : never) {
+	if (typeof p !== "string")
+		return undefined as (undefined extends T ? undefined : never);
+
+	if (p.startsWith("~/"))
+		return path.join(os.homedir(), p.substr(2));
+	if (!path.isAbsolute(p)) {
+		const relativePathBase = workspace.workspaceFile?.scheme === "file"
+			? path.dirname(fsPath(workspace.workspaceFile))
+			: workspace.workspaceFolders?.length
+				? fsPath(workspace.workspaceFolders[0].uri)
+				: undefined;
+		if (relativePathBase)
+			return path.join(relativePathBase, p);
+	}
+	return p;
+}
 
 export function getDartWorkspaceFolders(): WorkspaceFolder[] {
 	if (!workspace.workspaceFolders)
@@ -29,15 +57,140 @@ export function getDartWorkspaceFolders(): WorkspaceFolder[] {
 	return workspace.workspaceFolders.filter(isDartWorkspaceFolder);
 }
 
+function getAnalysisOptionsExcludedFolders(
+	logger: Logger,
+	projectFolders: string[],
+): string[] {
+	const results: string[] = [];
+	for (const projectFolder of projectFolders) {
+		const analysisOptionsPath = path.join(projectFolder, "analysis_options.yaml");
+		try {
+			const analysisOptionsContent = fs.readFileSync(analysisOptionsPath);
+			const yaml = YAML.parse(analysisOptionsContent.toString());
+			const excluded = yaml?.analyzer?.exclude;
+			if (excluded && Array.isArray(excluded)) {
+				for (let exclude of excluded as string[]) {
+					// Only exclude an entire folder if the /** is at the end. If it's
+					// something like foo/**/*.generated.* then it does not exclude
+					// everything in foo.
+					if (exclude.endsWith("/**"))
+						exclude = exclude.substring(0, exclude.length - 3);
+
+					// Handle relative paths.
+					if (!exclude.startsWith("/"))
+						exclude = path.join(projectFolder, exclude);
+
+					// Now, if no wildcards remain in the path, we can use it as an exclusion.
+					if (!exclude.includes("*"))
+						results.push(exclude);
+				}
+			}
+		} catch (e: any) {
+			if (e?.code !== "ENOENT") // Don't warn for missing files.
+				logger.error(`Failed to read ${analysisOptionsPath}: ${e}`);
+		}
+	}
+	return results;
+}
+
+export class ProjectFinder {
+	constructor(private readonly logger: Logger) { }
+
+	public async findAllProjectFolders(
+		getExcludedFolders: ((f: WorkspaceFolder | undefined) => string[]) | undefined,
+		options: { sort?: boolean; requirePubspec?: boolean, searchDepth: number, workspaceFolders?: WorkspaceFolder[], onlyWorkspaceRoots?: boolean },
+	) {
+		return getAllProjectFolders(this.logger, getExcludedFolders, options);
+	}
+}
+
 export async function getAllProjectFolders(
 	logger: Logger,
 	getExcludedFolders: ((f: WorkspaceFolder | undefined) => string[]) | undefined,
-	options: { sort?: boolean; requirePubspec?: boolean, searchDepth: number },
+	options: { sort?: boolean; requirePubspec?: boolean, searchDepth: number, workspaceFolders?: WorkspaceFolder[], onlyWorkspaceRoots?: boolean },
 ) {
-	const workspaceFolders = getDartWorkspaceFolders();
-	const topLevelFolders = workspaceFolders.map((w) => fsPath(w.uri));
-	const allExcludedFolders = getExcludedFolders ? flatMap(workspaceFolders, getExcludedFolders) : [];
-	return findProjectFolders(logger, topLevelFolders, allExcludedFolders, options);
+	const results = await getAllProjectFoldersAndExclusions(logger, getExcludedFolders, options);
+	return results.projectFolders;
+}
+
+export async function getAllProjectFoldersAndExclusions(
+	logger: Logger,
+	getExcludedFolders: ((f: WorkspaceFolder | undefined) => string[]) | undefined,
+	options: { sort?: boolean; requirePubspec?: boolean, searchDepth: number, workspaceFolders?: WorkspaceFolder[], onlyWorkspaceRoots?: boolean },
+): Promise<ProjectFolderSearchResults> {
+	const workspaceFolders = options.workspaceFolders ?? getDartWorkspaceFolders();
+
+	// If an existing search is in progress, wait because it might populate the cache with the results
+	// we want.
+	if (inProgressProjectFolderSearch) {
+		await inProgressProjectFolderSearch;
+	}
+
+	const cacheKey = `folders_${workspaceFolders.map((f) => f.uri.toString()).join(path.sep)}_${!!options.sort}_${!!options.onlyWorkspaceRoots}`;
+	const cachedFolders = projectFolderCache.get(cacheKey);
+	if (cachedFolders) {
+		logger.info(`Returning cached results for project search`);
+		return cachedFolders;
+	}
+
+	// Track this search so other searches can wait on it.
+	const completer = new PromiseCompleter<void>();
+	inProgressProjectFolderSearch = completer.promise;
+	try {
+		let startTimeMs = new Date().getTime();
+		const tokenSource = new vs.CancellationTokenSource();
+		let isComplete = false;
+
+		const topLevelFolders = workspaceFolders.map((w) => fsPath(w.uri));
+		let allExcludedFolders = getExcludedFolders ? flatMap(workspaceFolders, getExcludedFolders) : [];
+		const resultsPromise = findProjectFolders(logger, topLevelFolders, allExcludedFolders, options, tokenSource.token);
+
+		// After some time, if we still have not completed, show a progress notification that can be cancelled
+		// to stop the search, which automatically hides when `resultsPromise` resolves.
+		setTimeout(() => {
+			if (!isComplete) {
+				void vs.window.withProgress({
+					cancellable: true,
+					location: vs.ProgressLocation.Notification,
+					title: projectSearchProgressText,
+				}, (progress, token) => {
+					token.onCancellationRequested(() => {
+						tokenSource.cancel();
+						logger.info(`Project search was cancelled after ${new Date().getTime() - startTimeMs}ms (was searching ${options.searchDepth} levels)`);
+					});
+					return resultsPromise;
+				});
+			}
+		}, projectSearchProgressNotificationDelayInMs);
+
+		let projectFolders = await resultsPromise;
+		isComplete = true;
+		logger.info(`Took ${new Date().getTime() - startTimeMs}ms to search for projects (${options.searchDepth} levels)`);
+		startTimeMs = new Date().getTime();
+
+		// Filter out any folders excluded by analysis_options.
+		try {
+			const excludedFolders = getAnalysisOptionsExcludedFolders(logger, projectFolders);
+			projectFolders = projectFolders.filter((p) => !excludedFolders.find((ex) => isWithinPathOrEqual(p, ex)));
+			logger.info(`Took ${new Date().getTime() - startTimeMs}ms to filter out excluded projects (${excludedFolders.length} exclusion rules)`);
+
+			allExcludedFolders = allExcludedFolders.concat(excludedFolders);
+		} catch (e) {
+			logger.error(`Failed to filter out analysis_options exclusions: ${e}`);
+		}
+
+		const result = { projectFolders, excludedFolders: new Set(allExcludedFolders) };
+
+		// Cache the results.
+		projectFolderCache.add(cacheKey, result, projectSearchCacheTimeInMs);
+
+		return result;
+	} finally {
+		// Clear the promise if it's still ours.
+		completer.resolve();
+		if (inProgressProjectFolderSearch === completer.promise)
+			inProgressProjectFolderSearch = undefined;
+	}
 }
 
 export function isDartWorkspaceFolder(folder?: WorkspaceFolder): boolean {
@@ -99,7 +252,7 @@ export function warnIfPathCaseMismatch(logger: Logger, p: string, pathDescriptio
 		const message = `The casing of ${pathDescription} does not match the casing on disk; please ${helpText}. `
 			+ `Expected ${realPath} but got ${userPath}`;
 		logger.warn(message);
-		vs.window.showWarningMessage(message);
+		void vs.window.showWarningMessage(message);
 		return true;
 	}
 	return false;
@@ -203,4 +356,66 @@ export function createWatcher(pattern: string, emitter: EventEmitter<vs.Uri | vo
 	watcher.onDidCreate((uri) => emitter.fire(uri));
 	watcher.onDidDelete((uri) => emitter.fire(uri));
 	return watcher;
+}
+
+function getHostKind(): string | undefined {
+	return buildHostKind(vs.env);
+}
+
+
+/// Builds a string for analytics/logging purposes that describes the environment that the extension is running in.
+///
+/// appName is passed only to detect cloud IDEs and is not part of the string, since that is reported separately.
+///
+/// The returned string is essentially `$appHost-$remoteName` but with some cleanup to avoid redundant or duplicated values, and to
+/// shorten domains to top-levels.
+export function buildHostKind({ appName, appHost, remoteName }: { appName?: string, appHost?: string, remoteName?: string }): string | undefined {
+	const topLevelDomainRegex = new RegExp(".*\\.(.*\\..*)$");
+	const withoutNumbersRegex = new RegExp("(.*?)[\\d.\\-:]*$");
+	const regexes = [topLevelDomainRegex, withoutNumbersRegex];
+
+	// Fix any known cloud IDEs incorrectly using the default "desktop" value.
+	if (isKnownCloudIde(appName) && appHost === "desktop")
+		appHost = "web";
+
+	// Assume desktop by default.
+	if (appHost === "desktop")
+		appHost = undefined;
+
+	/// Clean up domains to only top level domains without ports and no
+	/// local domains.
+	function cleanString(input: string | undefined): string | undefined {
+		if (!input)
+			return input;
+
+		for (const regex of regexes) {
+			const match = regex.exec(input);
+			if (match)
+				input = match[1];
+		}
+
+		if (input.endsWith(".local") || input.endsWith("localhost")) {
+			input = undefined;
+		}
+
+		return input;
+	}
+
+	remoteName = cleanString(remoteName);
+	appHost = cleanString(appHost);
+
+	// There are a lot of uses of "server-distro" that have domains suffixed.
+	// We don't care too much about the specific domains for these, we should
+	// just group them all as "server-distro".
+	if (appHost?.startsWith("server-distro") || remoteName?.startsWith("server-distro"))
+		return "server-distro";
+
+	if (appHost && remoteName && appHost !== remoteName)
+		return `${appHost}-${remoteName}`;
+	else if (appHost)
+		return appHost;
+	else if (remoteName)
+		return remoteName;
+	else
+		return undefined;
 }

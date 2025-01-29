@@ -13,7 +13,8 @@ export class EditCommands implements vs.Disposable {
 			vs.commands.registerCommand("_dart.showCode", showCode, this),
 			vs.commands.registerCommand("dart.writeRecommendedSettings", this.writeRecommendedSettings, this),
 			vs.commands.registerCommand("dart.printSelectionToTerminal", this.printSelectionToTerminal, this),
-			vs.commands.registerCommand("dart.toggleDartdocComment", this.toggleDartdocomment, this),
+			vs.commands.registerCommand("dart.toggleLineComment", this.toggleLineComment, this),
+			vs.commands.registerCommand("dart.toggleDartdocComment", this.toggleDartdocComment, this),
 		);
 	}
 
@@ -41,20 +42,22 @@ export class EditCommands implements vs.Disposable {
 		}
 	}
 
-	private async writeRecommendedSettings() {
+	private async writeRecommendedSettings(options?: { showNotification?: boolean }) {
 		const topLevelConfig = vs.workspace.getConfiguration("", null);
 		const dartLanguageConfig = topLevelConfig.inspect("[dart]");
 		const existingConfig = dartLanguageConfig ? dartLanguageConfig.globalValue : undefined;
 		const newValues = Object.assign({}, dartRecommendedConfig, existingConfig);
 		await topLevelConfig.update("[dart]", newValues, vs.ConfigurationTarget.Global);
 
-		const action = await vs.window.showInformationMessage(
-			"Recommended settings were written to the [dart] section of your global settings file",
-			openSettingsAction,
-		);
+		if (options?.showNotification !== false) {
+			const action = await vs.window.showInformationMessage(
+				"Recommended settings were written to the [dart] section of your global settings file",
+				openSettingsAction,
+			);
 
-		if (action === openSettingsAction)
-			await vs.commands.executeCommand("workbench.action.openSettingsJson");
+			if (action === openSettingsAction)
+				await vs.commands.executeCommand("workbench.action.openSettingsJson", { revealSetting: { key: "[dart]" } });
+		}
 	}
 
 	private async printSelectionToTerminal() {
@@ -67,7 +70,11 @@ export class EditCommands implements vs.Disposable {
 		}
 	}
 
-	private async toggleDartdocomment() {
+	private toggleDartdocComment() {
+		return this.toggleLineComment(true);
+	}
+
+	private async toggleLineComment(onlyDartdoc = false) {
 		const editor = getActiveRealFileEditor();
 		if (!editor || !editor.selections.length)
 			return;
@@ -102,23 +109,40 @@ export class EditCommands implements vs.Disposable {
 			}
 		}
 
-		switch (commonPrefix) {
-			case "NONE":
-				// If no prefix, insert triples.
-				this.prefixLines(editor, selections, "/// ");
-				break;
-			case "DOUBLE":
-				// If already double, just add the additional one slash.
-				this.prefixLines(editor, selections, "/");
-				break;
-			case "TRIPLE":
-				// If already triple, remove slashes.
-				this.removeLinePrefixes(editor, selections, ["/// ", "///"]);
-				break;
+		if (onlyDartdoc) {
+			switch (commonPrefix) {
+				case "NONE":
+					// If no prefix, insert triples.
+					await this.prefixLines(editor, selections, "/// ");
+					break;
+				case "DOUBLE":
+					// If already double, just add the additional one slash.
+					await this.prefixLines(editor, selections, "/");
+					break;
+				case "TRIPLE":
+					// If already triple, remove slashes.
+					await this.removeLinePrefixes(editor, selections, ["/// ", "///"]);
+					break;
+			}
+		} else {
+			switch (commonPrefix) {
+				case "NONE":
+					// If no prefix, insert doubles.
+					await this.prefixLines(editor, selections, "// ");
+					break;
+				case "DOUBLE":
+					// If already double, add an additional slash to make triple.
+					await this.prefixLines(editor, selections, "/");
+					break;
+				case "TRIPLE":
+					// If already triple, remove slashes.
+					await this.removeLinePrefixes(editor, selections, ["/// ", "///"]);
+					break;
+			}
 		}
 	}
 
-	private prefixLines(editor: vs.TextEditor, selections: readonly vs.Selection[], prefix: string) {
+	private async prefixLines(editor: vs.TextEditor, selections: readonly vs.Selection[], prefix: string) {
 		const document = editor.document;
 		// In case we have overlapping selections, keep track of lines we've done.
 		const doneLines = new Set<number>();
@@ -137,7 +161,7 @@ export class EditCommands implements vs.Disposable {
 			}
 		}
 
-		editor.edit((edit) => {
+		await editor.edit((edit) => {
 			for (const selection of selections) {
 				for (let lineNumber = selection.start.line; lineNumber <= selection.end.line; lineNumber++) {
 					if (doneLines.has(lineNumber))
@@ -155,12 +179,12 @@ export class EditCommands implements vs.Disposable {
 		});
 	}
 
-	private removeLinePrefixes(editor: vs.TextEditor, selections: readonly vs.Selection[], prefixes: string[]) {
+	private async removeLinePrefixes(editor: vs.TextEditor, selections: readonly vs.Selection[], prefixes: string[]) {
 		const document = editor.document;
 		// In case we have overlapping selections, keep track of lines we've done.
 		const doneLines = new Set<number>();
 
-		editor.edit((edit) => {
+		await editor.edit((edit) => {
 			for (const selection of selections) {
 				for (let lineNumber = selection.start.line; lineNumber <= selection.end.line; lineNumber++) {
 					if (doneLines.has(lineNumber))

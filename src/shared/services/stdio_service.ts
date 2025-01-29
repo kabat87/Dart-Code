@@ -15,7 +15,7 @@ export abstract class StdIOService<T> implements IAmDisposable {
 	private openLogFile: string | undefined;
 	private logStream?: fs.WriteStream;
 	private readonly requestErrorSubscriptions: Array<(notification: any) => void> = [];
-	private processExited = false;
+	protected processExited = false;
 	private description: string | undefined;
 
 	constructor(
@@ -91,11 +91,19 @@ export abstract class StdIOService<T> implements IAmDisposable {
 		};
 	}
 
+	protected notifyRequestAfterExit() { }
+
 	protected sendRequest<TReq, TResp>(method: string, params?: TReq): Promise<TResp> {
 		// Generate an ID for this request so we can match up the response.
 		const id = this.nextRequestID++;
 
 		return new Promise<TResp>((resolve, reject) => {
+			if (this.processExited) {
+				this.notifyRequestAfterExit();
+				reject(`Tried to call "${method}" but process has already exited with code ${this.process?.exitCode}`);
+				return;
+			}
+
 			// Stash the callbacks so we can call them later.
 			this.activeRequests[id.toString()] = [resolve, reject, method];
 
@@ -148,9 +156,11 @@ export abstract class StdIOService<T> implements IAmDisposable {
 
 		let msg: any;
 		try {
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 			msg = JSON.parse(message);
 
 			if (this.messagesWrappedInBrackets && msg && msg.length === 1)
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 				msg = msg[0];
 		} catch (e: any) {
 			if (this.treatHandlingErrorsAsUnhandledMessages) {
@@ -163,8 +173,7 @@ export abstract class StdIOService<T> implements IAmDisposable {
 
 		try {
 			if (msg && this.isNotification(msg))
-				// tslint:disable-next-line: no-floating-promises
-				this.handleNotification(msg as T).catch((e) => this.logger.error(e));
+				void this.handleNotification(msg as T).catch((e) => this.logger.error(e));
 			else if (msg && this.isRequest(msg))
 				this.processServerRequest(msg as Request<any>).catch((e) => this.logger.error(e));
 			else if (msg && this.isResponse(msg))
@@ -191,8 +200,8 @@ export abstract class StdIOService<T> implements IAmDisposable {
 	protected isResponse(msg: any): boolean { return !!msg.id; }
 
 	private async processServerRequest(request: Request<any>) {
-		let result: any;
-		let error: any;
+		let result: unknown;
+		let error: unknown;
 		try {
 			result = await this.handleRequest(request.method, request.params);
 		} catch (e) {
@@ -217,6 +226,7 @@ export abstract class StdIOService<T> implements IAmDisposable {
 			return;
 		}
 		const method: string = handler[2];
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 		const error = evt.error;
 
 		if (error && error.code === "SERVER_ERROR") {
@@ -289,18 +299,33 @@ export abstract class StdIOService<T> implements IAmDisposable {
 	}
 
 	public dispose() {
+		this.logTraffic(`Process ${this.description} is being disposed`);
 		for (const pid of this.additionalPidsToTerminate) {
 			try {
+				this.logTraffic(`Process ${this.description} is terminating process ${pid}`);
 				process.kill(pid);
 			} catch (e: any) {
 				// TODO: Logger knows the category!
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 				this.logger.error({ message: e.toString() });
 			}
 		}
 		this.additionalPidsToTerminate.length = 0;
 		try {
-			if (!this.processExited && this.process && !this.process.killed)
+			if (!this.processExited && this.process && !this.process.killed) {
+				this.logTraffic(`Process ${this.description} is terminating the main process`);
 				this.process.kill();
+			} else {
+				if (this.processExited) {
+					this.logTraffic(`Process ${this.description} skipped terminating because it had already exited`);
+				} else if (!this.process) {
+					this.logTraffic(`Process ${this.description} skipped terminating because there is no process`);
+				} else if (this.process?.killed) {
+					this.logTraffic(`Process ${this.description} skipped terminating because it was already killed`);
+				} else {
+					this.logTraffic(`Process ${this.description} skipped terminating because 🤷‍♂️`);
+				}
+			}
 		} catch (e) {
 			// This tends to throw a lot because the shell process quit when we terminated the related
 			// process above, so just swallow the error.
@@ -311,6 +336,7 @@ export abstract class StdIOService<T> implements IAmDisposable {
 			try {
 				return await d.dispose();
 			} catch (e: any) {
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 				this.logger.error({ message: e.toString() });
 			}
 		});

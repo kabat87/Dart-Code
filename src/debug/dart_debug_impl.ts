@@ -1,9 +1,9 @@
 /* eslint-disable no-underscore-dangle */
+import { DebugSession, Event, InitializedEvent, OutputEvent, Scope, Source, StackFrame, StoppedEvent, TerminatedEvent } from "@vscode/debugadapter";
+import { DebugProtocol } from "@vscode/debugprotocol";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { DebugSession, Event, InitializedEvent, OutputEvent, Scope, Source, StackFrame, StoppedEvent, TerminatedEvent } from "vscode-debugadapter";
-import { DebugProtocol } from "vscode-debugprotocol";
 import { DartCapabilities } from "../shared/capabilities/dart";
 import { VmServiceCapabilities } from "../shared/capabilities/vm_service";
 import { dartVMPath, debugLaunchProgressId, debugTerminatingProgressId, pleaseReportBug, vmServiceListeningBannerPattern } from "../shared/constants";
@@ -12,12 +12,12 @@ import { LogCategory, LogSeverity } from "../shared/enums";
 import { LogMessage, SpawnedProcess } from "../shared/interfaces";
 import { ExecutionInfo, safeSpawn } from "../shared/processes";
 import { PackageMap } from "../shared/pub/package_map";
-import { errorString, notUndefined, PromiseCompleter, uniq, uriToFilePath, usingCustomScript } from "../shared/utils";
+import { PromiseCompleter, errorString, notUndefined, uniq, uriToFilePath, usingCustomScript } from "../shared/utils";
 import { sortBy } from "../shared/utils/array";
 import { applyColor, faint } from "../shared/utils/colors";
 import { getRandomInt, getSdkVersion } from "../shared/utils/fs";
 import { mayContainStackFrame, parseStackFrame } from "../shared/utils/stack_trace";
-import { DebuggerResult, Version, VM, VMClass, VMClassRef, VMErrorRef, VMEvent, VMFrame, VMInstance, VMInstanceRef, VMIsolate, VMIsolateRef, VMMapEntry, VMObj, VMScript, VMScriptRef, VMSentinel, VmServiceConnection, VMStack, VMTypeRef, VMWriteEvent } from "./dart_debug_protocol";
+import { DebuggerResult, VM, VMClass, VMClassRef, VMErrorRef, VMEvent, VMFrame, VMInstance, VMInstanceRef, VMIsolate, VMIsolateRef, VMMapEntry, VMObj, VMScript, VMScriptRef, VMSentinel, VMStack, VMTypeRef, VMWriteEvent, Version, VmExceptionMode, VmServiceConnection } from "./dart_debug_protocol";
 import { DebugAdapterLogger } from "./logging";
 import { ThreadInfo, ThreadManager } from "./threads";
 import { formatPathForVm } from "./utils";
@@ -77,23 +77,23 @@ export class DartDebugSession extends DebugSession {
 	public useInspectorNotificationsForWidgetErrors = false;
 	public evaluateGettersInDebugViews = false;
 	protected evaluateToStringInDebugViews = false;
-	protected readonly dartCapabilities = DartCapabilities.empty;
-	protected readonly vmServiceCapabilities = VmServiceCapabilities.empty;
+	public readonly dartCapabilities = DartCapabilities.empty;
+	public readonly vmServiceCapabilities = VmServiceCapabilities.empty;
 	private useWriteServiceInfo = false;
 	protected vmServiceInfoFile?: string;
-	private serviceInfoPollTimer?: NodeJS.Timer;
+	private serviceInfoPollTimer?: NodeJS.Timeout;
 	protected deleteServiceFileAfterRead = false;
 	private remoteEditorTerminalLaunched?: Promise<RemoteEditorTerminalProcess>;
 	private vmServiceInfoFileCompleter?: PromiseCompleter<string>;
 	protected threadManager: ThreadManager;
 	public packageMap?: PackageMap;
-	protected sendStdOutToConsole: boolean = true;
-	protected supportsObservatoryWebApp: boolean = true;
-	protected parseVmServiceUriFromStdOut: boolean = true;
-	protected requiresProgram: boolean = true;
+	protected sendStdOutToConsole = true;
+	protected supportsObservatoryWebApp = true;
+	protected parseVmServiceUriFromStdOut = true;
+	protected requiresProgram = true;
 	protected pollforMemoryMs?: number; // If set, will poll for memory usage and send events back.
 	protected processExit: Promise<{ code: number | null, signal: string | null }> = Promise.resolve({ code: 0, signal: null });
-	protected maxLogLineLength: number = 1000; // This should always be overriden in launch/attach requests but we have it here for narrower types.
+	protected maxLogLineLength = 1000; // This should always be overriden in launch/attach requests but we have it here for narrower types.
 	protected shouldKillProcessOnTerminate = true;
 	protected logCategory = LogCategory.General; // This isn't used as General, since both debuggers override it.
 	protected supportsRunInTerminalRequest = false;
@@ -241,8 +241,7 @@ export class DartDebugSession extends DebugSession {
 				process.on("error", (error) => {
 					this.logToUser(`${error}\n`, "stderr");
 				});
-				// tslint:disable-next-line: no-floating-promises
-				this.processExit.then(async ({ code, signal }) => {
+				void this.processExit.then(async ({ code, signal }) => {
 					this.stopServiceFilePolling(this.deleteServiceFileAfterRead);
 					this.processExited = true;
 					this.log(`Process exited (${signal ? `${signal}`.toLowerCase() : code})`);
@@ -427,6 +426,7 @@ export class DartDebugSession extends DebugSession {
 		if (this.useWriteServiceInfo && this.vmServiceInfoFile) {
 			allArgs.push(`--write-service-info=${formatPathForVm(this.vmServiceInfoFile)}`);
 			allArgs.push("-DSILENT_OBSERVATORY=true");
+			allArgs.push("-DSILENT_VM_SERVICE=true");
 		}
 
 		// Replace in any custom tool.
@@ -724,6 +724,13 @@ export class DartDebugSession extends DebugSession {
 			});
 		}
 
+		// We don't know for certain we have a connected DDS that supports custom streams, so wrap in try/catch
+		try {
+			await this.vmService.on("ToolEvent", (event: VMEvent) => this.handleToolEvent(event)).catch((e) => {
+				this.logger.info(errorString(e));
+			});
+		} catch (e) { }
+
 		if (this.subscribeToStdout) {
 			await this.vmService.on("Stdout", (event: VMWriteEvent) => this.handleStdoutEvent(event)).catch((e) => {
 				// Some embedders may not provide Stdout and it's not clear if they will throw, so
@@ -814,7 +821,7 @@ export class DartDebugSession extends DebugSession {
 
 	// Run some code, but don't wait longer than a certain time period for the result
 	// as it may never come. Returns true if the operation completed.
-	private async raceIgnoringErrors(action: () => Promise<any>, timeoutMilliseconds: number = 250): Promise<boolean> {
+	private async raceIgnoringErrors(action: () => Promise<any>, timeoutMilliseconds = 250): Promise<boolean> {
 		try {
 			await this.withTimeout(action(), timeoutMilliseconds);
 			return true;
@@ -925,9 +932,9 @@ export class DartDebugSession extends DebugSession {
 
 		// If we're running in noDebug mode, we'll always set None.
 		if (!this.noDebug) {
-			if (filters.indexOf("Unhandled") !== -1)
+			if (filters.includes("Unhandled"))
 				mode = "Unhandled";
-			if (filters.indexOf("All") !== -1)
+			if (filters.includes("All"))
 				mode = "All";
 		}
 
@@ -1145,15 +1152,20 @@ export class DartDebugSession extends DebugSession {
 		stackFrame.canRestart = !isTopFrame && frame.index < firstAsyncMarkerIndex;
 
 		// Resolve the line and column information.
-		try {
-			const script = await thread.getScript(location.script);
-			const fileLocation = this.resolveFileLocation(script, location.tokenPos);
-			if (fileLocation) {
-				stackFrame.line = fileLocation.line;
-				stackFrame.column = fileLocation.column;
+		if (location.line && location.column) {
+			stackFrame.line = location.line;
+			stackFrame.column = location.column;
+		} else {
+			try {
+				const script = await thread.getScript(location.script);
+				const fileLocation = this.resolveFileLocation(script, location.tokenPos);
+				if (fileLocation) {
+					stackFrame.line = fileLocation.line;
+					stackFrame.column = fileLocation.column;
+				}
+			} catch (e) {
+				this.logger.error(e);
 			}
-		} catch (e) {
-			this.logger.error(e);
 		}
 
 		return stackFrame;
@@ -1329,12 +1341,14 @@ export class DartDebugSession extends DebugSession {
 								});
 							}
 						} else if (instance.fields) {
+							const fieldAndGetterPromises: Array<Promise<DebugProtocol.Variable>> = [];
 
-							let fieldAndGetterPromises: Array<Promise<DebugProtocol.Variable>> = [];
-
-							const fields = sortBy(instance.fields, (f) => f.decl.name);
-							const fieldPromises = fields.map(async (field, i) => this.instanceRefToVariable(thread, canEvaluate, `${instanceRef.evaluateName}.${field.decl.name}`, field.decl.name, field.value, i <= maxValuesToCallToString));
-							fieldAndGetterPromises = fieldAndGetterPromises.concat(fieldPromises);
+							const fields = sortBy(instance.fields, (f) => f.decl?.name ?? f.name);
+							const fieldPromises = fields.map(async (field, i) => {
+								const name = field.decl?.name ?? (typeof field.name === "number" ? `\$${field.name}` : field.name);
+								return this.instanceRefToVariable(thread, canEvaluate, `${instanceRef.evaluateName}.${name}`, name, field.value, i <= maxValuesToCallToString);
+							});
+							fieldAndGetterPromises.push(...fieldPromises);
 
 							// Add getters
 							if (this.evaluateGettersInDebugViews && instance.class) {
@@ -1368,7 +1382,7 @@ export class DartDebugSession extends DebugSession {
 										return { name: getterName, value: this.errorAsDisplayValue(e), variablesReference: 0 };
 									}
 								});
-								fieldAndGetterPromises = fieldAndGetterPromises.concat(getterPromises);
+								fieldAndGetterPromises.push(...getterPromises);
 							}
 
 							const fieldAndGetterVariables = await Promise.all(fieldAndGetterPromises);
@@ -1428,7 +1442,7 @@ export class DartDebugSession extends DebugSession {
 		return kind === "String" || kind === "Bool" || kind === "Int" || kind === "Num" || kind === "Double" || kind === "Null" || kind === "Closure";
 	}
 
-	private async callToString(isolate: VMIsolateRef, instanceRef: VMInstanceRef, getFullString: boolean = false, suppressQuotesAroundStrings: boolean = false): Promise<string | undefined> {
+	private async callToString(isolate: VMIsolateRef, instanceRef: VMInstanceRef, getFullString = false, suppressQuotesAroundStrings = false): Promise<string | undefined> {
 		if (!this.vmService)
 			return;
 
@@ -1521,7 +1535,6 @@ export class DartDebugSession extends DebugSession {
 	protected restartFrameRequest(response: DebugProtocol.RestartFrameResponse, args: DebugProtocol.RestartFrameArguments): void {
 		this.logDapRequest("restartFrameRequest", args);
 		const frameId = args.frameId;
-		// const context: string = args.context; // "watch", "repl", "hover"
 
 		if (!frameId) {
 			this.errorResponse(response, "unable to restart with no frame");
@@ -1549,9 +1562,15 @@ export class DartDebugSession extends DebugSession {
 		const isClipboardContext = args.context === "clipboard";
 		const isWatchContext = args.context === "watch";
 		const expression: string = args.expression.replace(trailingSemicolonPattern, "");
+
+		if (expression.endsWith(",nq") || expression.endsWith(",h") || expression.endsWith(",d")) {
+			this.errorResponse(response, "Format specifiers are only supported in the SDK debug adapters");
+			return;
+		}
+
 		// Stack frame scope; if not specified, the expression is evaluated in the global scope.
 		const frameId = args.frameId;
-		// const context: string = args.context; // "watch", "repl", "hover"
+		// const context: string = args.context; // "watch", "repl", "hover", file:///foo.dart
 
 		const data = frameId ? this.threadManager.getStoredData(frameId) : undefined;
 		const thread = data ? data.thread : this.threadManager.threads[0];
@@ -1643,21 +1662,25 @@ export class DartDebugSession extends DebugSession {
 		}
 	}
 
-	private withTimeout<T>(promise: Promise<T>, milliseconds: number = 100000): Promise<T> {
+	private withTimeout<T>(promise: Promise<T>, milliseconds = 100000): Promise<T> {
 		return new Promise<T>((resolve, reject) => {
 			// Set a timeout to reject the promise after the timeout period.
 			const timeoutTimer = setTimeout(() => {
 				reject(new Error(`<timed out>`));
 			}, milliseconds);
 
-			promise
-				// When the main promise completes, cancel the timeout and return its result.
-				.then((result) => {
+			// When the main promise completes (or rejects), cancel the timeout and return its result.
+			// eslint-disable-next-line @typescript-eslint/no-floating-promises
+			promise.then(
+				(result) => {
 					clearTimeout(timeoutTimer);
 					resolve(result);
-				})
-				// And if it errors, pass that up.
-				.catch(reject);
+				},
+				(e) => {
+					clearTimeout(timeoutTimer);
+					reject(e);
+				},
+			);
 		});
 	}
 
@@ -1674,7 +1697,7 @@ export class DartDebugSession extends DebugSession {
 		return completer.promise;
 	}
 
-	protected startProgress(progressID: string, message: string | undefined) {
+	protected startProgress(progressId: string, message: string | undefined) {
 		message = message || "Working";
 		message = message.endsWith("…") || message.endsWith("...") ? message : `${message}…`;
 		// TODO: It's not clear if passing an empty string for title is reasonable, but it works better in VS Code.
@@ -1682,25 +1705,25 @@ export class DartDebugSession extends DebugSession {
 
 		// TODO: Revert these changes if VS Code removes the delay.
 		// https://github.com/microsoft/vscode/issues/101405
-		// this.sendEvent(new ProgressStartEvent(progressID, "", e.message));
-		this.sendEvent(new Event("dart.progressStart", { progressID, message }));
+		// this.sendEvent(new ProgressStartEvent(progressId, "", e.message));
+		this.sendEvent(new Event("dart.progressStart", { progressId, message }));
 	}
 
-	protected updateProgress(progressID: string, message: string | undefined) {
+	protected updateProgress(progressId: string, message: string | undefined) {
 		if (!message)
 			return;
 		message = message.endsWith("…") || message.endsWith("...") ? message : `${message}…`;
 		// TODO: Revert these changes if VS Code removes the delay.
 		// https://github.com/microsoft/vscode/issues/101405
-		// this.sendEvent(new ProgressUpdateEvent(progressID, message));
-		this.sendEvent(new Event("dart.progressUpdate", { progressID, message }));
+		// this.sendEvent(new ProgressUpdateEvent(progressId, message));
+		this.sendEvent(new Event("dart.progressUpdate", { progressId, message }));
 	}
 
-	protected endProgress(progressID: string, message?: string | undefined) {
+	protected endProgress(progressId: string, message?: string | undefined) {
 		// TODO: Revert these changes if VS Code removes the delay.
 		// https://github.com/microsoft/vscode/issues/101405
-		// this.sendEvent(new ProgressEndEvent(progressID, e.message));
-		this.sendEvent(new Event("dart.progressEnd", { progressID, message }));
+		// this.sendEvent(new ProgressEndEvent(progressId, e.message));
+		this.sendEvent(new Event("dart.progressEnd", { progressId, message }));
 	}
 
 	protected async customRequest(request: string, response: DebugProtocol.Response, args: any): Promise<void> {
@@ -1788,6 +1811,15 @@ export class DartDebugSession extends DebugSession {
 		this.lastLoggingEvent = this.lastLoggingEvent.then(() => this.processLoggingEvent(event));
 	}
 
+	// ToolEvent
+	public async handleToolEvent(event: VMEvent) {
+		// Don't process any events while the debugger is still running init code.
+		await this.debuggerInit;
+
+		const data = event.extensionData;
+		this.sendEvent(new Event("dart.toolEvent", { kind: event.extensionKind, data }));
+	}
+
 	public handleStdoutEvent(event: VMWriteEvent): void {
 		if (!event.bytes)
 			return;
@@ -1808,7 +1840,7 @@ export class DartDebugSession extends DebugSession {
 				const logPrefix = `[${name || "log"}] `;
 				let indent = " ".repeat(logPrefix.length);
 
-				const printLogRecord = async (event: VMEvent, instance: VMInstanceRef, logPrefix: string, indent: string, category: string = "console") => {
+				const printLogRecord = async (event: VMEvent, instance: VMInstanceRef, logPrefix: string, indent: string, category = "console") => {
 					const message = await this.fullValueAsString(event.isolate, instance, true);
 					if (message) {
 						const indentedMessage = `${faint(logPrefix)}${message.split("\n").join(`\n${indent}`)}`;
@@ -1904,7 +1936,7 @@ export class DartDebugSession extends DebugSession {
 				// dummy unconditional breakpoints.
 				// TODO: Ensure that VM breakpoint state is reconciled with debugger breakpoint state before
 				// handling thread state so that this doesn't happen, and remove this check.
-				const hasUnknownBreakpoints = potentialBreakpoints.indexOf(undefined) !== -1;
+				const hasUnknownBreakpoints = potentialBreakpoints.includes(undefined);
 
 				if (!hasUnknownBreakpoints) {
 					// There can't be any undefined here because of the above, but the types don't know that
@@ -2066,7 +2098,7 @@ export class DartDebugSession extends DebugSession {
 		}
 
 		// Split on the separators and return only the first and last two parts.
-		const sep = uri.indexOf("/") === -1 && uri.indexOf("\\") !== -1 ? "\\" : "/";
+		const sep = !uri.includes("/") && uri.includes("\\") ? "\\" : "/";
 		const parts = uri.split(sep);
 		if (parts.length > 3) {
 			return parts[0] === "org-dartlang-app"
@@ -2174,10 +2206,10 @@ export class DartDebugSession extends DebugSession {
 			return false;
 
 		// HACK: Take a guess at whether it's inside the pubcache (in which case we're considering it external).
-		return path.indexOf("/hosted/pub.dartlang.org/") !== -1
-			|| path.indexOf("\\hosted\\pub.dartlang.org\\") !== -1
-			|| path.indexOf("/third_party/") !== -1
-			|| path.indexOf("\\third_party\\") !== -1;
+		return path.includes("/hosted/pub.")
+			|| path.includes("\\hosted\\pub.")
+			|| path.includes("/third_party/")
+			|| path.includes("\\third_party\\");
 	}
 
 	private resolveFileLocation(script: VMScript, tokenPos: number): FileLocation | undefined {
@@ -2249,8 +2281,9 @@ export class DartDebugSession extends DebugSession {
 	///    [5:01:50 PM] [General] [Info] [stderr]
 	///    [5:01:50 PM] [General] [Info] [stderr]
 	///    [5:01:50 PM] [General] [Info] [stderr]     main (file:///D:/a/
-	///    [5:01:50 PM] [General] [Info] [stderr] Dart-Code/Dart-Code/src/test/test_projects/hello_world/bin/broken.dart:2:3)
+	///    [5:01:50 PM] [General] [Info] [stderr] Dart Code/Dart-Code/src/test/test_projects/hello_world/bin/broken.dart:2:3)
 	protected logToUserBuffered(message: string, category: string) {
+		this.logBufferFlushes[category]?.unref();
 		this.logBuffer[category] = this.logBuffer[category] || "";
 		this.logBuffer[category] += message;
 
@@ -2259,9 +2292,21 @@ export class DartDebugSession extends DebugSession {
 			const processString = this.logBuffer[category].substr(0, lastNewLine + 1);
 			this.logBuffer[category] = this.logBuffer[category].substr(lastNewLine + 1);
 			this.logToUser(processString, category);
+		} else {
+			// If we don't get another message we need to ensure the buffer is flushed after some
+			// small period.
+			this.logBufferFlushes[category] = setTimeout(() => this.flushLogBuffer(category), 50);
 		}
 	}
 	private logBuffer: { [key: string]: string } = {};
+	private logBufferFlushes: { [key: string]: NodeJS.Timer } = {};
+
+	private flushLogBuffer(category: string) {
+		const processString = this.logBuffer[category];
+		delete this.logBuffer[category];
+		if (processString)
+			this.logToUser(processString, category);
+	}
 
 	// Logs a message back to the editor. Does not add its own newlines, you must
 	// provide them!
@@ -2269,7 +2314,7 @@ export class DartDebugSession extends DebugSession {
 
 		// If we get a multi-line message that contains an error/stack trace, process each
 		// line individually, so we can attach location metadata to individual lines.
-		const isMultiLine = message.trimRight().indexOf("\n") !== -1;
+		const isMultiLine = message.trimRight().includes("\n");
 		if (isMultiLine && mayContainStackFrame(message)) {
 			message.split("\n").forEach((line) => this.logToUser(`${line}\n`, category));
 			return;
@@ -2320,8 +2365,6 @@ export interface InstanceWithEvaluateName extends VMInstanceRef {
 	// Undefined means we cannot evaluate
 	evaluateName: string | undefined;
 }
-
-export type VmExceptionMode = "None" | "Unhandled" | "All";
 
 class RemoteEditorTerminalProcess {
 	public killed = false;

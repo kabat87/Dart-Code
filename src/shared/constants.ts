@@ -2,6 +2,8 @@ import * as fs from "fs";
 import { DevToolsPage } from "./interfaces";
 import { versionIsAtLeast } from "./utils";
 
+export type SdkTypeString = "Dart" | "Flutter";
+
 export const dartCodeExtensionIdentifier = "Dart-Code.dart-code";
 export const flutterExtensionIdentifier = "Dart-Code.flutter";
 export const debugAdapterPath = "out/dist/debug.js";
@@ -22,11 +24,15 @@ export const androidStudioExecutableNames = isWin ? ["studio64.exe"] : ["studio.
 export const executableNames = {
 	dart: isWin ? "dart.exe" : "dart",
 	dartdoc: isWin ? "dartdoc.bat" : "dartdoc",
+	devToolsToolBinary: isWin ? "dt.bat" : "dt",
+	devToolsToolLegacyBinary: isWin ? "devtools_tool.bat" : "devtools_tool",
 	flutter: isWin ? "flutter.bat" : "flutter",
 	pub: isWin ? "pub.bat" : "pub",
 };
 export const getExecutableName = (cmd: string) => (executableNames as { [key: string]: string | undefined })[cmd] ?? cmd;
 export const dartVMPath = "bin/" + executableNames.dart;
+export const devToolsToolPath = "tool/bin/" + executableNames.devToolsToolBinary;
+export const devToolsToolLegacyPath = "tool/bin/" + executableNames.devToolsToolLegacyBinary;
 export const dartDocPath = "bin/" + executableNames.dartdoc;
 export const pubPath = "bin/" + executableNames.pub;
 export const flutterPath = "bin/" + executableNames.flutter;
@@ -36,25 +42,9 @@ export const androidStudioPaths = androidStudioExecutableNames.map((s) => "bin/"
 export const DART_DOWNLOAD_URL = "https://dart.dev/get-dart";
 export const FLUTTER_DOWNLOAD_URL = "https://flutter.dev/setup/";
 
-export const IS_LSP_CONTEXT = "dart-code:isLsp";
-
-export const DART_DEP_PROJECT_NODE_CONTEXT = "dart-code:depProjectNode";
-export const DART_DEP_DEPENDENCIES_NODE_CONTEXT = "dart-code:depDependenciesNode";
-export const DART_DEP_DEV_DEPENDENCIES_NODE_CONTEXT = "dart-code:depDevDependenciesNode";
-export const DART_DEP_TRANSITIVE_DEPENDENCIES_NODE_CONTEXT = "dart-code:depTransitiveDependenciesNode";
-export const DART_DEP_PACKAGE_NODE_CONTEXT = "dart-code:depPackageNode";
-export const DART_DEP_DEPENDENCY_PACKAGE_NODE_CONTEXT = "dart-code:depDependencyPackageNode";
-export const DART_DEP_DEV_DEPENDENCY_PACKAGE_NODE_CONTEXT = "dart-code:depDevDependencyPackageNode";
-export const DART_DEP_TRANSITIVE_DEPENDENCY_PACKAGE_NODE_CONTEXT = "dart-code:depTransitiveDependencyPackageNode";
-export const DART_DEP_FOLDER_NODE_CONTEXT = "dart-code:depFolderNode";
-export const DART_DEP_FILE_NODE_CONTEXT = "dart-code:depFileNode";
-export const DART_IS_CAPTURING_LOGS_CONTEXT = "dart-code:isCapturingLogs";
-export const PUB_OUTDATED_SUPPORTED_CONTEXT = "dart-code:pubOutdatedSupported";
-
-export const IS_RUNNING_LOCALLY_CONTEXT = "dart-code:isRunningLocally";
-
 export const stopLoggingAction = "Stop Logging";
 export const showLogAction = "Show Log";
+export const captureLogsMaxLineLength = 999999999;
 
 export const restartReasonManual = "manual";
 export const restartReasonSave = "save";
@@ -63,7 +53,6 @@ export const debugLaunchProgressId = "launch";
 export const debugTerminatingProgressId = "terminate";
 
 export const pubGlobalDocsUrl = "https://www.dartlang.org/tools/pub/cmd/pub-global";
-export const stagehandInstallationInstructionsUrl = "https://github.com/dart-lang/stagehand#installation";
 
 export const issueTrackerAction = "Issue Tracker";
 export const issueTrackerUri = "https://github.com/Dart-Code/Dart-Code/issues";
@@ -76,17 +65,36 @@ export const doNotAskAgainAction = "Never Ask";
 export const moreInfoAction = "More Info";
 
 export const flutterSurveyDataUrl = "https://docs.flutter.dev/f/flutter-survey-metadata.json";
-export const flutterSurveyAnalyticsText = "By clicking on this link you agree to share feature usage along with the survey responses.";
 export const takeSurveyAction = "Take Survey";
 export const skipThisSurveyAction = "Skip This Survey";
 
+export const noSdkAvailablePrompt = "No SDK is available to add to PATH";
+export const sdkAlreadyOnPathPrompt = (sdkType: SdkTypeString) => `The ${sdkType} SDK is already in your PATH`;
+export const addedToPathPrompt = (sdkType: SdkTypeString) => `The ${sdkType} SDK was added to your PATH`;
+export const addSdkToPathPrompt = (sdkType: SdkTypeString) => `Do you want to add the ${sdkType} SDK to PATH so it's accessible in external terminals?`;
+export const unableToAddToPathPrompt = (sdkType: SdkTypeString) => `Unable to add the ${sdkType} SDK to PATH automatically. Show instructions to add manually?`;
+export const openInstructionsAction = "Open Instructions";
+export const copySdkPathToClipboardAction = "Copy SDK path to Clipboard";
+export const addSdkToPathAction = "Add SDK to PATH";
+export const addToPathInstructionsUrl = isWin
+	? "https://flutter.dev/to/update-windows-path"
+	: isMac
+		? "https://flutter.dev/to/update-macos-path"
+		: isLinux && !isChromeOS
+			? "https://flutter.dev/to/update-linux-path"
+			: undefined;
+
 export const modifyingFilesOutsideWorkspaceInfoUrl = "https://dartcode.org/docs/modifying-files-outside-workspace/";
-export const initializingFlutterMessage = "Initializing Flutter. This may take a few minutes.";
+export const initializingFlutterMessage = "Initializing the Flutter SDK. This may take a few minutes.";
+export const cloningFlutterMessage = "Downloading the Flutter SDK. This may take a few minutes.";
 
-export const snapBinaryPath = "/usr/bin/snap";
-export const snapFlutterBinaryPath = "/snap/bin/flutter";
+export const cancelAction = "Cancel";
+export const closeAction = "Close";
 
-// Minutes.
+// Seconds.
+export const tenSecondsInMs = 1000 * 10;
+export const twentySecondsInMs = 1000 * 20;
+
 export const fiveMinutesInMs = 1000 * 60 * 5;
 export const tenMinutesInMs = 1000 * 60 * 10;
 export const twentyMinutesInMs = 1000 * 60 * 20;
@@ -102,64 +110,85 @@ export const longRepeatPromptThreshold = fortyHoursInMs;
 
 export const pleaseReportBug = "Please raise a bug against the Dart extension for VS Code.";
 
+export const projectSearchProgressText = "Searching for projects...";
+// Search for 2s before showing progress notification.
+export const projectSearchProgressNotificationDelayInMs = 2000;
+export const projectSearchCacheTimeInMs = fiveMinutesInMs;
+
 // Chrome OS exposed ports: 8000, 8008, 8080, 8085, 8888, 9005, 3000, 4200, 5000
 export const CHROME_OS_DEVTOOLS_PORT = 8080;
 export const CHROME_OS_VM_SERVICE_PORT = 8085;
 
-export const DART_CREATE_PROJECT_TRIGGER_FILE = "dart.sh.create";
+export const DART_CREATE_PROJECT_TRIGGER_FILE = "dart.create";
 export const FLUTTER_CREATE_PROJECT_TRIGGER_FILE = "flutter.create";
+export const flutterCreateAvailablePlatforms = ["android", "ios", "linux", "macos", "windows", "web"];
+export const flutterCreateTemplatesSupportingPlatforms = ["app", "plugin", "plugin_ffi", "skeleton"];
 
 export const REFACTOR_FAILED_DOC_MODIFIED = "This refactor cannot be applied because the document has changed.";
 export const REFACTOR_ANYWAY = "Refactor Anyway";
 
-export const HAS_LAST_DEBUG_CONFIG = "dart-code:hasLastDebugConfig";
-export const HAS_LAST_TEST_DEBUG_CONFIG = "dart-code:hasLastTestDebugConfig";
-export const isInFlutterDebugModeDebugSessionContext = "dart-code:isInFlutterDebugModeDebugSession";
-export const isInFlutterProfileModeDebugSessionContext = "dart-code:isInFlutterProfileModeDebugSession";
-export const isInFlutterReleaseModeDebugSessionContext = "dart-code:isInFlutterReleaseModeDebugSession";
 export const showErrorsAction = "Show Errors";
-export const debugAnywayAction = "Debug Anyway";
+export const runAnywayAction = "Run Anyway";
 
 export const userPromptContextPrefix = "hasPrompted.";
 export const installFlutterExtensionPromptKey = "install_flutter_extension_3";
 export const useRecommendedSettingsPromptKey = "use_recommended_settings";
 export const yesAction = "Yes";
 export const noAction = "No";
+export const noThanksAction = "No Thanks";
 export const skipAction = "Skip";
 export const iUnderstandAction = "I Understand";
 export const showRecommendedSettingsAction = "Show Recommended Settings";
 export const recommendedSettingsUrl = "https://dartcode.org/docs/recommended-settings/";
 export const openSettingsAction = "Open Settings File";
-export const reactivateDevToolsAction = "Reactivate DevTools";
+export const tryAgainAction = "Try Again";
+export const vmServiceListeningBannerPattern = new RegExp("(?:Observatory|Dart VM [Ss]ervice) .* (?:listening on|available at:) (http:.+)");
+export const vmServiceHttpLinkPattern = new RegExp("(http://[\\d\\.:]+/)");
 
-export const vmServiceListeningBannerPattern: RegExp = new RegExp("(?:Observatory|The Dart VM service is) (?:listening on|.* is available at:) (http:.+)");
-export const vmServiceHttpLinkPattern: RegExp = new RegExp("(http://[\\d\\.:]+/)");
+export const sdkDeprecationInformationUrl = "https://dartcode.org/sdk-version-compatibility/";
+
+/// Constants used in reporting of where commands are executed from.
+///
+/// Used in DevTools querystring, so do not change.
+export abstract class CommandSource {
+	static commandPalette = "command";
+	static dtdServiceRequest = "dtdServiceRequest";
+	static sidebarContent = "sidebarContent";
+	static sidebarTitle = "sidebarToolbar";
+	static touchbar = "touchbar"; // MacOS touchbar button
+	static launchConfiguration = "launchConfiguration"; // Configured explicitly in launch configuration
+	static onDebugAutomatic = "onDebugAutomatic"; // Configured to always run on debug session start
+	static onDebugPrompt = "onDebugPrompt"; // Responded to prompt when running a debug session
+	static languageStatus = "languageStatus"; // Launched from the language status popout
+}
 
 export const runFlutterCreatePrompt = (platformType: string, platformNeedsGloballyEnabling: boolean) =>
 	platformNeedsGloballyEnabling
 		? `Enable the ${platformType} platform and add it to this project?`
 		: `Add the ${platformType} platform to this project?`;
-export const cancelAction = "Cancel";
 
 export const validMethodNameRegex = new RegExp("^[a-zA-Z_][a-zA-Z0-9_]*$");
 export const validClassNameRegex = validMethodNameRegex;
 
-export const widgetInspectorPage: DevToolsPage = { id: "inspector", commandId: "dart.openDevToolsInspector", title: "Widget Inspector" };
-export const cpuProfilerPage: DevToolsPage = { id: "cpu-profiler", commandId: "dart.openDevToolsCpuProfiler", title: "CPU Profiler" };
+// This isn't included in [devToolsPages] because we only use it as a default.
+export const devToolsHomePage = { id: "home", commandSuffix: "Home", title: "DevTools Home", requiredDartSdkVersion: "3.3.0-0" };
+export const widgetInspectorPage: DevToolsPage = { id: "inspector", commandSuffix: "Inspector", title: "Widget Inspector", requiresFlutter: true };
+export const cpuProfilerPage: DevToolsPage = { id: "cpu-profiler", commandSuffix: "CpuProfiler", title: "CPU Profiler" };
 export const performancePage: DevToolsPage = {
-	commandId: "dart.openDevToolsPerformance",
+	commandSuffix: "Performance",
 	id: "performance",
+	requiresFlutter: true,
 	routeId: (flutterVersion) => !flutterVersion || versionIsAtLeast(flutterVersion, "2.3.1" /* 2.3.0-16.0? */) ? "performance" : "legacy-performance",
 	title: "Performance",
 };
 export const devToolsPages: DevToolsPage[] = [
-	// First entry is the default page.
 	widgetInspectorPage,
 	cpuProfilerPage,
-	{ id: "memory", commandId: "dart.openDevToolsMemory", title: "Memory" },
+	{ id: "memory", commandSuffix: "Memory", title: "Memory" },
 	performancePage,
-	{ id: "network", commandId: "dart.openDevToolsNetwork", title: "Network" },
-	{ id: "logging", commandId: "dart.openDevToolsLogging", title: "Logging" },
+	{ id: "network", commandSuffix: "Network", title: "Network" },
+	{ id: "logging", commandSuffix: "Logging", title: "Logging" },
+	{ id: "deep-links", commandSuffix: "DeepLinks", title: "Deep Links", requiresFlutter: true, requiredDartSdkVersion: "3.3.0-277", isStaticTool: true },
 ];
 
 export const dartRecommendedConfig = {
@@ -176,44 +205,33 @@ export const dartRecommendedConfig = {
 	// with Dart's ability to highlight only exact references to the selected variable.
 	"editor.selectionHighlight": false,
 
-	// By default, VS Code prevents code completion from popping open when in
-	// "snippet mode" (editing placeholders in inserted code). Setting this option
-	// to `false` stops that and allows completion to open as normal, as if you
-	// weren't in a snippet placeholder.
-	"editor.suggest.snippetsPreventQuickSuggestions": false,
-
-	// By default, VS Code will pre-select the most recently used item from code
-	// completion. This is usually not the most relevant item.
-	//
-	// "first" will always select top item
-	// "recentlyUsedByPrefix" will filter the recently used items based on the
-	//     text immediately preceeding where completion was invoked.
-	"editor.suggestSelection": "first",
-
 	// Allows pressing <TAB> to complete snippets such as `for` even when the
 	// completion list is not visible.
 	"editor.tabCompletion": "onlySnippets",
 
-	// By default, VS Code will popualte code completion with words found in the
-	// current file when a language service does not provide its own completions.
+	// By default, VS Code will populate code completion with words found in the
+	// matching documents when a language service does not provide its own completions.
 	// This results in code completion suggesting words when editing comments and
 	// strings. This setting will prevent that.
-	"editor.wordBasedSuggestions": false,
+	"editor.wordBasedSuggestions": "off",
 };
 
 export const defaultLaunchJson = JSON.stringify(
 	{
-		"configurations": [
+		configurations: [
 			{
-				"name": "Dart & Flutter",
-				"request": "launch",
-				"type": "dart",
+				name: "Dart & Flutter",
+				request: "launch",
+				type: "dart",
 			},
 		],
-		"version": "0.2.0",
+		version: "0.2.0",
 	},
 	undefined, "\t"
 );
 
-// This indicates that a version is the latest possible.
+// This indicates that a version is the latest possible, used for Bazel workspaces.
 export const MAX_VERSION = "999.999.999";
+
+// This indicates the Flutter version file was missing and we are also assuming the highest.
+export const MISSING_VERSION_FILE_VERSION = "999.999.888";

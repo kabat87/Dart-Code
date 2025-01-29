@@ -1,5 +1,5 @@
 import { strict as assert } from "assert";
-import { DART_DEP_DEPENDENCY_PACKAGE_NODE_CONTEXT, DART_DEP_DEV_DEPENDENCY_PACKAGE_NODE_CONTEXT, DART_DEP_FILE_NODE_CONTEXT, DART_DEP_FOLDER_NODE_CONTEXT, DART_DEP_PACKAGE_NODE_CONTEXT, DART_DEP_PROJECT_NODE_CONTEXT, DART_DEP_TRANSITIVE_DEPENDENCY_PACKAGE_NODE_CONTEXT } from "../../../shared/constants";
+import { DART_DEP_DEPENDENCY_PACKAGE_NODE_CONTEXT, DART_DEP_DEV_DEPENDENCY_PACKAGE_NODE_CONTEXT, DART_DEP_FILE_NODE_CONTEXT, DART_DEP_FOLDER_NODE_CONTEXT, DART_DEP_PACKAGE_NODE_CONTEXT, DART_DEP_PROJECT_NODE_CONTEXT, DART_DEP_TRANSITIVE_DEPENDENCY_PACKAGE_NODE_CONTEXT } from "../../../shared/constants.contexts";
 import { fsPath } from "../../../shared/utils/fs";
 import { ensurePackageTreeNode, extApi, getPackages, myPackageThingFile, renderedItemLabel } from "../../helpers";
 
@@ -45,13 +45,13 @@ describe("packages tree", () => {
 
 			ensurePackageTreeNode(directDependencies, depDirect, "my_package");
 			ensurePackageTreeNode(devDependencies, depDev, "test");
-			ensurePackageTreeNode(transitiveDependencies, depTransitive, "meta");
+			ensurePackageTreeNode(transitiveDependencies, depTransitive, "file");
 		} else {
 			const allDependencies = await extApi.packagesTreeProvider.getChildren(packageNode);
 
 			ensurePackageTreeNode(allDependencies, depDirect, "my_package");
 			ensurePackageTreeNode(allDependencies, depDev, "test");
-			ensurePackageTreeNode(allDependencies, depTransitive, "meta");
+			ensurePackageTreeNode(allDependencies, depTransitive, "file");
 		}
 	});
 
@@ -115,7 +115,7 @@ describe("packages tree", () => {
 			"zzz.txt",
 			"ZZZ_2.txt",
 		];
-		const actualNames = names.filter((n) => expectedNamesInOrder.indexOf(n) !== -1);
+		const actualNames = names.filter((n) => expectedNamesInOrder.includes(n));
 
 		assert.equal(actualNames.length, expectedNamesInOrder.length);
 		actualNames.forEach((name, index) => assert.equal(name, expectedNamesInOrder[index]));

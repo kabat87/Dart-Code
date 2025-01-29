@@ -6,6 +6,8 @@ import { LogCategory } from "./enums";
 import { CustomScript, IAmDisposable, Logger } from "./interfaces";
 import { ExecutionInfo } from "./processes";
 
+export type PromiseOr<T> = Promise<T> | T;
+
 export function uniq<T>(array: T[]): T[] {
 	return array.filter((value, index) => array.indexOf(value) === index);
 }
@@ -22,7 +24,7 @@ export async function flatMapAsync<T1, T2>(input: T1[], f: (input: T1) => Promis
 }
 
 export function filenameSafe(input: string) {
-	return input.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
+	return input.replace(/[^a-z0-9]+/gi, "_").replace(/_{2,}/g, "_").replace(/_$/g, "").toLowerCase();
 }
 
 export function escapeRegExp(input: string): string {
@@ -57,6 +59,11 @@ export function findFileInAncestor(files: string[], startLocation: string) {
 	}
 
 	return undefined;
+}
+
+/// Converts a file URI to file path without a dependency on vs.Uri.
+export function maybeUriToFilePath(uri: string | undefined, returnWindowsPath: boolean = isWin): string | undefined {
+	return uri === undefined ? uri : uriToFilePath(uri);
 }
 
 /// Converts a file URI to file path without a dependency on vs.Uri.
@@ -100,16 +107,16 @@ export function pubVersionIsAtLeast(inputVersion: string, requiredVersion: strin
 	// https://github.com/dart-lang/pub_semver/
 
 	// If only one of them has build metadata, it's newest.
-	if (inputVersion.indexOf("+") !== -1 && requiredVersion.indexOf("+") === -1)
+	if (inputVersion.includes("+") && !requiredVersion.includes("+"))
 		return true;
-	if (inputVersion.indexOf("+") === -1 && requiredVersion.indexOf("+") !== -1)
+	if (!inputVersion.includes("+") && requiredVersion.includes("+"))
 		return false;
 
 	// Otherwise, since they're both otherwise equal and both have build
 	// metadata we can treat the build metadata like pre-release by converting
 	// it to pre-release (with -) or appending it to existing pre-release.
-	inputVersion = inputVersion.replace("+", inputVersion.indexOf("-") === -1 ? "-" : ".");
-	requiredVersion = requiredVersion.replace("+", requiredVersion.indexOf("-") === -1 ? "-" : ".");
+	inputVersion = inputVersion.replace("+", !inputVersion.includes("-") ? "-" : ".");
+	requiredVersion = requiredVersion.replace("+", !requiredVersion.includes("-") ? "-" : ".");
 	return versionIsAtLeast(inputVersion, requiredVersion);
 }
 
@@ -182,7 +189,7 @@ export class BufferedLogger implements Logger {
 	}
 }
 
-export type NullAsUndefined<T> = null extends T ? Exclude<T, null> | undefined : T;
+export type NullAsUndefined<T> = null extends T ? NonNullable<T> | undefined : T;
 
 export function nullToUndefined<T>(value: T): NullAsUndefined<T> {
 	return (value === null ? undefined : value) as NullAsUndefined<T>;
@@ -234,9 +241,32 @@ export function disposeAll(disposables: IAmDisposable[]) {
 	disposables.length = 0;
 	for (const d of toDispose) {
 		try {
-			d.dispose();
+			void d.dispose();
 		} catch (e) {
 			console.warn(e);
 		}
 	}
+}
+
+export async function withTimeout<T>(promise: Thenable<T>, message: string | (() => string), seconds = 360): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		// Set a timeout to reject the promise after the timeout period.
+		const timeoutTimer = setTimeout(() => {
+			const msg = typeof message === "string" ? message : message();
+			reject(new Error(`${msg} within ${seconds}s`));
+		}, seconds * 1000);
+
+		// When the main promise completes (or rejects), cancel the timeout and return its result.
+		// eslint-disable-next-line @typescript-eslint/no-floating-promises
+		promise.then(
+			(result) => {
+				clearTimeout(timeoutTimer);
+				resolve(result);
+			},
+			(e) => {
+				clearTimeout(timeoutTimer);
+				reject(e);
+			},
+		);
+	});
 }

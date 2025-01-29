@@ -4,8 +4,9 @@ import * as os from "os";
 import * as path from "path";
 import { platformEol } from "./constants";
 import { LogCategory, LogSeverity } from "./enums";
-import { IAmDisposable, Logger, LogMessage, SpawnedProcess } from "./interfaces";
+import { IAmDisposable, LogMessage, Logger, SpawnedProcess } from "./interfaces";
 import { errorString } from "./utils";
+import { createFolderForFile } from "./utils/fs";
 
 class LogEmitter extends EventEmitter {
 	public fire(msg: LogMessage): void {
@@ -93,6 +94,7 @@ export function logProcess(logger: Logger, category: LogCategory, process: Spawn
 	process.stdout.on("data", (data) => logger.info(`${prefix} ${data}`, category));
 	process.stderr.on("data", (data) => logger.info(`${prefix} ${data}`, category));
 	process.on("close", (code, signal) => logger.info(`${prefix} closed (${code}, ${signal})`, category));
+	process.on("error", (e) => logger.info(`${prefix} errored (${e})`, category));
 	process.on("exit", (code, signal) => logger.info(`${prefix} exited (${code}, ${signal})`, category));
 }
 
@@ -109,12 +111,13 @@ export function captureLogs(logger: EmittingLogger, file: string, header: string
 	if (!file || !path.isAbsolute(file))
 		throw new Error("Path passed to logTo must be an absolute path");
 	const time = (detailed = false) => detailed ? `[${(new Date()).toTimeString()}] ` : `[${(new Date()).toLocaleTimeString()}] `;
+	createFolderForFile(file);
 	let logStream: fs.WriteStream | undefined = fs.createWriteStream(file);
 	if (header)
 		logStream.write(header);
 
 	const categoryNames = logCategories.map((c) => LogCategory[c]);
-	logStream.write(`Logging Categories:${platformEol}    ${categoryNames.join(", ")}${platformEol}${platformEol}`);
+	logStream.write(`${excludeLogCategories ? "Not " : ""}Logging Categories:${platformEol}    ${categoryNames.join(", ")}${platformEol}${platformEol}`);
 
 	logStream.write(`${(new Date()).toDateString()} ${time(true)}Log file started${platformEol}`);
 	let fileLogger: IAmDisposable | undefined = logger.onLog((e) => {
@@ -126,8 +129,8 @@ export function captureLogs(logger: EmittingLogger, file: string, header: string
 		// - The category filter includes this category; or
 		// - The log is WARN/ERROR (they get logged everywhere).
 		const shouldLog = (excludeLogCategories
-			? logCategories.indexOf(e.category) === -1
-			: logCategories.indexOf(e.category) !== -1)
+			? !logCategories.includes(e.category)
+			: logCategories.includes(e.category))
 			|| e.severity === LogSeverity.Warn
 			|| e.severity === LogSeverity.Error;
 		if (!shouldLog)
@@ -136,15 +139,16 @@ export function captureLogs(logger: EmittingLogger, file: string, header: string
 		logStream.write(`${e.toLine(maxLogLineLength)}${os.EOL}`);
 	});
 	return {
-		dispose(): Promise<void> | void {
+		async dispose(): Promise<void> {
 			if (fileLogger) {
-				fileLogger.dispose();
+				await fileLogger.dispose();
 				fileLogger = undefined;
 			}
 			return new Promise((resolve) => {
 				if (logStream) {
 					logStream.write(`${(new Date()).toDateString()} ${time(true)}Log file ended${os.EOL}`);
-					logStream.end(resolve);
+					logStream.once("finish", resolve);
+					logStream.end();
 					logStream = undefined;
 				}
 			});

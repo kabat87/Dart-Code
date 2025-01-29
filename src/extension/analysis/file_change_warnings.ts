@@ -17,7 +17,7 @@ export class FileChangeWarnings implements vs.Disposable {
 	}
 
 	public onDidChangeTextDocument(e: vs.TextDocumentChangeEvent) {
-		if (!util.isAnalyzable(e.document))
+		if (!util.isDartFile(fsPath(e.document.uri)))
 			return;
 
 		if (e.contentChanges.length === 0) // This event fires for metadata changes (dirty?) so don't need to notify AS then.
@@ -30,7 +30,7 @@ export class FileChangeWarnings implements vs.Disposable {
 			&& !util.isWithinWorkspace(filePath)
 			&& !this.filesWarnedAbout.has(filePath)) {
 
-			const isInPubCache = filePath.indexOf(`${path.sep}hosted${path.sep}pub.dartlang.org${path.sep}`) !== -1;
+			const isInPubCache = filePath.includes(`${path.sep}hosted${path.sep}pub.dartlang.org${path.sep}`);
 			const shouldWarn = isInPubCache
 				? config.warnWhenEditingFilesInPubCache
 				: config.warnWhenEditingFilesOutsideWorkspace;
@@ -43,12 +43,12 @@ export class FileChangeWarnings implements vs.Disposable {
 			const dontShowAgainAction = "Don't Warn Me";
 
 			if (shouldWarn) {
-				vs.window.showWarningMessage(promptText, moreInfoAction, dontShowAgainAction)
+				void vs.window.showWarningMessage(promptText, moreInfoAction, dontShowAgainAction)
 					.then(async (action) => {
 						if (action === moreInfoAction) {
 							await envUtils.openInBrowser(modifyingFilesOutsideWorkspaceInfoUrl);
 						} else if (action === dontShowAgainAction)
-							dontShowAgainSetter();
+							void dontShowAgainSetter();
 					});
 				this.filesWarnedAbout.add(filePath);
 			}

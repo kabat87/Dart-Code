@@ -14,27 +14,27 @@ export class LspTestCodeLensProvider implements CodeLensProvider, IAmDisposable 
 	public readonly onDidChangeCodeLenses: Event<void> = this.onDidChangeCodeLensesEmitter.event;
 
 	constructor(private readonly logger: Logger, private readonly analyzer: LspAnalyzer) {
-		this.disposables.push(this.analyzer.fileTracker.onOutline.listen(() => {
+		this.disposables.push(this.analyzer.fileTracker.onOutline(() => {
 			this.onDidChangeCodeLensesEmitter.fire();
 		}));
 	}
 
 	public async provideCodeLenses(document: TextDocument, token: CancellationToken): Promise<CodeLens[] | undefined> {
-		// Without version numbers, the best we have to tell if an outline is likely correct or stale is
-		// if its length matches the document exactly.
-		const expectedLength = document.getText().length;
-		const outline = await this.analyzer.fileTracker.waitForOutlineWithLength(document, expectedLength, token);
-		if (!outline || !outline.children || !outline.children.length)
-			return;
-
 		// We should only show the CodeLens for projects we know can actually handle `pub run` (for ex. the
 		// SDK codebase cannot, and will therefore run all tests when you click them).
-		if (!this.analyzer.fileTracker.supportsPubRunTest(document.uri))
+		if (!this.analyzer.fileTracker.supportsPackageTest(document.uri))
 			return;
 
 		// If we don't consider this a test file, we should also not show links (since we may try to run the
 		// app with 'flutter run' instead of 'flutter test' which will fail due to no `-name` argument).
 		if (!isTestFile(fsPath(document.uri)))
+			return;
+
+		// Without version numbers, the best we have to tell if an outline is likely correct or stale is
+		// if its length matches the document exactly.
+		const expectedLength = document.getText().length;
+		const outline = await this.analyzer.fileTracker.waitForOutlineWithLength(document, expectedLength, token);
+		if (!outline || !outline.children || !outline.children.length)
 			return;
 
 		const templates = getTemplatedLaunchConfigs(document.uri, "test");

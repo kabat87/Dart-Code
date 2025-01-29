@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { extensions, Uri } from "vscode";
+import { extensions, MarkdownString, Uri } from "vscode";
 import { dartCodeExtensionIdentifier, flutterExtensionIdentifier } from "../constants";
 import * as dartdoc from "../utils/dartdocs";
 
@@ -36,10 +36,24 @@ function checkIsPreReleaseExtension() {
 	return minSegment % 2 === 1;
 }
 
+export function getExtensionVersionForReleaseNotes() {
+	if (!isPreReleaseExtension)
+		return extensionVersion;
+
+	const segments = extensionVersion.split(".");
+	return `${segments[0]}.${parseInt(segments[1], 10) - 1}.0`;
+}
+
 export function checkHasFlutterExtension() {
 	return extensions.getExtension(flutterExtensionIdentifier) !== undefined;
 }
 
 export function cleanDartdoc(doc: string | undefined) {
 	return dartdoc.cleanDartdoc(doc, docsIconPathFormat);
+}
+
+export function createMarkdownString(doc: string) {
+	const md = new MarkdownString(doc);
+	md.supportHtml = true;
+	return md;
 }

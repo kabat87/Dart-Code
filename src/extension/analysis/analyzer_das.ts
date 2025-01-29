@@ -1,6 +1,7 @@
 import * as path from "path";
 import * as vs from "vscode";
 import * as as from "../../shared/analysis_server_types";
+import { ServerOpenUrlRequestRequest } from "../../shared/analysis_server_types";
 import { Analyzer } from "../../shared/analyzer";
 import { DartCapabilities } from "../../shared/capabilities/dart";
 import { dartVMPath } from "../../shared/constants";
@@ -8,6 +9,8 @@ import { LogCategory } from "../../shared/enums";
 import { DartSdks, Logger } from "../../shared/interfaces";
 import { CategoryLogger } from "../../shared/logging";
 import { PromiseCompleter, versionIsAtLeast } from "../../shared/utils";
+import { ANALYSIS_FILTERS } from "../../shared/vscode/constants";
+import { getLanguageStatusItem } from "../../shared/vscode/status_bar";
 import { WorkspaceContext } from "../../shared/workspace";
 import { Analytics } from "../analytics";
 import { config } from "../config";
@@ -46,28 +49,42 @@ export class AnalyzerCapabilities {
 export class DasAnalyzer extends Analyzer {
 	public readonly client: DasAnalyzerClient;
 	public readonly fileTracker: DasFileTracker;
-	public readonly vmServicePort: number | undefined;
+
+	private readonly statusItem = getLanguageStatusItem("dart.analysisServer", ANALYSIS_FILTERS);
 
 	constructor(logger: Logger, analytics: Analytics, sdks: DartSdks, dartCapabilities: DartCapabilities, wsContext: WorkspaceContext) {
 		super(new CategoryLogger(logger, LogCategory.Analyzer));
-		this.vmServicePort = config.analyzerVmServicePort;
 
-		this.client = new DasAnalyzerClient(this.logger, sdks, dartCapabilities, this.vmServicePort);
+		this.setupStatusItem();
+
+		this.client = new DasAnalyzerClient(this.logger, sdks, dartCapabilities);
 		this.fileTracker = new DasFileTracker(logger, this.client, wsContext);
 		this.disposables.push(this.client);
 		this.disposables.push(this.fileTracker);
 
 		const connectedEvent = this.client.registerForServerConnected((sc) => {
-			// TODO: Lsp equiv.
-			analytics.analysisServerVersion = sc.version;
+			this.statusItem.text = "Dart Analysis Server";
 			this.onReadyCompleter.resolve();
 			connectedEvent.dispose();
 		});
 
 		this.client.registerForServerStatus((params) => {
-			if (params.analysis)
+			if (params.analysis) {
+				this.statusItem.busy = params.analysis.isAnalyzing;
 				this.onAnalysisStatusChangeEmitter.fire({ isAnalyzing: params.analysis.isAnalyzing });
+			}
 		});
+	}
+
+	private setupStatusItem() {
+		const statusItem = this.statusItem;
+		statusItem.text = "Dart Analysis Server Starting…";
+
+		statusItem.command = {
+			command: "dart.restartAnalysisServer",
+			title: "restart",
+			tooltip: "Restarts the Dart Analysis Server",
+		};
 	}
 
 	public getDiagnosticServerPort(): Promise<{ port: number; }> {
@@ -87,10 +104,10 @@ export class DasAnalyzerClient extends AnalyzerGen {
 	private currentAnalysisCompleter?: PromiseCompleter<void>;
 	public capabilities: AnalyzerCapabilities = AnalyzerCapabilities.empty;
 
-	constructor(logger: Logger, sdks: DartSdks, dartCapabilities: DartCapabilities, vmServicePort: number | undefined) {
+	constructor(logger: Logger, sdks: DartSdks, dartCapabilities: DartCapabilities) {
 		super(logger, config.maxLogLineLength);
 
-		this.launchArgs = getAnalyzerArgs(logger, sdks, dartCapabilities, false, vmServicePort);
+		this.launchArgs = getAnalyzerArgs(logger, sdks, dartCapabilities, false);
 
 		// Hook error subscriptions so we can try and get diagnostic info if this happens.
 		this.registerForServerError((e) => this.requestDiagnosticsUpdate());
@@ -138,9 +155,12 @@ export class DasAnalyzerClient extends AnalyzerGen {
 			}
 		});
 
-		// tslint:disable-next-line: no-floating-promises
-		this.serverSetSubscriptions({
+		void this.serverSetSubscriptions({
 			subscriptions: ["STATUS"],
+		});
+
+		void this.sendRequest("server.setClientCapabilities", {
+			requests: ["openUrlRequest", "showMessageRequest"],
 		});
 	}
 
@@ -167,7 +187,32 @@ export class DasAnalyzerClient extends AnalyzerGen {
 		const serverHasStarted = !!this.version;
 		if (withError)
 			reportAnalyzerTerminatedWithError(!serverHasStarted);
-		this.notify(this.serverTerminatedSubscriptions, undefined);
+		void this.notify(this.serverTerminatedSubscriptions, undefined);
+	}
+
+	protected async handleRequest(method: string, params: any): Promise<any> {
+		switch (method) {
+			case "server.showMessageRequest":
+				return this.handleShowMessageRequest(params as as.ServerShowMessageRequestRequest);
+			case "server.openUrlRequest":
+				return this.handleOpenUrl(params as ServerOpenUrlRequestRequest);
+			default:
+				throw new Error(`Unknown request ${method}`);
+		}
+	}
+
+
+	private handleOpenUrl(params: as.ServerOpenUrlRequestRequest) {
+		void vs.env.openExternal(vs.Uri.parse(params.url));
+		return;
+	}
+
+	private async handleShowMessageRequest(params: as.ServerShowMessageRequestRequest): Promise<as.ServerShowMessageRequestResponse> {
+		const actionStrings = params.actions.map((s) => s.label);
+		const userChoiceString = await vs.window.showInformationMessage(params.message, ...actionStrings);
+		return {
+			action: userChoiceString,
+		};
 	}
 
 	protected shouldHandleMessage(message: string): boolean {
@@ -203,8 +248,7 @@ export class DasAnalyzerClient extends AnalyzerGen {
 			edits: [{ offset: 0, length: 0, replacement: "", id: "" }],
 			type: "change",
 		};
-		// tslint:disable-next-line: no-floating-promises
-		this.analysisUpdateContent({ files });
+		void this.analysisUpdateContent({ files });
 	}
 
 	// Wraps completionGetSuggestions to return the final result automatically in the original promise

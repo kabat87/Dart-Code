@@ -40,7 +40,7 @@ describe("extension", () => {
 		const sdks: Sdks = extApi.workspaceContext.sdks;
 		assert.ok(sdks);
 		assert.ok(sdks.dart);
-		assert.notEqual(sdks.dart.indexOf("flutter"), -1);
+		assert.notEqual(sdks.dart.toLowerCase().indexOf("flutter"), -1);
 	});
 	it("resolves the correct debug config for a nested project", async () => {
 		await activateWithoutAnalysis();
@@ -50,7 +50,7 @@ describe("extension", () => {
 				name: "Dart",
 				program: fsPath(helloWorldMainFile),
 				request: "launch",
-				suppressPromptOnErrors: true,
+				suppressPrompts: true,
 				type: "dart",
 			},
 		);

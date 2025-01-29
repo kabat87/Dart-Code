@@ -27,4 +27,18 @@ void main() {
       expect(11.toRadixString(16), equals("b"));
     });
   });
+
+  group("greater than", () {
+    test("without quotes List<String>", () {
+      expect(1, 1);
+    });
+
+    test('with quotes ">= foo"', () {
+      expect(1, 1);
+    });
+  });
+
+  test('`with backticks`', () {
+    expect(1, 1);
+  });
 }

@@ -1,11 +1,11 @@
-import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
 import * as vs from "vscode";
+import { DartCapabilities } from "../capabilities/dart";
 import { vsCodeVersion } from "../capabilities/vscode";
-import { alwaysOpenAction, doNotAskAgainAction, flutterSurveyAnalyticsText, flutterSurveyDataUrl, isWin, longRepeatPromptThreshold, noRepeatPromptThreshold, notTodayAction, openAction, skipThisSurveyAction, takeSurveyAction, wantToTryDevToolsPrompt } from "../constants";
+import { CommandSource, alwaysOpenAction, doNotAskAgainAction, flutterSurveyDataUrl, iUnderstandAction, longRepeatPromptThreshold, moreInfoAction, noRepeatPromptThreshold, notTodayAction, openAction, sdkDeprecationInformationUrl, skipThisSurveyAction, takeSurveyAction, wantToTryDevToolsPrompt } from "../constants";
 import { WebClient } from "../fetch";
 import { Analytics, FlutterRawSurveyData, FlutterSurveyData, Logger } from "../interfaces";
+import { WorkspaceContext } from "../workspace";
+import { envUtils, isRunningLocally } from "./utils";
 import { Context } from "./workspace";
 
 /// Shows Survey notification if appropriate. Returns whether a notification was shown
@@ -43,28 +43,8 @@ export async function showFlutterSurveyNotificationIfAppropriate(context: Contex
 	if (lastShown && now - lastShown < longRepeatPromptThreshold)
 		return false;
 
-	// Work out the URL and prompt to show.
-	let clientID: string | undefined;
-	try {
-		const flutterSettingsFolder =
-			isWin ?
-				process.env.APPDATA || os.homedir()
-				: os.homedir();
-		const flutterSettingsPath = path.join(flutterSettingsFolder, ".flutter");
-		if (fs.existsSync(flutterSettingsPath)) {
-			const json = fs.readFileSync(flutterSettingsPath).toString();
-			const settings = JSON.parse(json);
-			if (settings.enabled !== false) {
-				clientID = settings.clientId;
-			}
-		}
-	} catch {
-		logger.warn("Unable to read Flutter settings for preparing survey link");
-	}
-
-	const prompt = clientID ? `${surveyData.title} ${flutterSurveyAnalyticsText}` : surveyData.title;
-	const firstQsSep = surveyData.url.indexOf("?") !== -1 ? "&" : "?";
-	const surveyUrl = `${surveyData.url}${firstQsSep}Source=VSCode${clientID ? `&ClientID=${encodeURIComponent(clientID)}` : ""}`;
+	const firstQsSep = surveyData.url.includes("?") ? "&" : "?";
+	const surveyUrl = `${surveyData.url}${firstQsSep}Source=VSCode`;
 
 	// Mark the last time we've shown it (now) so we can avoid showing again for
 	// 40 hours.
@@ -72,7 +52,7 @@ export async function showFlutterSurveyNotificationIfAppropriate(context: Contex
 
 	// Prompt to show and handle response.
 	analytics.logFlutterSurveyShown();
-	vs.window.showInformationMessage(prompt, takeSurveyAction, skipThisSurveyAction).then(async (choice) => {
+	void vs.window.showInformationMessage(surveyData.title, takeSurveyAction, skipThisSurveyAction).then(async (choice) => {
 		if (choice === skipThisSurveyAction) {
 			context.setFlutterSurveyNotificationDoNotShow(surveyData.uniqueId, true);
 			analytics.logFlutterSurveyDismissed();
@@ -94,6 +74,11 @@ export async function showDevToolsNotificationIfAppropriate(context: Context): P
 	if (!vsCodeVersion.supportsDevTools)
 		return { didOpen: false };
 
+	// Don't show in remote workspaces because currently DevTools fails to load if SSE doesn't work (which
+	// is the case for some cloud IDE proxies).
+	if (!isRunningLocally)
+		return { didOpen: false };
+
 	const lastShown = context.devToolsNotificationLastShown;
 	const doNotShow = context.devToolsNotificationDoNotShow;
 
@@ -112,13 +97,57 @@ export async function showDevToolsNotificationIfAppropriate(context: Context): P
 		context.devToolsNotificationDoNotShow = true;
 		return { didOpen: false };
 	} else if (choice === alwaysOpenAction) {
-		vs.commands.executeCommand("dart.openDevTools");
+		void vs.commands.executeCommand("dart.openDevTools", { commandSource: CommandSource.onDebugPrompt });
 		return { didOpen: true, shouldAlwaysOpen: true };
 	} else if (choice === openAction) {
-		vs.commands.executeCommand("dart.openDevTools");
+		void vs.commands.executeCommand("dart.openDevTools", { commandSource: CommandSource.onDebugPrompt });
 		return { didOpen: true };
 	} else {
 		// No thanks.
 		return { didOpen: false };
 	}
+}
+
+export async function showSdkDeprecationNoticeIfAppropriate(logger: Logger, context: Context, workspaceContext: WorkspaceContext, dartCapabilities: DartCapabilities): Promise<boolean> {
+	if (dartCapabilities.version === DartCapabilities.empty.version)
+		return false;
+
+	if (!dartCapabilities.isUnsupportedNow && !dartCapabilities.isUnsupportedSoon)
+		return false;
+
+	const sdkKind = workspaceContext.sdks.dartSdkIsFromFlutter ? "Flutter" : "Dart";
+	let userShownSdkVersion = workspaceContext.sdks.dartSdkIsFromFlutter ? workspaceContext.sdks.flutterVersion : workspaceContext.sdks.dartVersion;
+	let dartSdkVersion = workspaceContext.sdks.dartVersion;
+
+	if (!userShownSdkVersion || !dartSdkVersion)
+		return false;
+
+	try {
+		// Trim to major+minor.
+		userShownSdkVersion = userShownSdkVersion.split(".").slice(0, 2).join(".");
+		dartSdkVersion = dartSdkVersion.split(".").slice(0, 2).join(".");
+
+		const message = dartCapabilities.isUnsupportedNow
+			? `v${userShownSdkVersion} of the ${sdkKind} SDK is not supported by this version of the Dart extension. Update to a more recent ${sdkKind} SDK or switch to an older version of the extension.`
+			: `Support for v${userShownSdkVersion} of the ${sdkKind} SDK will be removed in an upcoming release of the Dart extension. Consider updating to a more recent ${sdkKind} SDK.`;
+
+		const actions: Array<typeof moreInfoAction | typeof iUnderstandAction> = dartCapabilities.isUnsupportedNow
+			? [moreInfoAction]
+			: [moreInfoAction, iUnderstandAction];
+
+		if (dartCapabilities.isUnsupportedNow || !context.getSdkDeprecationNoticeDoNotShow(dartSdkVersion)) {
+			const action = await vs.window.showWarningMessage(message, ...actions);
+			if (action === moreInfoAction) {
+				await envUtils.openInBrowser(sdkDeprecationInformationUrl);
+			}
+
+			context.setSdkDeprecationNoticeDoNotShow(dartSdkVersion, true);
+
+			return true;
+		}
+	} catch (e) {
+		logger.error(e);
+	}
+
+	return false;
 }

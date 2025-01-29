@@ -3,12 +3,12 @@ import * as vs from "vscode";
 import { Uri } from "vscode";
 import { Logger } from "../../../shared/interfaces";
 import { notUndefined } from "../../../shared/utils";
-import { fsPath, isFlutterProjectFolder } from "../../../shared/utils/fs";
+import { fsPath, homeRelativePath, isFlutterProjectFolder } from "../../../shared/utils/fs";
 import { getAllProjectFolders } from "../../../shared/vscode/utils";
 import { config } from "../../config";
 import { getActiveRealFileEditor } from "../../editors";
 import { locateBestProjectRoot } from "../../project";
-import { getExcludedFolders, homeRelativePath } from "../../utils";
+import { getExcludedFolders } from "../../utils";
 
 export async function getFolderToRunCommandIn(logger: Logger, placeHolder: string, selection?: vs.Uri, flutterOnly = false): Promise<string | undefined> {
 	// Attempt to find a project based on the supplied folder of active file.
@@ -29,7 +29,7 @@ export async function getFolderToRunCommandIn(logger: Logger, placeHolder: strin
 
 	if (!selectableFolders || !selectableFolders.length) {
 		const projectTypes = flutterOnly ? "Flutter" : "Dart/Flutter";
-		vs.window.showWarningMessage(`No ${projectTypes} project roots were found. Do you have a pubspec.yaml file?`);
+		void vs.window.showWarningMessage(`No ${projectTypes} project roots were found. Do you have a pubspec.yaml file?`);
 		return undefined;
 	}
 

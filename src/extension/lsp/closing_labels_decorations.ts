@@ -2,61 +2,87 @@ import * as vs from "vscode";
 import { LanguageClient } from "vscode-languageclient/node";
 import { ClosingLabelsParams, PublishClosingLabelsNotification } from "../../shared/analysis/lsp/custom_protocol";
 import { disposeAll } from "../../shared/utils";
-import { fsPath } from "../../shared/utils/fs";
+import { DocumentCache } from "../../shared/utils/document_cache";
+import { findVisibleEditor } from "../../shared/vscode/editors";
+import { config } from "../config";
 import { validLastCharacters } from "../decorations/closing_labels_decorations";
 
 export class LspClosingLabelsDecorations implements vs.Disposable {
 	private subscriptions: vs.Disposable[] = [];
-	private closingLabels: { [key: string]: ClosingLabelsParams } = {};
-	private editors: { [key: string]: vs.TextEditor } = {};
-	private updateTimeout?: NodeJS.Timer;
+	private closingLabels = new DocumentCache<ClosingLabelsParams>();
+	private editors = new DocumentCache<vs.TextEditor>();
+	private updateTimeouts = new DocumentCache<NodeJS.Timeout>();
 
-	private readonly decorationType = vs.window.createTextEditorDecorationType({
-		after: {
-			color: new vs.ThemeColor("dart.closingLabels"),
-			margin: "2px",
-		},
-		rangeBehavior: vs.DecorationRangeBehavior.ClosedOpen,
-	});
+	private decorationType!: vs.TextEditorDecorationType;
+	private closingLabelsPrefix: string;
+
+	private buildDecorationType() {
+		this.decorationType = vs.window.createTextEditorDecorationType({
+			after: {
+				color: new vs.ThemeColor("dart.closingLabels"),
+				fontStyle: config.closingLabelsTextStyle,
+				margin: "2px",
+			},
+			rangeBehavior: vs.DecorationRangeBehavior.ClosedOpen,
+		});
+	}
 
 	constructor(private readonly analyzer: LanguageClient) {
-		// tslint:disable-next-line: no-floating-promises
-		analyzer.onReady().then(() => {
+		this.closingLabelsPrefix = config.closingLabelsPrefix;
+		this.buildDecorationType();
+
+		void analyzer.start().then(() => {
 			this.analyzer.onNotification(PublishClosingLabelsNotification.type, (n) => {
-				const filePath = fsPath(vs.Uri.parse(n.uri));
-				this.closingLabels[filePath] = n;
-				// Fire an update if it was for the active document.
-				if (vs.window.activeTextEditor
-					&& vs.window.activeTextEditor.document
-					&& filePath === fsPath(vs.window.activeTextEditor.document.uri)) {
+				const uri = vs.Uri.parse(n.uri);
+				this.closingLabels.set(uri, n);
+				// Fire an update if it was for a visible editor.
+				const editor = findVisibleEditor(uri);
+				if (editor) {
 					// Delay this so if we're getting lots of updates we don't flicker.
-					if (this.updateTimeout)
-						clearTimeout(this.updateTimeout);
-					this.updateTimeout = setTimeout(() => this.update(), 500);
+					if (this.updateTimeouts.has(uri))
+						clearTimeout(this.updateTimeouts.get(uri));
+					this.updateTimeouts.set(uri, setTimeout(() => this.update(uri), 500));
 				}
 			});
 		});
 
-		this.subscriptions.push(vs.window.onDidChangeActiveTextEditor(() => this.update()));
+		this.subscriptions.push(vs.window.onDidChangeVisibleTextEditors(() => this.updateAll()));
 		this.subscriptions.push(vs.workspace.onDidCloseTextDocument((td) => {
-			const filePath = fsPath(td.uri);
-			delete this.closingLabels[filePath];
+			this.closingLabels.delete(td.uri);
 		}));
-		if (vs.window.activeTextEditor)
-			this.update();
+		this.subscriptions.push(vs.workspace.onDidChangeConfiguration((e) => {
+			let needsUpdate = false;
+			if (e.affectsConfiguration("dart.closingLabelsPrefix")) {
+				needsUpdate = true;
+				this.closingLabelsPrefix = config.closingLabelsPrefix;
+			}
+			if (e.affectsConfiguration("dart.closingLabels") || e.affectsConfiguration("dart.closingLabelsTextStyle")) {
+				needsUpdate = true;
+				this.decorationType.dispose();
+				this.buildDecorationType();
+			}
+			if (needsUpdate) {
+				this.updateAll();
+			}
+		}));
+
+		this.updateAll();
 	}
 
-	private update() {
-		const editor = vs.window.activeTextEditor;
-		if (!editor || !editor.document)
+	private updateAll() {
+		for (const editor of vs.window.visibleTextEditors)
+			this.update(editor.document.uri);
+	}
+
+	private update(uri: vs.Uri) {
+		if (!this.closingLabels.has(uri))
 			return;
 
-		const filePath = fsPath(editor.document.uri);
-		if (!this.closingLabels[filePath])
-			return;
+		const editor = findVisibleEditor(uri);
+		if (!editor) return;
 
 		const decorations: { [key: number]: vs.DecorationOptions & { renderOptions: { after: { contentText: string } } } } = [];
-		for (const r of this.closingLabels[filePath].labels) {
+		for (const r of this.closingLabels.get(uri)?.labels ?? []) {
 			const labelRange = this.analyzer.protocol2CodeConverter.asRange(r.range);
 
 			// Ensure the label we got looks like a sensible range, otherwise the outline info
@@ -69,7 +95,7 @@ export class LspClosingLabelsDecorations implements vs.Disposable {
 
 			const finalCharacterRange = new vs.Range(finalCharacterPosition.translate({ characterDelta: -1 }), finalCharacterPosition);
 			const finalCharacterText = editor.document.getText(finalCharacterRange);
-			if (validLastCharacters.indexOf(finalCharacterText) === -1)
+			if (!validLastCharacters.includes(finalCharacterText))
 				return;
 
 			// Get the end of the line where we'll show the labels.
@@ -77,17 +103,17 @@ export class LspClosingLabelsDecorations implements vs.Disposable {
 
 			const existingDecorationForLine = decorations[endOfLine.line];
 			if (existingDecorationForLine) {
-				existingDecorationForLine.renderOptions.after.contentText = " // " + r.label + " " + existingDecorationForLine.renderOptions.after.contentText;
+				existingDecorationForLine.renderOptions.after.contentText = this.closingLabelsPrefix + r.label + " " + existingDecorationForLine.renderOptions.after.contentText;
 			} else {
 				const dec = {
 					range: new vs.Range(labelRange.start, endOfLine),
-					renderOptions: { after: { contentText: " // " + r.label } },
+					renderOptions: { after: { contentText: this.closingLabelsPrefix + r.label } },
 				};
 				decorations[endOfLine.line] = dec;
 			}
 		}
 
-		this.editors[filePath] = editor;
+		this.editors.set(uri, editor);
 		editor.setDecorations(this.decorationType, Object.keys(decorations).map((k) => parseInt(k, 10)).map((k) => decorations[k]));
 	}
 
@@ -100,6 +126,7 @@ export class LspClosingLabelsDecorations implements vs.Disposable {
 				// doesn't seem to be a way to tell.
 			}
 		}
+		this.decorationType.dispose();
 		disposeAll(this.subscriptions);
 	}
 }

@@ -1,7 +1,6 @@
 import { activate, ensureTestContent, executeSortMembersCodeAction, setTestContent } from "../../helpers";
 
 describe("sort members", () => {
-
 	beforeEach("activate", () => activate());
 
 	it("sorts members", async () => {

@@ -1,13 +1,13 @@
-import { Thread, ThreadEvent } from "vscode-debugadapter";
-import { DebugProtocol } from "vscode-debugprotocol";
+import { Thread, ThreadEvent } from "@vscode/debugadapter";
+import { DebugProtocol } from "@vscode/debugprotocol";
 import { LogCategory } from "../shared/enums";
 import { Logger } from "../shared/interfaces";
-import { errorString, PromiseCompleter } from "../shared/utils";
-import { DartDebugSession, InstanceWithEvaluateName, VmExceptionMode } from "./dart_debug_impl";
-import { DebuggerResult, VMBreakpoint, VMEvent, VMIsolate, VMIsolateRef, VMLibraryRef, VMResponse, VMScript, VMScriptRef } from "./dart_debug_protocol";
+import { PromiseCompleter, errorString } from "../shared/utils";
+import { DartDebugSession, InstanceWithEvaluateName } from "./dart_debug_impl";
+import { DebuggerResult, VMBreakpoint, VMEvent, VMIsolate, VMIsolateRef, VMLibraryRef, VMResponse, VMScript, VMScriptRef, VmExceptionMode } from "./dart_debug_protocol";
 
 export class ThreadManager {
-	public nextThreadId: number = 0;
+	public nextThreadId = 0;
 
 	public threads: ThreadInfo[] = [];
 	public bps: { [uri: string]: DebugProtocol.SourceBreakpoint[] } = {};
@@ -37,12 +37,23 @@ export class ThreadManager {
 
 			if (this.debugSession.vmService) {
 				await Promise.all([
-					this.debugSession.vmService.setExceptionPauseMode(thread.ref.id, this.exceptionMode),
+					this.setThreadExceptionPauseMode(thread.ref, this.exceptionMode),
 					this.setLibrariesDebuggable(thread.ref),
 					this.resendThreadBreakpoints(thread),
 				]);
 				thread.setInitialBreakpoints();
 			}
+		}
+	}
+
+	private async setThreadExceptionPauseMode(isolateRef: VMIsolateRef, mode: VmExceptionMode): Promise<void> {
+		if (!this.debugSession?.vmService)
+			return;
+
+		if (this.debugSession.vmServiceCapabilities.supportsSetIsolatePauseMode && this.debugSession.dartCapabilities.supportsSetIsolatePauseModeForWeb) {
+			await this.debugSession.vmService.setIsolatePauseMode(isolateRef.id, { exceptionPauseMode: mode });
+		} else {
+			await this.debugSession.vmService.setExceptionPauseMode(isolateRef.id, mode);
 		}
 	}
 
@@ -88,7 +99,7 @@ export class ThreadManager {
 			if (!thread.runnable || !this.debugSession.vmService)
 				return;
 
-			await this.debugSession.vmService.setExceptionPauseMode(thread.ref.id, mode);
+			await this.setThreadExceptionPauseMode(thread.ref, mode);
 		}));
 	}
 
@@ -165,7 +176,7 @@ export class ThreadManager {
 		return completer.promise;
 	}
 
-	public nextDataId: number = 1;
+	public nextDataId = 1;
 	public storedData: { [id: number]: StoredData } = {};
 
 	public storeData(thread: ThreadInfo, data: StorableData): number {
@@ -214,13 +225,13 @@ class StoredData {
 
 export class ThreadInfo {
 	public scriptCompleters: { [key: string]: PromiseCompleter<VMScript> } = {};
-	public runnable: boolean = false;
+	public runnable = false;
 	public vmBps: { [uri: string]: VMBreakpoint[] } = {};
 	// TODO: Do we need both sets of breakpoints?
 	public breakpoints: { [key: string]: DebugProtocol.SourceBreakpoint } = {};
-	public atAsyncSuspension: boolean = false;
+	public atAsyncSuspension = false;
 	public exceptionReference = 0;
-	public paused: boolean = false;
+	public paused = false;
 	public pauseEvent: VMEvent | undefined;
 
 	constructor(
@@ -298,8 +309,7 @@ export class ThreadInfo {
 
 	public checkResume() {
 		if (this.paused && this.gotPauseStart && this.initialBreakpoints && this.hasConfigurationDone)
-			// tslint:disable-next-line: no-floating-promises
-			this.resume();
+			void this.resume();
 	}
 
 	public handleResumed() {
