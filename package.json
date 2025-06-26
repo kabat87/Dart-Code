@@ -2637,7 +2637,7 @@
 		"report_screen": "nyc report"
 	},
 	"dependencies": {
-		"minimatch": "^5.0.1",
+		"minimatch": "^10.0.2",
 		"semver": "^7.3.5",
 		"vscode-debugadapter": "^1.51.0",
 		"vscode-debugprotocol": "^1.51.0",
