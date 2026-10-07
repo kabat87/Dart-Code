@@ -1,10 +1,10 @@
 import { EventEmitter } from "./events";
-import { IAmDisposable, Logger } from "./interfaces";
-import { disposeAll, PromiseCompleter } from "./utils";
+import { IAmDisposableAsync, Logger } from "./interfaces";
+import { PromiseCompleter, disposeAllAsync } from "./utils";
 import { resolvedPromise } from "./utils/promises";
 
-export abstract class Analyzer implements IAmDisposable {
-	protected disposables: IAmDisposable[] = [];
+export abstract class Analyzer implements IAmDisposableAsync {
+	protected disposables: IAmDisposableAsync[] = [];
 
 	protected readonly onReadyCompleter = new PromiseCompleter<void>();
 	public readonly onReady = this.onReadyCompleter.promise;
@@ -21,19 +21,17 @@ export abstract class Analyzer implements IAmDisposable {
 	public readonly onAnalysisStatusChange = this.onAnalysisStatusChangeEmitter.event;
 	private isAnalyzing = false;
 
-	public abstract vmServicePort: number | undefined;
-	public abstract getDiagnosticServerPort(): Promise<{ port: number }>;
+	public abstract getDiagnosticServerPort(): Promise<{ port: number } | undefined>;
 	public abstract forceReanalyze(): Promise<void>;
 
 	constructor(protected readonly logger: Logger) {
 		this.disposables.push(this.onAnalysisStatusChangeEmitter);
-		// tslint:disable-next-line: no-floating-promises
-		this.setup();
+		void this.setup();
 	}
 
 	private async setup(): Promise<void> {
 		await this.onReady;
-		this.onAnalysisStatusChange.listen((status) => {
+		this.onAnalysisStatusChange((status) => {
 			this.isAnalyzing = status.isAnalyzing;
 			if (!status.isAnalyzing) {
 				this.onAnalysisCompleteCompleter.resolve();
@@ -42,12 +40,12 @@ export abstract class Analyzer implements IAmDisposable {
 		});
 	}
 
-	public dispose(): void | Promise<void> {
-		disposeAll(this.disposables);
+	public dispose(): Promise<void> {
+		return disposeAllAsync(this.disposables);
 	}
 }
 
-export interface AnalyzingEvent {
+interface AnalyzingEvent {
 	isAnalyzing: boolean;
 	suppressProgress?: boolean;
 }

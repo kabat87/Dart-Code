@@ -1,5 +1,4 @@
-/* eslint-disable id-blacklist */
-import * as WebSocket from "ws";
+import { default as WebSocket } from "ws";
 import { PromiseCompleter } from "../shared/utils";
 
 export class DebuggerResult {
@@ -67,7 +66,7 @@ export interface VMIsolateRef extends VMResponse {
 }
 
 export interface VMIsolate extends VMResponse, VMIsolateRef {
-	number: string;
+	number: string; // eslint-disable-line id-blacklist
 	runnable: boolean;
 	pauseEvent: VMEvent;
 	libraries: VMLibraryRef[];
@@ -76,7 +75,7 @@ export interface VMIsolate extends VMResponse, VMIsolateRef {
 	extensionRPCs?: string[];
 }
 
-export interface VMObjectRef extends VMResponse {
+interface VMObjectRef extends VMResponse {
 	id: string;
 }
 
@@ -86,7 +85,7 @@ export interface VMStack extends VMResponse {
 	truncated: boolean | undefined;
 }
 
-export interface VMHeapSpace extends VMResponse {
+interface VMHeapSpace extends VMResponse {
 	name: string;
 	used: number;
 	capacity: number;
@@ -102,22 +101,26 @@ export interface VMFrame extends VMResponse {
 	vars?: VMBoundVariable[];
 }
 
-export interface VMCodeRef extends VMObjectRef {
+interface VMCodeRef extends VMObjectRef {
 	name: string;
 	// CodeKind: Dart, Native, Stub, Tag, Collected
 	kind: string;
 }
 
-export interface VMSourceLocation extends VMResponse {
+interface VMSourceLocation extends VMResponse {
 	// The script containing the source location.
 	script: VMScriptRef;
 	// The first token of the location.
 	tokenPos: number;
 	// The last token of the location if this is a range.
 	endTokenPos?: number;
+	// The line number for [tokenPos].
+	line?: number;
+	// The column number for [tokenPos].
+	column?: number;
 }
 
-export interface VMUnresolvedSourceLocation extends VMResponse {
+interface VMUnresolvedSourceLocation extends VMResponse {
 	// The script containing the source location if the script has been loaded.
 	// Either the script or the scriptUri field will be present.
 	script?: VMScriptRef;
@@ -178,17 +181,18 @@ export interface VMClass extends VMObj {
 	super?: VMClassRef;
 }
 
-export interface VMBoundField {
-	decl: VMFieldRef;
+interface VMBoundField {
+	decl: VMFieldRef | undefined;
+	name: string | number;
 	value: VMInstanceRef | VMSentinel;
 }
 
-export interface VMMapAssociation {
+interface VMMapAssociation {
 	key: VMInstanceRef | VMSentinel;
 	value: VMInstanceRef | VMSentinel;
 }
 
-export interface VMFieldRef extends VMObjectRef {
+interface VMFieldRef extends VMObjectRef {
 	// The name of this field.
 	name: string;
 	// The owner of this field, which can be either a Library or a Class.
@@ -202,12 +206,8 @@ export interface VMLibraryRef extends VMObjectRef {
 	uri: string;
 }
 
-export interface VMLibrary extends VMObj {
-	// A list of the scripts which constitute this library.
-	scripts: VMScriptRef[];
-}
 
-export interface VMFuncRef extends VMObjectRef {
+interface VMFuncRef extends VMObjectRef {
 	name: string;
 	// The owner of this function, which can be one of [LibraryRef], [ClassRef] or [FuncRef].
 	owner: VMLibraryRef | VMClassRef | VMFuncRef;
@@ -217,7 +217,7 @@ export interface VMFuncRef extends VMObjectRef {
 	isConst: boolean;
 }
 
-export interface VMBoundVariable {
+interface VMBoundVariable {
 	name: string;
 	// [value] can be one of [InstanceRef] or [Sentinel].
 	value: VMInstanceRef | VMSentinel;
@@ -283,14 +283,14 @@ export interface VMClassRef extends VMObjectRef {
 	name: string;
 }
 
-export interface VMFunctionRef extends VMObjectRef {
+interface VMFunctionRef extends VMObjectRef {
 	name: string;
 	_kind: string;
 	static: boolean;
 	const: boolean;
 }
 
-export interface VMLogRecord extends VMResponse {
+interface VMLogRecord extends VMResponse {
 	// The log message.
 	message: VMInstanceRef;
 
@@ -324,67 +324,7 @@ export interface VMWriteEvent extends VMEvent {
 	bytes?: string;
 }
 
-export interface VMSourceReport extends VMResponse {
-	// A list of ranges in the program source.  These ranges correspond
-	// to ranges of executable code in the user's program (functions,
-	// methods, constructors, etc.)
-	//
-	// Note that ranges may nest in other ranges, in the case of nested
-	// functions.
-	//
-	// Note that ranges may be duplicated, in the case of mixins.
-	ranges: VMSourceReportRange[];
-
-	// A list of scripts, referenced by index in the report's ranges.
-	scripts: VMScriptRef[];
-}
-
-export interface VMSourceReportRange {
-	// An index into the script table of the SourceReport, indicating
-	// which script contains this range of code.
-	scriptIndex: number;
-
-	// The token position at which this range begins.
-	startPos: number;
-
-	// The token position at which this range ends.  Inclusive.
-	endPos: number;
-
-	// Has this range been compiled by the Dart VM?
-	compiled: boolean;
-
-	// The error while attempting to compile this range, if this
-	// report was generated with forceCompile=true.
-	error?: Error;
-
-	// Code coverage information for this range.  Provided only when the
-	// Coverage report has been requested and the range has been
-	// compiled.
-	coverage?: VMSourceReportCoverage;
-
-	// Possible breakpoint information for this range, represented as a
-	// sorted list of token positions.  Provided only when the when the
-	// PossibleBreakpoint report has been requested and the range has been
-	// compiled.
-	possibleBreakpoints?: number[];
-}
-
-export interface VMSourceReportCoverage {
-	// A list of token positions in a SourceReportRange which have been
-	// executed.  The list is sorted.
-	hits: number[];
-
-	// A list of token positions in a SourceReportRange which have not been
-	// executed.  The list is sorted.
-	misses: number[];
-}
-
-export enum SourceReportKind {
-	Coverage,
-	PossibleBreakpoints,
-}
-
-export class RPCError {
+class RPCError {
 	public code: number;
 	public message: string;
 	public data: any;
@@ -396,7 +336,7 @@ export class RPCError {
 	}
 
 	public details(): string | undefined {
-		return this.data ? this.data.details : undefined;
+		return this.data ? this.data.details as string : undefined;
 	}
 
 	public toString(): string {
@@ -417,7 +357,7 @@ export class VmServiceConnection {
 			uri = url.toString();
 		}
 		this.socket = new WebSocket(uri, { followRedirects: true });
-		this.socket.on("message", (data) => this.handleData(data.toString()));
+		this.socket.on("message", (data: Buffer) => this.handleData(data.toString()));
 	}
 
 	public onOpen(cb: () => void) {
@@ -461,9 +401,12 @@ export class VmServiceConnection {
 		return this.callMethod("addBreakpointWithScriptUri", data);
 	}
 
-	// None, Unhandled, and All
-	public setExceptionPauseMode(isolateId: string, mode: string): Promise<DebuggerResult> {
+	public setExceptionPauseMode(isolateId: string, mode: VmExceptionMode): Promise<DebuggerResult> {
 		return this.callMethod("setExceptionPauseMode", { isolateId, mode });
+	}
+
+	public setIsolatePauseMode(isolateId: string, modes: { exceptionPauseMode?: VmExceptionMode, shouldPauseOnExit?: boolean }): Promise<DebuggerResult> {
+		return this.callMethod("setIsolatePauseMode", { isolateId, ...modes });
 	}
 
 	public removeBreakpoint(isolateId: string, breakpointId: string) {
@@ -481,12 +424,6 @@ export class VmServiceConnection {
 
 	public getStack(isolateId: string, limit: number | undefined): Promise<DebuggerResult> {
 		return this.callMethod("getStack", { isolateId, limit });
-	}
-
-	// TODO: Make these strongly-typed - DebuggerResult -> SourceReport? DebuggerResult<SourceReport>?
-	// Do we need DebuggerResult?
-	public getSourceReport(isolate: VMIsolateRef, reports: SourceReportKind[], script: VMScriptRef): Promise<DebuggerResult> {
-		return this.callMethod("getSourceReport", { isolateId: isolate.id, reports: reports.map((r) => SourceReportKind[r]), scriptId: script.id });
 	}
 
 	public getObject(isolateId: string, objectId: string, offset?: number, count?: number): Promise<DebuggerResult> {
@@ -532,7 +469,7 @@ export class VmServiceConnection {
 		return this.callMethod("setLibraryDebuggable", { isolateId, libraryId, isDebuggable });
 	}
 
-	public nextId: number = 0;
+	public nextId = 0;
 
 	public callMethod(method: string, params?: any): Promise<DebuggerResult> {
 		const id = `${this.nextId++}`;
@@ -588,7 +525,7 @@ export class VmServiceConnection {
 			const callback = this.eventListeners[streamId];
 			// Responses to requests (above) are processed by completing a promise
 			// which will be processed asynchronously. If we call callback here
-			// synchronously then it may trigger before a response that was recieved
+			// synchronously then it may trigger before a response that was received
 			// before it. The setTimeout forces it to go into the queue to be
 			// processed in order.
 			// TODO: Try to find a better way.
@@ -616,7 +553,5 @@ export class VmServiceConnection {
 	}
 }
 
-export interface FlutterServiceExtensionStateChangedData {
-	extension: string;
-	value: any;
-}
+
+export type VmExceptionMode = "None" | "Unhandled" | "All";

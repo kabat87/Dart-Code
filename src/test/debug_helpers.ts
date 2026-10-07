@@ -1,70 +1,192 @@
+import { DebugProtocol } from "@vscode/debugprotocol";
 import { strict as assert } from "assert";
 import * as path from "path";
-import { DebugAdapterExecutable, DebugAdapterServer, DebugAdapterTrackerFactory, DebugConfiguration, Uri } from "vscode";
-import { DebugProtocol } from "vscode-debugprotocol";
-import { dartVMPath, flutterPath, isWin, vmServiceListeningBannerPattern } from "../shared/constants";
-import { DartVsCodeLaunchArgs } from "../shared/debug/interfaces";
+import { CancellationToken, commands, debug, DebugAdapterExecutable, DebugAdapterTrackerFactory, DebugConfiguration, DebugSession, TestItem, TestRunRequest, Uri } from "vscode";
+import { vmServiceListeningBannerPattern } from "../debug/constants";
+import { dartVMPath, flutterPath, isWin } from "../shared/constants";
+import { DartVsCodeLaunchArgs } from "../shared/debugging/interfaces";
 import { DebuggerType, LogCategory, VmServiceExtension } from "../shared/enums";
 import { SpawnedProcess } from "../shared/interfaces";
 import { logProcess } from "../shared/logging";
-import { faint } from "../shared/utils/colors";
+import { withTimeout } from "../shared/utils";
 import { fsPath } from "../shared/utils/fs";
+import { TestOutlineInfo, TestOutlineVisitor } from "../shared/utils/outline";
 import { DartDebugClient } from "./dart_debug_client";
-import { currentTestName, defer, delay, extApi, getLaunchConfiguration, logger, watchPromise, withTimeout } from "./helpers";
+import { currentTestName, defer, delay, fakeCancellationToken, findSuiteNode, getLaunchConfiguration, logger, openFile, privateApi, sb, waitForResult, watchPromise } from "./helpers";
 
 export const flutterTestDeviceId = process.env.FLUTTER_TEST_DEVICE_ID || "flutter-tester";
 export const flutterTestDeviceIsWeb = flutterTestDeviceId === "chrome" || flutterTestDeviceId === "web-server";
 
-export async function startDebugger(dc: DartDebugClient, script?: Uri | string, extraConfiguration?: { [key: string]: any }): Promise<DebugConfiguration & DartVsCodeLaunchArgs & DebugProtocol.LaunchRequestArguments> {
-	extraConfiguration = Object.assign(
-		{ deviceId: flutterTestDeviceId },
-		extraConfiguration,
-	);
+export async function startDebugger(dc: DartDebugClient, script?: Uri | string, extraConfiguration?: Record<string, any>): Promise<DebugConfiguration & DartVsCodeLaunchArgs & DebugProtocol.LaunchRequestArguments> {
+	if (dc.debuggerType === DebuggerType.Flutter || dc.debuggerType === DebuggerType.FlutterTest) {
+		extraConfiguration = Object.assign(
+			{ deviceId: flutterTestDeviceId },
+			extraConfiguration,
+		);
+	}
 	const config = await getLaunchConfiguration(script, extraConfiguration);
 	if (!config)
 		throw new Error(`Could not get launch configuration (got ${config})`);
 
 	await watchPromise("startDebugger->start", dc.start());
-	return config as DebugConfiguration & DartVsCodeLaunchArgs & DebugProtocol.LaunchRequestArguments;
+	return config satisfies DebugConfiguration & DartVsCodeLaunchArgs & DebugProtocol.LaunchRequestArguments;
 }
 
-export function createDebugClient(debugType: DebuggerType) {
-	const descriptor = extApi.debugAdapterDescriptorFactory.descriptorForType(debugType);
-	const trackerFactory = extApi.debugLogger as DebugAdapterTrackerFactory;
-	const dc = descriptor instanceof DebugAdapterServer
-		? new DartDebugClient({ port: descriptor.port }, extApi.debugCommands, extApi.testCoordinator, trackerFactory)
-		: descriptor instanceof DebugAdapterExecutable
-			? new DartDebugClient({ runtime: descriptor.command, executable: descriptor.args[0], args: descriptor.args.slice(1) }, extApi.debugCommands, extApi.testCoordinator, trackerFactory)
-			: undefined;
+export function createDebugClient(debuggerType: DebuggerType) {
+	const descriptor = privateApi.debugAdapterDescriptorFactory.descriptorForType(debuggerType);
+	const trackerFactories = privateApi.trackerFactories as DebugAdapterTrackerFactory[];
+	const dc = descriptor instanceof DebugAdapterExecutable
+		? new DartDebugClient(
+			debuggerType,
+			{
+				args: descriptor.args.slice(1),
+				executable: descriptor.args[0],
+				runtime: descriptor.command,
+			},
+			privateApi.debugCommands,
+			privateApi.testCoordinator,
+			trackerFactories,
+			privateApi.dartCapabilities,
+		)
+		: undefined;
 	if (!dc)
-		throw Error(`Unknown debug descriptor type ${descriptor}`);
+		throw Error(`Unknown debug descriptor type ${descriptor.constructor.name}`);
 
-	dc.defaultTimeout = 60000;
+	dc.defaultTimeout = 120000;
 	const thisDc = dc;
 	defer("Terminate and clean up debug client/adapter", async () => {
-		if (!dc.hasStarted) {
-			extApi.logger.info(`Skipping shutdown because it never started`);
+		if (!thisDc.hasStarted) {
+			privateApi.logger.info(`Skipping shutdown because it never started`);
 			return;
 		}
-		if (debugType === DebuggerType.DartTest) {
-			// The test runner doesn't quit on the first SIGINT, it prints a message that it's waiting for the
-			// test to finish and then runs cleanup. Since we don't care about this for these tests, we just send
-			// a second request and that'll cause it to quit immediately.
-			return withTimeout(
-				Promise.all([
-					thisDc.terminateRequest().catch((e) => logger.error(e)),
-					delay(500).then(() => thisDc.stop()).catch((e) => logger.error(e)),
-				]),
-				"Timed out disconnecting - this is often normal because we have to try to quit twice for the test runner",
-				60,
-			);
-		} else {
-			extApi.logger.info(`Calling dc.stop()...`);
-			await thisDc.stop();
-			extApi.logger.info(`Done calling dc.stop()`);
+		if (!thisDc.hasTerminated) {
+			// Wait for a terminated event with a timeout.
+			const terminatedEvent = new Promise((resolve) => thisDc.on("terminated", resolve));
+			try {
+				thisDc.terminateRequest().catch((e) => logger.warn(e));
+				// Tests may require a second terminateRequest because they first print "waiting for test to finish...".
+				if (debuggerType === DebuggerType.DartTest || debuggerType === DebuggerType.FlutterTest || debuggerType === DebuggerType.WebTest) {
+					await Promise.race([delay(300), terminatedEvent]);
+					// If we still hasn't termianted, send the second.
+					if (!thisDc.hasTerminated) {
+						thisDc.terminateRequest().catch((e) => logger.warn(e));
+						await Promise.race([delay(300), terminatedEvent]);
+					}
+				}
+			} catch (e) {
+				logger.warn(e);
+			}
+			await withTimeout(terminatedEvent, "Timed out terminating and cleaning up!", 50);
+		}
+
+		try {
+			thisDc.stop().catch((e) => logger.warn(e));
+		} catch (e) {
+			logger.warn(e);
 		}
 	});
-	return dc;
+	return thisDc;
+}
+
+export function startFakeDebugSession(options?: {
+	debuggerType?: DebuggerType;
+	hasStarted?: boolean;
+	id?: string;
+	name?: string;
+}): DebugSession & { hotReloadCount: number } {
+	const debuggerType = options?.debuggerType;
+	const configuration = {
+		debuggerType,
+		name: options?.name ?? "Fake Debug Session",
+		request: "launch",
+		type: "dart",
+	};
+
+	let hotReloadCount = 0;
+	const session = {
+		configuration,
+		id: options?.id ?? `fake-${debuggerType ?? "session"}`,
+		name: configuration.name,
+		type: configuration.type,
+		workspaceFolder: undefined,
+		async getDebugProtocolBreakpoint() { return undefined; },
+		async customRequest(command: string) {
+			if (command === "hotReload")
+				hotReloadCount++;
+		},
+		get hotReloadCount() { return hotReloadCount; },
+	} as DebugSession & { hotReloadCount: number };
+
+	const dartSession = privateApi.debugCommands.handleDebugSessionStart(session);
+	if (options?.hasStarted && dartSession)
+		dartSession.hasStarted = true;
+	defer("Remove fake debug session", () => privateApi.debugCommands.handleDebugSessionEnd(session));
+
+	return session;
+}
+
+/*
+ * Runs an action that would call `debug.startDebugging` and returns every launch
+ * configuration it tried to start, without spawning a debug session.
+ *
+ * The stub resolves `false` on purpose. Test commands only finish after the session
+ * terminates when start reports success, and a stub never produces that event.
+ */
+export async function captureStartDebuggingConfigs(start: () => Thenable<unknown>): Promise<DebugConfiguration[]> {
+	const startDebugging = sb.stub(debug, "startDebugging").resolves(false);
+	await start();
+	assert.ok(startDebugging.called);
+	return startDebugging.getCalls().map((call) => call.args[1] as DebugConfiguration);
+}
+
+/*
+ * Runs the CodeLens outline command for one discovered test and returns the launch
+ * configuration that would have been started.
+ */
+export async function captureTestDebugConfiguration(fileUri: Uri, selectTest: (test: TestOutlineInfo) => boolean): Promise<DebugConfiguration> {
+	await openFile(fileUri);
+	await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(fileUri));
+
+	const visitor = new TestOutlineVisitor(logger, fsPath(fileUri));
+	const outline = privateApi.fileTracker.getOutlineFor(fileUri);
+	if (!outline)
+		throw new Error(`Did not get outline for ${fileUri}`);
+	visitor.visit(outline);
+	const test = visitor.tests.find(selectTest);
+	if (!test)
+		throw new Error(`Did not find a matching test in ${fileUri}`);
+
+	const configs = await captureStartDebuggingConfigs(() => commands.executeCommand("_dart.startWithoutDebuggingTestFromOutline", test, undefined));
+	assert.equal(configs.length, 1);
+	return configs[0];
+}
+
+/*
+ * Runs the VS Code test controller for the supplied request and returns every launch
+ * configuration that would have been started. `debug` selects the Debug profile.
+ */
+export async function captureTestDebugConfigurations(createRequest: () => TestRunRequest, debug = false, token: CancellationToken = fakeCancellationToken): Promise<DebugConfiguration[]> {
+	const controller = privateApi.testController!;
+	return captureStartDebuggingConfigs(() => controller.runTests(debug, false, createRequest(), token));
+}
+
+/*
+ * Runs the VS Code test controller for items chosen from one suite and returns the
+ * single launch configuration that would have been started.
+ */
+export async function captureTestDebugConfigurationForItems(fileUri: Uri, selectItems: (suiteNode: TestItem) => TestItem[], debug = false): Promise<DebugConfiguration> {
+	await openFile(fileUri);
+	await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(fileUri));
+	// The test tree is cleared between tests, so rebuild the suite from the cached outline.
+	privateApi.testDiscoverer?.forceUpdate(fileUri);
+
+	const suiteNode = findSuiteNode(fsPath(fileUri));
+	if (!suiteNode)
+		throw new Error(`Unable to find suite node for ${fileUri}`);
+
+	const configs = await captureTestDebugConfigurations(() => new TestRunRequest(selectItems(suiteNode)), debug);
+	assert.equal(configs.length, 1);
+	return configs[0];
 }
 
 /// Waits for all the provided promises, but throws if the debugger terminates before they complete.
@@ -72,11 +194,7 @@ export function waitAllThrowIfTerminates(dc: DartDebugClient, ...promises: Array
 	let didCompleteSuccessfully = false;
 	return Promise.race([
 		new Promise<void>(async (resolve, reject) => {
-			await dc.waitForEvent("terminated", "waitAllThrowIfTerminates")
-				.catch(() => {
-					// Swallow errors, as we don't care if this times out, we're only using it
-					// to tell if we stopped by the time we hit the end of this test.
-				});
+			await dc.waitForEvent("terminated", "waitAllThrowIfTerminates", 180000);
 			// Wait a small amount to allow other awaited tasks to complete.
 			setTimeout(() => {
 				if (didCompleteSuccessfully) {
@@ -91,7 +209,7 @@ export function waitAllThrowIfTerminates(dc: DartDebugClient, ...promises: Array
 }
 
 export function ensureVariable(variables: DebugProtocol.Variable[], evaluateName: string | undefined, name: string, value: string | { starts?: string, ends?: string }) {
-	assert.ok(variables && variables.length, "No variables given to search");
+	assert.ok(variables?.length, "No variables given to search");
 	const v = variables.find((v) => v.name === name);
 	assert.ok(
 		v,
@@ -116,13 +234,32 @@ export function ensureNoVariable(variables: DebugProtocol.Variable[], name: stri
 }
 
 export function ensureVariableWithIndex(variables: DebugProtocol.Variable[], index: number, evaluateName: string | undefined, name: string, value: string | { starts?: string, ends?: string }) {
-	assert.ok(variables && variables.length, "No variables given to search");
+	assert.ok(variables?.length, "No variables given to search");
 	const foundIndex = variables.findIndex((v) => v.name === name);
 	assert.equal(index, foundIndex, `Found variable ${name} at index ${foundIndex} but expected ${index}`);
 	ensureVariable(variables, evaluateName, name, value);
 }
 
-export interface MapEntry {
+export async function ensureVariableEvaluateName(dc: DartDebugClient, variable: DebugProtocol.Variable, { frameId }: { frameId?: number } = {}) {
+	const evaluateName = (variable as any).evaluateName as string | undefined;
+	if (!evaluateName)
+		return;
+	frameId ??= await dc.getTopFrameId();
+	const evaluateResult = (await dc.evaluateRequest({ expression: evaluateName, frameId })).body;
+	assert.ok(evaluateResult);
+	if (variable.value.endsWith("…\"")) {
+		// If the value was truncated, the evaluate responses should be longer
+		const prefix = variable.value.slice(1, -2); // Strip quotes
+		assert.ok(evaluateResult.result.length > prefix.length);
+		assert.equal(evaluateResult.result.slice(1, prefix.length + 1), prefix);
+	} else {
+		// Otherwise it should be the same.
+		assert.equal(evaluateResult.result, variable.value);
+	}
+	assert.equal(!!evaluateResult.variablesReference, !!variable.variablesReference);
+}
+
+interface MapEntry {
 	key: {
 		evaluateName: string | undefined;
 		name: string;
@@ -135,27 +272,30 @@ export interface MapEntry {
 	};
 }
 
-export async function ensureMapEntry(mapEntries: DebugProtocol.Variable[], entry: MapEntry, dc: DartDebugClient) {
+export async function ensureMapEntries(mapEntries: DebugProtocol.Variable[], entries: MapEntry[], dc: DartDebugClient) {
 	assert.ok(mapEntries);
-	let found = false;
-	const keyValues: string[] = [];
-	await Promise.all(mapEntries.map(async (mapEntry) => {
+	// Fetch the children for all entries concurrently.
+	const fetchedEntries = await Promise.all(mapEntries.map(async (mapEntry) => {
 		const variable = await dc.getVariables(mapEntry.variablesReference);
 
 		const key = variable[0];
 		const value = variable[1];
 		assert.ok(key, "Didn't get Key variable");
 		assert.ok(value, "Didn't get Value variable");
-		if (key.name === entry.key.name
+		return { key, value };
+	}));
+
+	const keyValues = fetchedEntries.map(({ key, value }) => `${key.value}=${value.value}`);
+	for (const entry of entries) {
+		const found = fetchedEntries.some(({ key, value }) =>
+			key.name === entry.key.name
 			&& key.value === entry.key.value
 			&& key.evaluateName === entry.key.evaluateName
 			&& value.evaluateName === entry.value.evaluateName
 			&& value.name === entry.value.name
-			&& value.value === entry.value.value)
-			found = true;
-		keyValues.push(`${key.value}=${value.value}`);
-	}));
-	assert.ok(found, `Didn't find map entry for ${entry.key.value}=${entry.value.value}\nGot:\n  ${keyValues.join("\n  ")})`);
+			&& value.value === entry.value.value);
+		assert.ok(found, `Didn't find map entry for ${entry.key.value}=${entry.value.value}\nGot:\n  ${keyValues.join("\n  ")})`);
+	}
 }
 
 export async function getVariablesTree(dc: DartDebugClient, variablesReference: number): Promise<string[]> {
@@ -177,20 +317,18 @@ export async function getVariablesTree(dc: DartDebugClient, variablesReference: 
 export function spawnDartProcessPaused(program: Uri, cwd: Uri, ...vmArgs: string[]): DartProcess {
 	const programPath = fsPath(program);
 	const cwdPath = fsPath(cwd);
-	const dartPath = path.join(extApi.workspaceContext.sdks.dart, dartVMPath);
+	const dartPath = path.join(privateApi.workspaceContext.sdks.dart, dartVMPath);
 	const debugArgs = [
 		"--enable-vm-service=0",
 		"--pause_isolates_on_start=true",
 	];
-	if (extApi.dartCapabilities.supportsDisableDartDev && !extApi.dartCapabilities.hasDdsTimingFix)
-		debugArgs.push("--disable-dart-dev");
 	const allArgs = [
 		...debugArgs,
 		...vmArgs,
 		programPath,
 	];
 	logger.info(`Spawning ${dartPath} in ${cwdPath} with args ${JSON.stringify(allArgs)}`);
-	const process = extApi.safeToolSpawn(
+	const process = privateApi.safeToolSpawn(
 		cwdPath,
 		dartPath,
 		allArgs,
@@ -215,7 +353,7 @@ export async function spawnFlutterProcess(script: string | Uri): Promise<DartPro
 		config.deviceId as string,
 		"--start-paused",
 	];
-	const process = extApi.safeToolSpawn(config.cwd, binPath, args);
+	const process = privateApi.safeToolSpawn(config.cwd, binPath, args);
 	logger.info(`(PROC ${process.pid}) Spawned ${binPath} ${args.join(" ")} in ${config.cwd}`, LogCategory.CommandProcesses);
 	logProcess(logger, LogCategory.CI, process);
 	const flutterProcess = new DartProcess(process);
@@ -228,36 +366,37 @@ export async function spawnFlutterProcess(script: string | Uri): Promise<DartPro
 	return flutterProcess;
 }
 
-export class DartProcess {
+class DartProcess {
 	public readonly vmServiceUri: Promise<string>;
 	public readonly exitCode: Promise<number | null>;
 	public get hasExited() { return this.exited; }
-	private exited: boolean = false;
+	private exited = false;
 
 	constructor(public readonly process: SpawnedProcess) {
-		this.vmServiceUri = new Promise((resolve, reject) => {
+		this.vmServiceUri = new Promise((resolve) => {
 			process.stdout.on("data", (data: Buffer | string) => {
 				const match = vmServiceListeningBannerPattern.exec(data.toString());
 				if (match)
 					resolve(match[1]);
 			});
 		});
-		this.exitCode = new Promise<number | null>((resolve, reject) => {
+		this.exitCode = new Promise<number | null>((resolve) => {
 			process.on("exit", (code) => { this.exited = true; resolve(code); });
 		});
 	}
 }
 
 export async function killFlutterTester(): Promise<void> {
-	// extApi may be unavailable if the test was skipped (eg. Flutter Bazel on
-	// Windows), so we can't call extApi.safeToolSpawn here (though also should
+	// privateApi may be unavailable if the test was skipped (eg. Flutter Bazel on
+	// Windows), so we can't call privateApi.safeToolSpawn here (though also should
 	// not need to).
-	if (!extApi)
+	if (!privateApi)
 		return;
-	return new Promise((resolve) => {
+
+	await new Promise<void>((resolve) => {
 		const proc = isWin
-			? extApi.safeToolSpawn(undefined, "taskkill", ["/IM", "flutter_tester.exe", "/F"])
-			: extApi.safeToolSpawn(undefined, "pkill", ["flutter_tester"]);
+			? privateApi.safeToolSpawn(undefined, "taskkill", ["/IM", "flutter_tester.exe", "/F"])
+			: privateApi.safeToolSpawn(undefined, "pkill", ["flutter_tester"]);
 		proc.on("exit", (code: number) => {
 			if (isWin ? code !== 128 : code === 0) {
 				logger.warn(`flutter_tester process(s) remained after test (${currentTestName}). These have been terminated to avoid affecting future tests, ` +
@@ -266,18 +405,33 @@ export async function killFlutterTester(): Promise<void> {
 			resolve();
 		});
 	});
+
+	if (!isWin) {
+		await new Promise<void>((resolve) => {
+			const proc2 = privateApi.safeToolSpawn(undefined, "ps", ["-x"]);
+
+			proc2.stdout.setEncoding("utf8");
+			proc2.stdout.on("data", (data: Buffer | string) => logger.info(data.toString()));
+			proc2.stderr.setEncoding("utf8");
+			proc2.stderr.on("data", (data: Buffer | string) => logger.info(data.toString()));
+			proc2.on("error", (error) => logger.info(error?.message));
+			proc2.on("data", (data: Buffer | string) => logger.info(data.toString()));
+
+			proc2.on("exit", () => resolve());
+		});
+	}
 }
 
 export function isSdkFrame(frame: DebugProtocol.StackFrame) {
-	return !frame.source || frame.source.name && frame.source.name.startsWith("dart:");
+	return frame.source?.name?.startsWith("dart:");
 }
 
 export function isExternalPackage(frame: DebugProtocol.StackFrame) {
-	return frame.source && frame.source.name && frame.source.name.startsWith("package:") && !isLocalPackage(frame);
+	return frame.source?.name && frame.source.name.startsWith("package:") && !isLocalPackage(frame);
 }
 
 export function isLocalPackage(frame: DebugProtocol.StackFrame) {
-	return frame.source && frame.source.name && frame.source.name.startsWith("package:") &&
+	return frame.source?.name && frame.source.name.startsWith("package:") &&
 		// Packages known to be local (from our test projects).
 		(frame.source.name.includes("my_package")
 			|| frame.source.name.includes("hello_world")
@@ -285,8 +439,7 @@ export function isLocalPackage(frame: DebugProtocol.StackFrame) {
 }
 
 export function isUserCode(frame: DebugProtocol.StackFrame) {
-	return frame.source
-		&& frame.source.name
+	return frame.source?.name
 		&& !frame.source.name.startsWith("dart:")
 		&& (!frame.source.name.startsWith("package:") || isLocalPackage(frame));
 }
@@ -300,20 +453,11 @@ export function ensureFrameCategories(frames: DebugProtocol.StackFrame[], presen
 }
 
 export async function ensureServiceExtensionValue(id: VmServiceExtension, expected: unknown, dc: DartDebugClient) {
-	const value = await extApi.debugCommands.vmServices.getCurrentServiceExtensionValue(dc.currentSession, id);
+	const value = await privateApi.debugCommands.vmServices.getCurrentServiceExtensionValue(dc.currentSession, id);
 	assert.equal(value, expected);
 }
 
-export function sdkPathForSdkDap(dc: DartDebugClient, file: string) {
-	if (dc.isDartDap)
-		return path.join(extApi.workspaceContext.sdks.dart, isWin ? file.replace(/\//g, "\\") : file);
-	// When not using the new DAPs, we don't translate SDK paths back to the local file paths.
-	return undefined;
+export function sdkPathForFile(file: string) {
+	return path.join(privateApi.workspaceContext.sdks.dart, isWin ? file.replace(/\//g, "\\") : file);
 }
 
-export function faintTextForNonSdkDap(dc: DartDebugClient, input: string) {
-	// Currently the SDK DAPs don't use colours.
-	if (dc.isDartDap)
-		return input;
-	return faint(input);
-}

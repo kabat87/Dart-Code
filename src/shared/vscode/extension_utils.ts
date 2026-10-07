@@ -1,12 +1,11 @@
 import * as fs from "fs";
 import * as path from "path";
-import { extensions, Uri } from "vscode";
+import { extensions, MarkdownString, Uri } from "vscode";
 import { dartCodeExtensionIdentifier, flutterExtensionIdentifier } from "../constants";
 import * as dartdoc from "../utils/dartdocs";
 
 export const extensionPath = extensions.getExtension(dartCodeExtensionIdentifier)!.extensionPath;
 export const extensionVersion = getExtensionVersion();
-export const vsCodeVersionConstraint = getVsCodeVersionConstraint();
 export const isPreReleaseExtension = checkIsPreReleaseExtension();
 export const isDevExtension = checkIsDevExtension();
 export const hasFlutterExtension = checkHasFlutterExtension();
@@ -18,13 +17,9 @@ export function readJson(file: string): any {
 
 function getExtensionVersion(): string {
 	const packageJson = readJson(path.join(extensionPath, "package.json"));
-	return packageJson.version;
+	return packageJson.version as string;
 }
 
-function getVsCodeVersionConstraint(): string {
-	const packageJson = readJson(path.join(extensionPath, "package.json"));
-	return packageJson.engines.vscode;
-}
 
 function checkIsDevExtension() {
 	return extensionVersion.endsWith("-dev");
@@ -36,10 +31,24 @@ function checkIsPreReleaseExtension() {
 	return minSegment % 2 === 1;
 }
 
+export function getExtensionVersionForReleaseNotes() {
+	if (!isPreReleaseExtension)
+		return extensionVersion;
+
+	const segments = extensionVersion.split(".");
+	return `${segments[0]}.${parseInt(segments[1], 10) - 1}.0`;
+}
+
 export function checkHasFlutterExtension() {
 	return extensions.getExtension(flutterExtensionIdentifier) !== undefined;
 }
 
 export function cleanDartdoc(doc: string | undefined) {
 	return dartdoc.cleanDartdoc(doc, docsIconPathFormat);
+}
+
+export function createMarkdownString(doc: string) {
+	const md = new MarkdownString(doc);
+	md.supportHtml = true;
+	return md;
 }

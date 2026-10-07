@@ -2,13 +2,14 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vs from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
-import { flutterPath } from "../../shared/constants";
+import { dartVMPath, ExtensionRestartReason, flutterPath, thirtySecondsInMs } from "../../shared/constants";
 import { LogCategory } from "../../shared/enums";
 import { CustomScript, DartSdks, DartWorkspaceContext, IAmDisposable, Logger, SpawnedProcess } from "../../shared/interfaces";
 import { logProcess } from "../../shared/logging";
-import { getPubExecutionInfo } from "../../shared/processes";
+import { getPubExecutionInfo, RunProcessResult } from "../../shared/processes";
 import { disposeAll, nullToUndefined, PromiseCompleter, usingCustomScript } from "../../shared/utils";
-import { fsPath } from "../../shared/utils/fs";
+import { getPackageOrFolderDisplayName } from "../../shared/vscode/display_names";
+import { OperationProgress } from "../../shared/vscode/interfaces";
 import { Context } from "../../shared/vscode/workspace";
 import { config } from "../config";
 import { DartSdkManager, FlutterSdkManager } from "../sdk/sdk_manager";
@@ -27,46 +28,38 @@ export const commandState = {
 
 export class BaseSdkCommands implements IAmDisposable {
 	protected readonly sdks: DartSdks;
-	protected readonly disposables: vs.Disposable[] = [];
+	protected readonly disposables: IAmDisposable[] = [];
 
 	// A map of any in-progress commands so we can terminate them if we want to run another.
-	private runningCommands: { [workspaceUriAndCommand: string]: ChainedProcess | undefined } = {};
+	private runningCommands: Record<string, ChainedProcess | undefined> = {};
 
 	constructor(protected readonly logger: Logger, protected readonly context: Context, protected readonly workspace: DartWorkspaceContext, protected readonly dartCapabilities: DartCapabilities) {
 		this.sdks = workspace.sdks;
 	}
 
 	protected async runCommandForWorkspace(
-		handler: (folder: string, args: string[], shortPath: string, alwaysShowOutput: boolean) => Thenable<number | undefined>,
+		handler: (folder: string, args: string[], packageOrFolderDisplayName: string, alwaysShowOutput: boolean, operationProgress?: OperationProgress) => Promise<RunProcessResult | undefined>,
 		placeHolder: string,
 		args: string[],
 		selection: vs.Uri | undefined,
 		alwaysShowOutput = false,
-	): Promise<number | undefined> {
-		const folderToRunCommandIn = await getFolderToRunCommandIn(this.logger, placeHolder, selection);
+		operationProgress?: OperationProgress,
+		{ onlyShowWorkspaceRoots = false }: { onlyShowWorkspaceRoots?: boolean; } = {}
+	): Promise<RunProcessResult | undefined> {
+		const folderToRunCommandIn = await getFolderToRunCommandIn(this.logger, placeHolder, { selection, onlyShowWorkspaceRoots });
 		if (!folderToRunCommandIn)
 			return;
 
-		const containingWorkspace = vs.workspace.getWorkspaceFolder(vs.Uri.file(folderToRunCommandIn));
-		if (!containingWorkspace) {
-			this.logger.error(`Failed to get workspace folder for ${folderToRunCommandIn}`);
-			throw new Error(`Failed to get workspace folder for ${folderToRunCommandIn}`);
-		}
-		const containingWorkspacePath = fsPath(containingWorkspace.uri);
 
-		// Display the relative path from the workspace root to the folder we're running, or if they're
-		// the same then the folder name we're running in.
-		const shortPath = path.relative(containingWorkspacePath, folderToRunCommandIn)
-			|| path.basename(folderToRunCommandIn);
-
-		return handler(folderToRunCommandIn, args, shortPath, alwaysShowOutput);
+		const packageOrFolderDisplayName = getPackageOrFolderDisplayName(folderToRunCommandIn);
+		return handler(folderToRunCommandIn, args, packageOrFolderDisplayName, alwaysShowOutput, operationProgress);
 	}
 
-	protected runFlutter(args: string[], selection: vs.Uri | undefined, alwaysShowOutput = false): Thenable<number | undefined> {
-		return this.runCommandForWorkspace(this.runFlutterInFolder.bind(this), `Select the folder to run "flutter ${args.join(" ")}" in`, args, selection, alwaysShowOutput);
+	public runFlutter(args: string[], selection: vs.Uri | undefined, alwaysShowOutput = false, operationProgress?: OperationProgress, { onlyShowWorkspaceRoots = false }: { onlyShowWorkspaceRoots?: boolean; } = {}): Promise<RunProcessResult | undefined> {
+		return this.runCommandForWorkspace(this.runFlutterInFolder.bind(this), `Select the folder to run "flutter ${args.join(" ")}" in`, args, selection, alwaysShowOutput, operationProgress, { onlyShowWorkspaceRoots });
 	}
 
-	protected runFlutterInFolder(folder: string, args: string[], shortPath: string | undefined, alwaysShowOutput = false, customScript?: CustomScript): Thenable<number | undefined> {
+	public runFlutterInFolder(folder: string, args: string[], packageOrFolderDisplayName: string | undefined, alwaysShowOutput = false, operationProgress?: OperationProgress, customScript?: CustomScript): Promise<RunProcessResult | undefined> {
 		if (!this.sdks.flutter)
 			throw new Error("Flutter SDK not available");
 
@@ -80,29 +73,33 @@ export class BaseSdkCommands implements IAmDisposable {
 			.concat(config.for(vs.Uri.file(folder)).flutterAdditionalArgs)
 			.concat(execution.args);
 
-		return this.runCommandInFolder(shortPath, folder, execution.executable, allArgs, alwaysShowOutput);
+		return this.runCommandInFolder(packageOrFolderDisplayName, folder, execution.executable, allArgs, alwaysShowOutput, operationProgress);
 	}
 
-	protected runPub(args: string[], selection: vs.Uri | undefined, alwaysShowOutput = false): Thenable<number | undefined> {
-		return this.runCommandForWorkspace(this.runPubInFolder.bind(this), `Select the folder to run "pub ${args.join(" ")}" in`, args, selection, alwaysShowOutput);
+	public runPub(args: string[], selection: vs.Uri | undefined, alwaysShowOutput = false, operationProgress?: OperationProgress, { onlyShowWorkspaceRoots = false }: { onlyShowWorkspaceRoots?: boolean; } = {}): Promise<RunProcessResult | undefined> {
+		return this.runCommandForWorkspace(this.runPubInFolder.bind(this), `Select the folder to run "pub ${args.join(" ")}" in`, args, selection, alwaysShowOutput, operationProgress, { onlyShowWorkspaceRoots });
 	}
 
-	protected runPubInFolder(folder: string, args: string[], shortPath: string, alwaysShowOutput = false): Thenable<number | undefined> {
+	protected runPubInFolder(folder: string, args: string[], packageOrFolderDisplayName: string, alwaysShowOutput = false, operationProgress?: OperationProgress): Promise<RunProcessResult | undefined> {
 		if (!this.sdks.dart)
 			throw new Error("Dart SDK not available");
 
 		args = args.concat(...config.for(vs.Uri.file(folder)).pubAdditionalArgs);
 
-		const pubExecution = getPubExecutionInfo(this.dartCapabilities, this.sdks.dart, args);
+		const pubExecution = getPubExecutionInfo(this.sdks.dart, args);
 
-		return this.runCommandInFolder(shortPath, folder, pubExecution.executable, pubExecution.args, alwaysShowOutput);
+		return this.runCommandInFolder(packageOrFolderDisplayName, folder, pubExecution.executable, pubExecution.args, alwaysShowOutput, operationProgress);
 	}
 
-	protected runCommandInFolder(shortPath: string | undefined, folder: string, binPath: string, args: string[], alwaysShowOutput: boolean): Thenable<number | undefined> {
-		shortPath = shortPath || path.basename(folder);
+	protected async runCommandInFolder(packageOrFolderDisplayName: string | undefined, folder: string, binPath: string, args: string[], alwaysShowOutput: boolean, operationProgress?: OperationProgress): Promise<RunProcessResult | undefined> {
+		packageOrFolderDisplayName = packageOrFolderDisplayName || path.basename(folder);
 		const commandName = path.basename(binPath).split(".")[0]; // Trim file extension.
 
-		const channel = channels.getOutputChannel(`${commandName} (${shortPath})`, true);
+		const channelName =
+			commandName === packageOrFolderDisplayName
+				? commandName
+				: `${commandName} (${packageOrFolderDisplayName})`;
+		const channel = channels.getOutputChannel(channelName, true);
 		if (alwaysShowOutput)
 			channel.show();
 
@@ -116,11 +113,7 @@ export class BaseSdkCommands implements IAmDisposable {
 			return Promise.resolve(undefined);
 		}
 
-		return vs.window.withProgress({
-			cancellable: true,
-			location: vs.ProgressLocation.Notification,
-			title: `${commandName} ${args.join(" ")}`,
-		}, (progress, token) => {
+		const runWithProgress = async (progress: vs.Progress<{ message?: string; increment?: number }>, token: vs.CancellationToken) => {
 			if (existingProcess) {
 				progress.report({ message: "terminating previous command..." });
 				existingProcess.cancel();
@@ -129,19 +122,18 @@ export class BaseSdkCommands implements IAmDisposable {
 			}
 
 			const process = new ChainedProcess(() => {
-				channel.appendLine(`[${shortPath}] ${commandName} ${args.join(" ")}`);
-				progress.report({ message: "running..." });
+				channel.appendLine(`[${packageOrFolderDisplayName}] ${commandName} ${args.join(" ")}`);
+				progress.report({ message: `${packageOrFolderDisplayName}...` });
 				const proc = safeToolSpawn(folder, binPath, args);
 				channels.runProcessInOutputChannel(proc, channel);
 				this.logger.info(`(PROC ${proc.pid}) Spawned ${binPath} ${args.join(" ")} in ${folder}`, LogCategory.CommandProcesses);
 				logProcess(this.logger, LogCategory.CommandProcesses, proc);
 
-				// If we complete with a non-zero code, or don't complete within 10s, we should show
+				// If we complete with a non-zero code, or don't complete within 30s, we should show
 				// the output pane.
 				const completedWithErrorPromise = new Promise((resolve) => proc.on("close", resolve));
-				const timedOutPromise = new Promise((resolve) => setTimeout(() => resolve(true), 10000));
-				// tslint:disable-next-line: no-floating-promises
-				Promise.race([completedWithErrorPromise, timedOutPromise]).then((showOutput) => {
+				const timedOutPromise = new Promise((resolve) => setTimeout(() => resolve(true), thirtySecondsInMs).unref());
+				void Promise.race([completedWithErrorPromise, timedOutPromise]).then((showOutput) => {
 					if (showOutput)
 						channel.show(true);
 				});
@@ -152,10 +144,19 @@ export class BaseSdkCommands implements IAmDisposable {
 			token.onCancellationRequested(() => process.cancel());
 
 			return process.completed;
-		});
+		};
+
+		if (operationProgress)
+			return runWithProgress(operationProgress.progressReporter ?? { report: () => undefined }, operationProgress.cancellationToken);
+
+		return await vs.window.withProgress({
+			cancellable: true,
+			location: vs.ProgressLocation.Notification,
+			title: `${commandName} ${args.join(" ")}`,
+		}, (progress, token) => runWithProgress(progress, token));
 	}
 
-	public dispose(): any {
+	public dispose(): void {
 		disposeAll(this.disposables);
 	}
 }
@@ -171,7 +172,18 @@ export class SdkCommands extends BaseSdkCommands {
 		}
 
 		// Monitor version files for SDK upgrades.
-		this.setupVersionWatcher();
+		void this.setupVersionWatcher();
+	}
+
+	/// Public wrapper used by the extension API.
+	public async runDartCommand(folder: string, args: string[], options?: { alwaysShowOutput?: boolean }): Promise<RunProcessResult | undefined> {
+		if (!this.sdks.dart)
+			throw new Error("Dart SDK not available");
+
+		const alwaysShowOutput = options?.alwaysShowOutput ?? false;
+		const dartExecutable = path.join(this.sdks.dart, dartVMPath);
+
+		return this.runCommandInFolder(undefined, folder, dartExecutable, args, alwaysShowOutput);
 	}
 
 	private async setupVersionWatcher() {
@@ -193,7 +205,7 @@ export class SdkCommands extends BaseSdkCommands {
 		if (!lastModifiedTime)
 			return;
 
-		const watcher = fs.watch(versionFile, { persistent: false }, async (eventType: string) => {
+		const watcher = fs.watch(versionFile, { persistent: false }, async () => {
 			if (!commandState.promptToReloadOnVersionChanges)
 				return;
 
@@ -208,10 +220,13 @@ export class SdkCommands extends BaseSdkCommands {
 			// Ensure we don't fire too often as some OSes may generate multiple events.
 			commandState.promptToReloadOnVersionChanges = false;
 			// Allow it again in 60 seconds.
-			setTimeout(() => commandState.promptToReloadOnVersionChanges = true, 60000);
+			setTimeout(() => commandState.promptToReloadOnVersionChanges = true, 60000).unref();
 
 			// Wait a short period before prompting.
-			setTimeout(() => util.promptToReloadExtension("Your Dart SDK has been updated. Reload using the new SDK?", undefined, false), 1000);
+			setTimeout(() => util.promptToReloadExtension(this.logger, {
+				prompt: "Your Dart SDK has been updated. Reload using the new SDK?",
+				restartReason: ExtensionRestartReason.AfterSdkVersionFileChange,
+			}), 1000);
 		});
 
 		this.disposables.push({ dispose() { watcher.close(); } });
@@ -228,9 +243,9 @@ export function markProjectCreationEnded(): void {
 class ChainedProcess {
 	private static processNumber = 1;
 	public processNumber = ChainedProcess.processNumber++;
-	private completer: PromiseCompleter<number | undefined> = new PromiseCompleter<number | undefined>();
+	private completer: PromiseCompleter<RunProcessResult | undefined> = new PromiseCompleter<RunProcessResult | undefined>();
 	public readonly completed = this.completer.promise;
-	public process: SpawnedProcess | undefined;
+	private process: SpawnedProcess | undefined;
 	private isCancelled = false;
 	public get hasStarted() {
 		return this.process !== undefined;
@@ -239,8 +254,7 @@ class ChainedProcess {
 	constructor(private readonly spawn: () => SpawnedProcess, parent: ChainedProcess | undefined) {
 		// We'll either start immediately, or if given a parent process only when it completes.
 		if (parent) {
-			// tslint:disable-next-line: no-floating-promises
-			parent.completed.then(() => this.start());
+			void parent.completed.then(() => this.start());
 		} else {
 			this.start();
 		}
@@ -254,7 +268,23 @@ class ChainedProcess {
 			return;
 		}
 		this.process = this.spawn();
-		this.process.on("close", (code) => this.completer.resolve(nullToUndefined(code)));
+		this.process.stdout?.setEncoding("utf8");
+		this.process.stderr?.setEncoding("utf8");
+
+		const stdoutChunks: string[] = [];
+		const stderrChunks: string[] = [];
+
+		this.process.stdout?.on("data", (data: string) => stdoutChunks.push(data));
+		this.process.stderr?.on("data", (data: string) => stderrChunks.push(data));
+
+		this.process.on("close", (code) => {
+			const result: RunProcessResult = {
+				stdout: stdoutChunks.join(""),
+				stderr: stderrChunks.join(""),
+				exitCode: nullToUndefined(code) ?? 1, // null means terminated by signal
+			};
+			this.completer.resolve(result);
+		});
 	}
 
 	public cancel(): void {

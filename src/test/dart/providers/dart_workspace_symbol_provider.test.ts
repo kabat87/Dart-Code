@@ -1,20 +1,29 @@
 import { strict as assert } from "assert";
 import * as path from "path";
 import * as vs from "vscode";
-import { activate, ensureWorkspaceSymbol, everythingFile, getWorkspaceSymbols } from "../../helpers";
+import { activate, ensureWorkspaceSymbol, everythingFile, getWorkspaceSymbols, privateApi } from "../../helpers";
 
 describe("workspace_symbol_provider", () => {
 
 	beforeEach("activate", () => activate());
 
 	it("includes nothing given no query", async () => {
-		const symbols = await getWorkspaceSymbols("");
+		let symbols = await getWorkspaceSymbols("");
 
-		assert.equal(symbols.length, 0);
+		// Filter out markdown titles that are showing up here from a readme in
+		// .dart_tool/extension_discovery despite being excluded.
+		// https://github.com/microsoft/vscode/issues/304477
+		symbols = symbols.filter((s) => !s.name.startsWith("#"));
+
+		assert.deepStrictEqual(symbols, []);
 	});
 
 	it("includes items from 'everything.dart'", async () => {
 		const symbols = await getWorkspaceSymbols("mytest");
+
+		const expectedNamedConstructorText = privateApi.dartCapabilities.includesClassNameInNamedConstructorInWorkspaceSymbols
+			? "MyTestClass.myTestNamed()"
+			: "myTestNamed()";
 
 		ensureWorkspaceSymbol(symbols, "MyTestClass", vs.SymbolKind.Class, undefined, everythingFile);
 		ensureWorkspaceSymbol(symbols, "myTestNumField", vs.SymbolKind.Field, "MyTestClass", everythingFile);
@@ -22,7 +31,7 @@ describe("workspace_symbol_provider", () => {
 		ensureWorkspaceSymbol(symbols, "myTestFutureString", vs.SymbolKind.Field, "MyTestClass", everythingFile);
 		ensureWorkspaceSymbol(symbols, "myTestNumGetter", vs.SymbolKind.Property, "MyTestClass", everythingFile);
 		ensureWorkspaceSymbol(symbols, "myTestNumSetter(…)", vs.SymbolKind.Property, "MyTestClass", everythingFile);
-		ensureWorkspaceSymbol(symbols, "myTestNamed()", vs.SymbolKind.Constructor, "MyTestClass", everythingFile);
+		ensureWorkspaceSymbol(symbols, expectedNamedConstructorText, vs.SymbolKind.Constructor, "MyTestClass", everythingFile);
 		ensureWorkspaceSymbol(symbols, "myTestVoidReturningMethod()", vs.SymbolKind.Method, "MyTestClass", everythingFile);
 		ensureWorkspaceSymbol(symbols, "myTestStringReturningMethod()", vs.SymbolKind.Method, "MyTestClass", everythingFile);
 	});
@@ -32,7 +41,8 @@ describe("workspace_symbol_provider", () => {
 		ensureWorkspaceSymbol(symbols, "IOClient", vs.SymbolKind.Class, undefined, { endsWith: `${path.sep}src${path.sep}io_client.dart` });
 	});
 
-	it("includes items from git dependencies", async () => {
+	it.skip("includes items from git dependencies", async () => {
+		// Skipped due to https://github.com/Dart-Code/Dart-Code/issues/4129.
 		const symbols = await getWorkspaceSymbols("ProtobufEnum");
 
 		ensureWorkspaceSymbol(symbols, "ProtobufEnum", vs.SymbolKind.Class, undefined, { endsWith: `${path.sep}src${path.sep}protobuf${path.sep}protobuf_enum.dart` });

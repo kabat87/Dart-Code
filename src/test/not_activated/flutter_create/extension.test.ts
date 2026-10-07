@@ -7,7 +7,7 @@ import { FLUTTER_CREATE_PROJECT_TRIGGER_FILE } from "../../../shared/constants";
 import { FlutterCreateTriggerData } from "../../../shared/interfaces";
 import { fsPath } from "../../../shared/utils/fs";
 import { FlutterSampleSnippet } from "../../../shared/vscode/interfaces";
-import { attachLoggingWhenExtensionAvailable, ext, getRandomTempFolder, sb, stubCreateInputBox } from "../../helpers";
+import { attachLoggingWhenExtensionAvailable, ext, getRandomTempFolder, privateApi, sb, setConfigForTest, stubCreateInputBox, stubCreateQuickPickActions } from "../../helpers";
 
 describe("test environment", () => {
 	it("has opened the correct folder", () => {
@@ -21,7 +21,8 @@ describe("test environment", () => {
 });
 
 describe("extension", () => {
-	it("did not activate", async () => {
+	// Skipped due to https://github.com/microsoft/vscode/issues/266221
+	it.skip("did not activate", async () => {
 		assert.equal(ext.isActive, false);
 	});
 });
@@ -30,24 +31,80 @@ describe("extension", () => {
 // Other tests must go in their own folders and be listed in test_all/launch.json individually.
 
 describe("command", () => {
-	it("Flutter: New Project can be invoked and creates app trigger file", async () => {
-		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "app");
+	it("Flutter: Create New Project can be invoked and creates app trigger file", async () => {
+		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "app", "application");
 	});
 
-	it("Flutter: New Project can be invoked and creates module trigger file", async () => {
-		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "module");
+	it("Flutter: Create New Project can be invoked and creates module trigger file", async () => {
+		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "module", "module");
 	});
 
-	it("Flutter: New Project can be invoked and creates package trigger file", async () => {
-		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "package");
+	it("Flutter: Create New Project can be invoked and creates package trigger file", async () => {
+		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "package", "package");
 	});
 
-	it("Flutter: New Project can be invoked and creates plugin trigger file", async () => {
-		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "plugin");
+	it("Flutter: Create New Project can be invoked and creates plugin trigger file", async () => {
+		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "plugin", "plugin");
 	});
 
-	it("Flutter: New Project can be invoked and creates skeleton trigger file", async () => {
-		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "skeleton");
+	it("Flutter: Create New Project can be invoked and creates skeleton trigger file", async function () {
+		// Skip this test if skeleton template is not supported
+		if (!privateApi?.flutterCapabilities?.supportsSkeleton)
+			this.skip();
+
+		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "skeleton", "application");
+	});
+
+	it("Flutter: Create New Project can be invoked and creates empty application trigger file", async () => {
+		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "app", "application", true);
+	});
+
+	it("Flutter: Create New Project allows modifying platforms during flow", async () => {
+		const selectedPlatforms = ["android", "web"];
+		// Clear the current setting.
+		await setConfigForTest("dart", "flutterCreatePlatforms", undefined);
+
+		// Run the create flow, selecting some specific platforms.
+		await projectContainsTriggerFileForExpectedTemplate("flutter.createProject", "app", "application", undefined, selectedPlatforms);
+
+		// Ensure it was persisted.
+		assert.deepEqual(vs.workspace.getConfiguration("dart").get("flutterCreatePlatforms"), selectedPlatforms);
+	});
+
+	it("Flutter: Create New Project doesn't use selected platforms automatically next time by default", async () => {
+		const selectedPlatforms = ["android", "web"];
+		await setConfigForTest("dart", "flutterCreatePlatforms", undefined);
+		await setConfigForTest("dart", "flutterCreatePromptForPlatforms", true);
+
+		await projectContainsTriggerFileForExpectedTemplate(
+			"flutter.createProject",
+			"app",
+			"application",
+			undefined,
+			selectedPlatforms,
+			false, // useOptionsAutomaticallyNextTime
+		);
+
+		assert.deepEqual(vs.workspace.getConfiguration("dart").get("flutterCreatePlatforms"), selectedPlatforms);
+		assert.equal(vs.workspace.getConfiguration("dart").get("flutterCreatePromptForPlatforms"), true);
+	});
+
+	it("Flutter: Create New Project uses selected platforms automatically next time if checked", async () => {
+		const selectedPlatforms = ["android", "web"];
+		await setConfigForTest("dart", "flutterCreatePlatforms", undefined);
+		await setConfigForTest("dart", "flutterCreatePromptForPlatforms", true);
+
+		await projectContainsTriggerFileForExpectedTemplate(
+			"flutter.createProject",
+			"app",
+			"application",
+			undefined,
+			selectedPlatforms,
+			true, // useOptionsAutomaticallyNextTime
+		);
+
+		assert.deepEqual(vs.workspace.getConfiguration("dart").get("flutterCreatePlatforms"), selectedPlatforms);
+		assert.equal(vs.workspace.getConfiguration("dart").get("flutterCreatePromptForPlatforms"), false);
 	});
 
 	it("Flutter: Create Sample Project can be invoked and creates trigger file", async () => {
@@ -64,7 +121,7 @@ describe("command", () => {
 		assert.ok(sampleFolderUri);
 		assert.ok(showQuickPick.calledOnce);
 		assert.ok(openFolder.calledOnce);
-		const triggerFile = path.join(fsPath(sampleFolderUri), FLUTTER_CREATE_PROJECT_TRIGGER_FILE);
+		const triggerFile = path.join(fsPath(vs.Uri.parse(sampleFolderUri)), FLUTTER_CREATE_PROJECT_TRIGGER_FILE);
 		assert.ok(fs.existsSync(triggerFile));
 
 		const jsonString: string | undefined = fs.readFileSync(triggerFile).toString().trim();
@@ -76,12 +133,16 @@ describe("command", () => {
 	});
 });
 
-async function projectContainsTriggerFileForExpectedTemplate(commandToExecute: string, expectedTemplate: string): Promise<void> {
+async function projectContainsTriggerFileForExpectedTemplate(commandToExecute: string, expectedTemplate: string, expectedName: string, empty?: boolean, selectedPlatforms?: string[], useOptionsAutomaticallyNextTime?: boolean): Promise<void> {
 	attachLoggingWhenExtensionAvailable();
 
 	// Return the expected project type from the prompt.
 	const showQuickPick = sb.stub(vs.window, "showQuickPick");
-	showQuickPick.resolves({ template: { id: expectedTemplate } });
+	showQuickPick.resolves({ template: { id: expectedTemplate, empty } });
+	const selectedQuickPickLabels = selectedPlatforms ? [...selectedPlatforms] : undefined;
+	if (selectedQuickPickLabels && useOptionsAutomaticallyNextTime)
+		selectedQuickPickLabels.push("Don't ask next time");
+	stubCreateQuickPickActions([selectedQuickPickLabels ? { kind: "multi", labels: selectedQuickPickLabels } : { kind: "accept-selected" }]);
 
 	// Choose a random temp folder for the project output.
 	const showOpenDialog = sb.stub(vs.window, "showOpenDialog");
@@ -91,8 +152,8 @@ async function projectContainsTriggerFileForExpectedTemplate(commandToExecute: s
 	const inputBox = stubCreateInputBox("my_test_flutter_proj");
 
 	// Create some folders in the temp folder to check the default name is correctly incremented.
-	fs.mkdirSync(path.join(tempFolder, "flutter_application_1"));
-	fs.mkdirSync(path.join(tempFolder, "flutter_application_2"));
+	fs.mkdirSync(path.join(tempFolder, `flutter_${expectedName}_1`));
+	fs.mkdirSync(path.join(tempFolder, `flutter_${expectedName}_2`));
 
 	// Intercept executeCommand for openFolder so we don't spawn a new instance of Code!
 	const executeCommand = sb.stub(vs.commands, "executeCommand").callThrough();
@@ -100,15 +161,16 @@ async function projectContainsTriggerFileForExpectedTemplate(commandToExecute: s
 	const projectFolderUri: string | undefined = await vs.commands.executeCommand(commandToExecute);
 
 	assert.ok(projectFolderUri);
-	assert.equal(inputBox.promptedValue, "flutter_application_3");
+	assert.equal(inputBox.promptedValue, `flutter_${expectedName}_3`);
 	assert.ok(showOpenDialog.calledOnce);
 	assert.ok(openFolder.calledOnce);
 
-	const triggerFile = path.join(fsPath(projectFolderUri), FLUTTER_CREATE_PROJECT_TRIGGER_FILE);
+	const triggerFile = path.join(fsPath(vs.Uri.parse(projectFolderUri)), FLUTTER_CREATE_PROJECT_TRIGGER_FILE);
 	assert.ok(fs.existsSync(triggerFile));
 
 	const jsonString: string | undefined = fs.readFileSync(triggerFile).toString().trim();
 	const json = jsonString ? JSON.parse(jsonString) as FlutterCreateTriggerData : undefined;
 
-	assert.equal(json?.template === expectedTemplate, true);
+	assert.equal(json?.template, expectedTemplate);
+	assert.equal(json?.empty, empty);
 }

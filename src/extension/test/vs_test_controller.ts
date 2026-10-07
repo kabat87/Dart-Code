@@ -1,26 +1,34 @@
+import { minimatch } from "minimatch";
 import * as path from "path";
 import * as vs from "vscode";
-import { TestStatus } from "../../shared/enums";
+import { URI } from "vscode-uri";
 import { IAmDisposable, Logger } from "../../shared/interfaces";
-import { GroupNode, SuiteData, SuiteNode, TestEventListener, TestModel, TestNode, TreeNode } from "../../shared/test/test_model";
+import { CoverageParser } from "../../shared/test/coverage";
+import { GroupNode, NodeDidChangeEvent, ProjectNode, RunnableTreeNode, SuiteData, SuiteNode, TestEventListener, TestModel, TestNode, TestSource, TreeNode, WorkspaceFolderNode } from "../../shared/test/test_model";
 import { ErrorNotification, PrintNotification } from "../../shared/test_protocol";
 import { disposeAll, notUndefined } from "../../shared/utils";
-import { fsPath } from "../../shared/utils/fs";
+import { isSetupOrTeardownTestName } from "../../shared/utils/test";
+import { DartFileCoverage } from "../../shared/vscode/coverage";
 import { config } from "../config";
 import { TestDiscoverer } from "../lsp/test_discoverer";
+import { formatForTerminal } from "../utils/vscode/terminals";
+
+const runnableTestTag = new vs.TestTag("DartRunnableTest");
+const runnableWithCoverageTestTag = new vs.TestTag("DartRunnableWithCoverageTest");
 
 export class VsCodeTestController implements TestEventListener, IAmDisposable {
 	private disposables: IAmDisposable[] = [];
 	public readonly controller: vs.TestController;
+	public readonly coverageParser: CoverageParser;
 	private itemForNode = new WeakMap<TreeNode, vs.TestItem>();
 	private nodeForItem = new WeakMap<vs.TestItem, TreeNode>();
-	private testRuns: { [key: string]: { run: vs.TestRun, shouldEndWithSession: boolean } | undefined } = {};
+	private testRuns: Record<string, { run: vs.TestRun, wasStartedByTestRunner: boolean } | undefined> = {};
 
-	constructor(private readonly logger: Logger, private readonly model: TestModel, private readonly discoverer: TestDiscoverer | undefined) {
-		const controller = vs.tests.createTestController("dart", "Dart & Flutter");
-		this.controller = controller;
+	constructor(private readonly logger: Logger, private readonly model: TestModel, public readonly discoverer: TestDiscoverer | undefined) {
+		const controller = this.controller = vs.tests.createTestController("dart", "Dart & Flutter");
+		this.coverageParser = new CoverageParser(logger);
 		this.disposables.push(controller);
-		this.disposables.push(model.onDidChangeTreeData.listen((node) => this.onDidChangeTreeData(node)));
+		this.disposables.push(model.onDidChangeTreeData((node) => this.onDidChangeTreeData(node)));
 		this.disposables.push(vs.debug.onDidTerminateDebugSession((e) => this.handleDebugSessionEnd(e)));
 		model.addTestEventListener(this);
 
@@ -28,10 +36,26 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 			controller.resolveHandler = (item: vs.TestItem | undefined) => this.resolveTestItem(item);
 
 		controller.createRunProfile("Run", vs.TestRunProfileKind.Run, (request, token) =>
-			this.runTests(false, request, token));
+			this.runTests(false, false, request, token), false, runnableTestTag);
 
 		controller.createRunProfile("Debug", vs.TestRunProfileKind.Debug, (request, token) =>
-			this.runTests(true, request, token));
+			this.runTests(true, false, request, token), true, runnableTestTag);
+
+		const coverageProfile = controller.createRunProfile("Run with Coverage", vs.TestRunProfileKind.Coverage, (request, token) =>
+			this.runTests(false, true, request, token), true, runnableWithCoverageTestTag);
+
+		coverageProfile.loadDetailedCoverage = async (testRun: vs.TestRun, fileCoverage: vs.FileCoverage, _token: vs.CancellationToken) => {
+			const dartFileCoverage = fileCoverage as DartFileCoverage;
+			const lineCoverage: vs.StatementCoverage[] = [];
+
+			dartFileCoverage.detail.coverableLines.forEach((lineNumber) => {
+				// LCOV files are one-based, but VS Code is zero-based.
+				const location = new vs.Position(lineNumber - 1, 0);
+				lineCoverage.push(new vs.StatementCoverage(dartFileCoverage.detail.coveredLines.has(lineNumber), location));
+			});
+
+			return lineCoverage;
+		};
 	}
 
 	private async resolveTestItem(item: vs.TestItem | undefined): Promise<void> {
@@ -48,149 +72,309 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 			await this.discoverer.discoverTestsForSuite(node);
 	}
 
-	public registerTestRun(dartCodeDebugSessionID: string, run: vs.TestRun, shouldEndWithSession: boolean): void {
-		this.testRuns[dartCodeDebugSessionID] = { run, shouldEndWithSession };
+	public registerTestRun(dartCodeDebugSessionID: string, run: vs.TestRun, { wasStartedByTestRunner }: { wasStartedByTestRunner: boolean }): void {
+		this.testRuns[dartCodeDebugSessionID] = { run, wasStartedByTestRunner };
 	}
 
-	private handleDebugSessionEnd(e: vs.DebugSession): any {
+	public handleDebugSessionEnd(e: vs.DebugSession): void {
 		const run = this.testRuns[e.configuration.dartCodeDebugSessionID];
-		if (run?.shouldEndWithSession)
+		if (run && !run.wasStartedByTestRunner)
 			run.run.end();
+
+		this.testRuns[e.configuration.dartCodeDebugSessionID] = undefined;
+
+		if (e.configuration.coverageFilePath && run)
+			this.parseCoverage(run.run, e.configuration.cwd as string | undefined, e.configuration.coverageFilePath as string);
+	}
+
+	private parseCoverage(run: vs.TestRun, cwd: string | undefined, coverageFilePath: string) {
+		if (!cwd) {
+			this.logger.error(`Unable to parse coverage file "${coverageFilePath}" because there is no cwd for the debug session`);
+			return;
+		}
+
+		try {
+			const coverageExcludePatterns = config.coverageExcludePatterns;
+			const coverage = this.coverageParser.parseLcovFile(coverageFilePath);
+			for (const fileCoverage of coverage) {
+				const absolutePath = path.isAbsolute(fileCoverage.sourceFilePath)
+					? fileCoverage.sourceFilePath
+					: path.join(cwd, fileCoverage.sourceFilePath);
+				if (coverageExcludePatterns.some((p: string) => minimatch(absolutePath, p, { dot: true })))
+					continue;
+				const uri = vs.Uri.file(absolutePath);
+				const coverage = new DartFileCoverage(uri, fileCoverage);
+				run.addCoverage(coverage);
+			}
+		} catch (e) {
+			this.logger.error(`Failed to read expected coverage file "${coverageFilePath}": ${e}`);
+		}
 	}
 
 	public getLatestData(test: vs.TestItem): TreeNode | undefined {
 		return this.nodeForItem.get(test);
 	}
 
-	public async runTests(debug: boolean, request: vs.TestRunRequest, token: vs.CancellationToken): Promise<void> {
-		await this.discoverer?.ensureSuitesDiscovered();
+	/**
+	 * Extracts the runnable nodes (suites, groups, tests) from a set of test items that might
+	 * include workspace folder or project nodes.
+	 */
+	private extractRunnableNodes(items: Set<vs.TestItem>): RunnableTreeNode[] {
+		const nodes: RunnableTreeNode[] = [];
+		const add = (item: vs.TestItem) => {
+			const node = this.nodeForItem.get(item);
+			if (node instanceof RunnableTreeNode) {
+				// If this node is runnable, add it.
+				nodes.push(node);
+			} else {
+				// Otherwise, try adding children (this may be a workspace folder, project, etc.).
+				item.children.forEach(add);
+			}
+		};
+		items.forEach(add);
+		return nodes;
+	}
+
+	public async runTests(debug: boolean, includeCoverage: boolean, request: vs.TestRunRequest, _token: vs.CancellationToken): Promise<void> {
+		const isRunningAll = !request.include;
+
+		// If running all tests, ensure we have discovered them all first.
+		if (isRunningAll)
+			await this.discoverer?.ensureSuitesDiscovered();
 
 		const testsToRun = new Set<vs.TestItem>();
-		const isRunningAll = !request.include?.length && !request.exclude?.length;
+		const testsToExclude = new Set<vs.TestItem>();
 		(request.include ?? this.controller.items).forEach((item) => testsToRun.add(item));
-		request.exclude?.forEach((item) => testsToRun.delete(item));
+		request.exclude?.forEach((item) => { testsToRun.delete(item); testsToExclude.add(item); });
 
 		// For each item in the set, remove any of its descendants because they will be run by the parent.
-		function removeWithDescendants(item: vs.TestItem) {
-			testsToRun.delete(item);
-			item.children.forEach((child) => removeWithDescendants(child));
-		}
-		const all = [...testsToRun];
-		all.forEach((item) => item.children.forEach((child) => removeWithDescendants(child)));
+		this.removeRedundantChildNodes(testsToRun);
+
+		// Similarly, remove any excluded tests that are already excluded by their suite, because that will allow the
+		// optimisation below (which requires only excluded suites) to work in more cases.
+		this.removeRedundantChildNodes(testsToExclude);
 
 		const run = this.controller.createTestRun(request);
+
+		// Mark each node we will run as enqueued.
+		this.markEnqueued(run, testsToRun, testsToExclude);
+
 		try {
 			// As an optimisation, if we're no-debug and running complete files (eg. all included or excluded items are
 			// suites), we can run the "fast path" in a single `dart test` invocation.
-			if (!debug && [...testsToRun].every((item) => this.nodeForItem.get(item) instanceof SuiteNode)) {
-				await vs.commands.executeCommand("_dart.runAllTestsWithoutDebugging", [...testsToRun].map((item) => this.nodeForItem.get(item)), run, isRunningAll);
+			const nodesToRun = this.extractRunnableNodes(testsToRun);
+			const nodesToExclude = this.extractRunnableNodes(testsToExclude);
+			if (!debug && nodesToRun.every((item) => item instanceof SuiteNode) && nodesToExclude.every((item) => item instanceof SuiteNode)) {
+				await vs.commands.executeCommand("_dart.runAllTestsWithoutDebugging", nodesToRun, nodesToExclude, includeCoverage, run, isRunningAll);
 				return;
 			}
 
 			// Group into suites since we need to run each seperately (although we can run
 			// multiple tests witthin one suite together).
-			const testsBySuite = new Map<SuiteData, TreeNode[]>();
+			const testsBySuite = new Map<SuiteData, RunnableTreeNode[]>();
 
-			testsToRun.forEach((test) => {
-				const node = this.nodeForItem.get(test);
-				if (!node) return;
+			nodesToRun.forEach((node) => {
 				const testNodes = testsBySuite.get(node.suiteData) ?? [];
 				testsBySuite.set(node.suiteData, testNodes);
 				testNodes.push(node);
 			});
 
-			for (const suite of testsBySuite.keys()) {
-				const nodes = testsBySuite.get(suite);
-				if (!nodes) continue;
+			const command = debug
+				? "_dart.startDebuggingTestsFromVsTestController"
+				: "_dart.startWithoutDebuggingTestsFromVsTestController";
+			const totalItems = testsBySuite.size;
 
-				const command = debug
-					? "_dart.startDebuggingTestsFromVsTestController"
-					: "_dart.startWithoutDebuggingTestsFromVsTestController";
-				await vs.commands.executeCommand(command, suite, nodes, true, run);
+			if (totalItems === 0)
+				return; // Shouldn't get here
+			else if (totalItems === 1) {
+				const [[suite, nodes]] = testsBySuite.entries();
+				await vs.commands.executeCommand(command, suite, nodes, false, includeCoverage, run, undefined);
+			} else {
+				const title = debug ? "Debugging" : "Running";
+				await vs.window.withProgress({
+					cancellable: true,
+					location: vs.ProgressLocation.Notification,
+					title,
+				}, async (progress, token) => {
+					let currentItem = 0;
+
+					for (const [suite, nodes] of testsBySuite.entries()) {
+						if (token?.isCancellationRequested || !nodes?.length)
+							continue;
+
+						currentItem++;
+						const suiteName = path.basename(suite.path);
+						progress.report({ message: `${suiteName}... (${currentItem}/${totalItems})`, increment: 100 / totalItems });
+
+						const suppressPrompts = true;
+						await vs.commands.executeCommand(command, suite, nodes, suppressPrompts, includeCoverage, run, token);
+					}
+				});
 			}
 		} finally {
 			run.end();
 		}
 	}
 
-	/// Replace the whole tree.
-	private replaceAll() {
-		const suiteTestItems = Object.values(this.model.suites)
-			.map((suite) => this.createOrUpdateNode(suite.node))
-			.filter(notUndefined);
-		this.controller.items.replace(suiteTestItems);
+	private markEnqueued(run: vs.TestRun, testsToRun: Set<vs.TestItem>, testsToExclude?: Set<vs.TestItem>) {
+		const markTestEnqueued = (item: vs.TestItem) => {
+			if (testsToExclude?.has(item))
+				return;
+
+			if (item.children.size === 0) {
+				// Enqueue only test items (VS Code will handle showing the status for containers).
+				const node = this.nodeForItem.get(item);
+				const isTest = node instanceof TestNode;
+				if (isTest) {
+					run.enqueued(item);
+				}
+			} else {
+				// Otherwise recurse.
+				item.children.forEach(markTestEnqueued);
+			}
+		};
+
+		testsToRun.forEach(markTestEnqueued);
 	}
 
-	private onDidChangeTreeData(node: TreeNode | undefined): void {
-		if (node === undefined) {
+	/// Removes any items from a set that are children of other items in the set.
+	private removeRedundantChildNodes(set: Set<vs.TestItem>): void {
+		// For each item in the set, remove any of its descendants because they will be run by the parent.
+		function removeWithDescendants(item: vs.TestItem) {
+			set.delete(item);
+			item.children.forEach((child) => removeWithDescendants(child));
+		}
+		const all = [...set];
+		all.forEach((item) => item.children.forEach((child) => removeWithDescendants(child)));
+	}
+
+	/// Replace the whole tree.
+	private replaceAll() {
+		const roots = this.model.getRoots()
+			.map((node) => this.createOrUpdateNode(node, true))
+			.filter(notUndefined);
+		this.controller.items.replace(roots);
+	}
+
+	private onDidChangeTreeData(event: NodeDidChangeEvent | undefined): void {
+		if (event === undefined) {
 			this.replaceAll();
 			return;
 		}
 
-		this.createOrUpdateNode(node);
+		if (event.nodeWasRemoved) {
+			this.removeNode(event.node);
+			return;
+		}
+
+		this.createOrUpdateNode(event.node, false);
 	}
 
-	/// Creates a node (including its children), or if it already exists, updates it
-	/// and its children.
+	/**
+	 * Gets the parent collection that a node belongs to.
+	 *
+	 * If this is a top-level node, returns the root items collection.
+	 */
+	private getParentCollection(node: TreeNode): vs.TestItemCollection | undefined {
+		let collection: vs.TestItemCollection | undefined;
 
+		// Find the parent whose child collection we belong to.
+		const parent = node.parent;
+		if (parent) {
+			const parentItem = this.itemForNode.get(parent);
+			collection = parentItem?.children;
+		} else {
+			// No parent, so we are top level.
+			collection = this.controller.items;
+		}
+
+		return collection;
+	}
+
+	/// Creates a node or if it already exists, updates it.
+	///
+	/// Recursively creates/updates children unless `updateChildren` is `false` and this node
+	/// already existed.
+	///
 	/// Does not add the item to its parent, so that the calling code can .replace()
 	/// all children if required.
 	///
 	/// Returns undefined if in the case of an error or a node that should
 	/// not be shown in the tree.
-	private createOrUpdateNode(node: TreeNode): vs.TestItem | undefined {
-		if (!this.shouldShowNode(node))
-			return;
-
-		let collection;
-		if (node instanceof SuiteNode) {
-			collection = this.controller.items;
-		} else {
-			collection = this.itemForNode.get(node.parent!)?.children;
+	private createOrUpdateNode(node: TreeNode, updateChildren: boolean): vs.TestItem | undefined {
+		// If we're not showing workspace folder nodes and this is a workspace folder, skip over it to
+		// its children.
+		const shouldShowWorkspaceFolders = (vs.workspace.workspaceFolders?.length ?? 0) > 1;
+		if (node instanceof WorkspaceFolderNode && !shouldShowWorkspaceFolders) {
+			if (updateChildren) {
+				node.children.forEach((c) => this.createOrUpdateNode(c, updateChildren));
+			}
+			return undefined;
 		}
+
+		const shouldShowNode = this.shouldShowNode(node);
+		const collection = this.getParentCollection(node);
 
 		if (!collection) {
 			this.logger.error(`Failed to find parent (${node.parent?.label}) of node (${node.label})`);
 			return;
 		}
-		let existingItem = collection.get(this.idForNode(node));
+		const nodeId = this.idForNode(node);
+		let existingItem = collection.get(nodeId);
+		const didCreate = !existingItem;
+
+		if (!shouldShowNode && existingItem)
+			collection.delete(nodeId);
 
 		// Create new item if required.
 		if (!existingItem) {
 			const newItem = this.createTestItem(node);
+			if (!shouldShowNode)
+				return;
+			collection.add(newItem);
 			existingItem = newItem;
 		} else {
 			// Otherwise, update this item to match the latest state.
 			this.updateFields(existingItem, node);
+			if (!shouldShowNode)
+				return;
 		}
 
-		// For new suites without chilren, set canResolveChildren because we can
+		// For new suites without children, set canResolveChildren because we can
 		// open the file and discover tests from the Outline if the user expands them.
 		if (node instanceof SuiteNode && node.children.length === 0)
 			existingItem.canResolveChildren = true;
 
-		existingItem.children.replace(
-			node.children.map((c) => this.createOrUpdateNode(c)).filter(notUndefined),
-		);
+		if (didCreate || updateChildren) {
+			existingItem.children.replace(
+				node.children.map((c) => this.createOrUpdateNode(c, updateChildren)).filter(notUndefined),
+			);
+		}
 
 		return existingItem;
+	}
+
+	/// Removes a node from the tree.
+	private removeNode(node: TreeNode): void {
+		const collection = this.getParentCollection(node);
+		if (!collection)
+			return;
+
+		const nodeId = this.idForNode(node);
+		const existingItem = collection.get(nodeId);
+		if (existingItem) {
+			collection.delete(nodeId);
+			this.nodeForItem.delete(existingItem);
+		}
+		this.itemForNode.delete(node);
 	}
 
 	private shouldShowNode(node: TreeNode): boolean {
 		if (config.showSkippedTests)
 			return true;
 
-		if (node instanceof TestNode && node.children.length === 0) {
-			// Simple test node.
-			// Show only if not skipped.
-			return node.status !== TestStatus.Skipped;
-		} else if (node instanceof TestNode) {
-			// Dynamic test node with children.
-			// Show only if any child not skipped.
-			return !!node.children.find((c) => (c as TestNode).status !== TestStatus.Skipped);
-		} else if (node instanceof GroupNode) {
-			// Show only if status is not exactly skipped.
-			return node.statuses.size !== 1 || !node.statuses.has(TestStatus.Skipped);
+		if (node instanceof TestNode || node instanceof GroupNode) {
+			return !node.isSkipped;
 		} else {
 			// Otherwise show eg. suites are always shown.
 			return true;
@@ -198,14 +382,21 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 	}
 
 	private idForNode(node: TreeNode) {
+		if (node instanceof WorkspaceFolderNode)
+			return `WF:${node.path}`;
+		if (node instanceof ProjectNode)
+			return `PROJECT:${node.path}`;
 		if (node instanceof SuiteNode)
-			return `SUITE:${node.suiteData.path}`;
+			return `SUITE:${node.path}`;
+
+		// IMPORTANT:
+		// We use suiteData.path here because we want to treat (tearDownAll) from a shared
+		// file as a child of the suite node for the instances where it ran in that suite.
 		if (node instanceof GroupNode)
 			return `GROUP:${node.suiteData.path}:${node.name}`;
 		if (node instanceof TestNode)
 			return `TEST:${node.suiteData.path}:${node.name}`;
 		throw new Error(`Tried to create ID for unknown node type! ${node.label}`);
-
 	}
 
 	private cleanLabel(label: string) {
@@ -213,12 +404,10 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 	}
 
 	private labelForSuite(node: SuiteNode): string {
-		const suitePath = node.suiteData.path;
-		const wf = vs.workspace.getWorkspaceFolder(vs.Uri.file(suitePath));
-
-		return wf
-			? path.relative(fsPath(wf.uri), node.suiteData.path)
-			: path.basename(suitePath);
+		const parent = node.parent;
+		if (parent instanceof ProjectNode || parent instanceof WorkspaceFolderNode)
+			return path.relative(parent.path, node.path);
+		return path.basename(node.path);
 	}
 
 	private createTestItem(node: TreeNode): vs.TestItem {
@@ -226,12 +415,25 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 		const label = node instanceof SuiteNode
 			? this.labelForSuite(node)
 			: this.cleanLabel(node.label ?? "<unnamed>");
-		const uri = vs.Uri.file(node.suiteData.path);
+		// We use path here (and not suiteData.path) because we want to
+		// navigate to the source for setup/teardown which may be in a
+		// different file to the test.
+		const uri = vs.Uri.file(node.path);
 
 		const item = this.controller.createTestItem(id, label, uri);
 		this.updateFields(item, node);
 		this.nodeForItem.set(item, node);
 		this.itemForNode.set(node, item);
+
+		if (this.isRunnableNode(node)) {
+			let project: TreeNode | undefined = node;
+			while (project && !(project instanceof ProjectNode))
+				project = project.parent;
+
+			item.tags = project?.supportsCoverage
+				? [runnableTestTag, runnableWithCoverageTestTag]
+				: [runnableTestTag];
+		}
 
 		item.children.replace(
 			node.children.map((c) => this.createTestItem(c)),
@@ -243,33 +445,70 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 	private updateFields(item: vs.TestItem, node: TreeNode) {
 		item.description = node.description;
 		if ((node instanceof GroupNode || node instanceof TestNode) && node.range) {
-			item.range = new vs.Range(
-				new vs.Position(node.range.start.line, node.range.start.character),
-				new vs.Position(node.range.end.line, node.range.end.character),
-			);
+			// Only update locations of tests that already have locations if they are from the Outline, because
+			// if they were from results then re-applying the original location might now be inaccurate due to
+			// changes to the file.
+			if (config.dynamicTestTracking || !item.range || node.testSource === TestSource.Outline) {
+				item.range = new vs.Range(
+					new vs.Position(node.range.start.line, node.range.start.character),
+					new vs.Position(node.range.end.line, node.range.end.character),
+				);
+			}
 		}
+	}
+
+	private isRunnableNode(node: TreeNode): boolean {
+		if (node instanceof ProjectNode)
+			return true;
+
+		if (!(node instanceof RunnableTreeNode))
+			return false;
+
+		const label = node.label;
+		if (!label)
+			return false;
+		if (isSetupOrTeardownTestName(label))
+			return false;
+		if (this.discoverer?.fileTracker.supportsPackageTest(URI.file(node.suiteData.path)) === false)
+			return false;
+		return true;
 	}
 
 	private getOrCreateTestRun(sessionID: string) {
 		let run = this.testRuns[sessionID]?.run;
 		if (!run) {
-			run = this.controller.createTestRun(new vs.TestRunRequest(), undefined, true);
-			this.registerTestRun(sessionID, run, true);
+			const request = new vs.TestRunRequest();
+			(request as any).preserveFocus = false; // TODO(dantup): Remove this when we crank VS Code min version in future.
+			run = this.controller.createTestRun(request, undefined, true);
+			this.registerTestRun(sessionID, run, { wasStartedByTestRunner: false });
 		}
 		return run;
 	}
 
-	public suiteDiscovered(sessionID: string | undefined, node: SuiteNode): void {
+	public suiteStarted(sessionID: string, node: SuiteNode): void {
+		this.getOrCreateTestRun(sessionID);
+		const run = this.testRuns[sessionID]!;
+
+		// If the tests were not started by the test runner, they won't have been marked
+		// as queued. If we know the entire suite is being run, enqueue them.
+		if (!run.wasStartedByTestRunner && node.suiteData.isRunningWholeSuite) {
+			const item = this.itemForNode.get(node);
+			if (item)
+				this.markEnqueued(run.run, new Set([item]));
+		}
+	}
+
+	public suiteDiscovered(_sessionID: string | undefined, _node: SuiteNode): void {
 		// const run = this.getOrCreateTestRun(sessionID);
 		// const item = this.itemForNode.get(node);
 	}
 
-	public groupDiscovered(sessionID: string | undefined, node: GroupNode): void {
+	public groupDiscovered(_sessionID: string | undefined, _node: GroupNode): void {
 		// const run = this.getOrCreateTestRun(sessionID);
 		// const item = this.itemForNode.get(node);
 	}
 
-	public testDiscovered(sessionID: string | undefined, node: TestNode): void {
+	public testDiscovered(_sessionID: string | undefined, _node: TestNode): void {
 		// const run = this.getOrCreateTestRun(sessionID);
 		// const item = this.itemForNode.get(node);
 	}
@@ -294,19 +533,19 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 		const run = this.getOrCreateTestRun(sessionID);
 		const item = this.itemForNode.get(node);
 		if (run && item) {
-			// TODO: isFailure??
-			this.appendTestOutputLines(run, item, message);
-			this.appendTestOutputLines(run, item, stack);
+			// TODO(dantup): If the change described here:
+			//  https://github.com/microsoft/vscode/issues/185778#issuecomment-1603742803
+			//  goes ahead, then if isFailure=true, capture the output of this as the
+			//  "lastFailureEvent" and then use that to pass to .failed() in testDone
+			//  instead of making a new TestMessage.
+			this.appendTestOutputLines(run, item, `${message}\r\n${stack}`.trimEnd());
 		}
 	}
 
 	public appendTestOutputLines(run: vs.TestRun, item: vs.TestItem, message: string) {
-		// Multi-line text doesn't show up correctly so split up
-		// https://github.com/microsoft/vscode/issues/136036
-		// run.appendOutput(`${formatForTerminal(message)}\r\n`, undefined, item);
-		message.split("\n").forEach((line) => {
-			run.appendOutput(line, undefined, item);
-		});
+		if (message.trim() === "")
+			return;
+		run.appendOutput(`${formatForTerminal(message)}\r\n`, undefined, item);
 	}
 
 	public testDone(sessionID: string, node: TestNode, result: "skipped" | "success" | "failure" | "error" | undefined): void {
@@ -320,23 +559,36 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 				case "success":
 					run.passed(item, node.duration);
 					break;
-				default:
-					const errors = node.outputEvents.map((e) => this.formatError(e)).filter(notUndefined);
-					const errorString = errors.join("\n");
+				default: {
+					const outputEvents = node.outputEvents;
+					const output = outputEvents.map((output) => this.formatNotification(output)).join("\n");
+					const outputMessage = formatForTerminal(output);
+					const testMessage = new vs.TestMessage(outputMessage);
+
+					// Attempt to extract Expected/Actual values if they are simple and on one line.
+					const valueMatch = /^Expected: (.*)\n\s*Actual: (.*)\n\n/.exec(outputMessage.replaceAll("\r\n", "\n").replaceAll("\r", "\n"));
+					if (valueMatch) {
+						const expected = valueMatch[1];
+						const actual = valueMatch[2];
+						testMessage.expectedOutput = typeof expected === "string" ? expected : undefined;
+						testMessage.actualOutput = typeof actual === "string" ? actual : undefined;
+					}
+
 					if (result === "failure")
-						run.failed(item, new vs.TestMessage(errorString), node.duration);
+						run.failed(item, testMessage, node.duration);
 					else
-						run.errored(item, new vs.TestMessage(errorString), node.duration);
+						run.errored(item, testMessage, node.duration);
 					break;
+				}
 			}
 		}
 	}
 
-	public suiteDone(sessionID: string, node: SuiteNode): void { }
+	public suiteDone(_sessionID: string, _node: SuiteNode): void { }
 
-	private formatError(error: ErrorNotification | PrintNotification) {
+	private formatNotification(error: ErrorNotification | PrintNotification) {
 		if (!("error" in error))
-			return;
+			return error.message;
 
 		return [
 			error.error ?? "",
@@ -344,7 +596,7 @@ export class VsCodeTestController implements TestEventListener, IAmDisposable {
 		].join("\n").trim();
 	}
 
-	public dispose(): any {
+	public dispose(): void {
 		disposeAll(this.disposables);
 	}
 }

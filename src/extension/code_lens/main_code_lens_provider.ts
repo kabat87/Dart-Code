@@ -1,11 +1,13 @@
+import * as path from "path";
 import { CancellationToken, CodeLens, CodeLensProvider, Event, EventEmitter, TextDocument } from "vscode";
-import { Outline } from "../../shared/analysis_server_types";
+import { Outline } from "../../shared/analysis/lsp/custom_protocol";
 import { IAmDisposable, Logger } from "../../shared/interfaces";
 import { disposeAll } from "../../shared/utils";
 import { fsPath } from "../../shared/utils/fs";
 import { getTemplatedLaunchConfigs } from "../../shared/vscode/debugger";
-import { toRange } from "../../shared/vscode/utils";
-import { DasAnalyzer } from "../analysis/analyzer_das";
+import { lspToPosition, lspToRange } from "../../shared/vscode/utils";
+import { LspAnalyzer } from "../analysis/analyzer";
+import { extensionApiModel } from "../api/extension_api";
 import { isInsideFlutterProject, isTestFile } from "../utils";
 
 export class MainCodeLensProvider implements CodeLensProvider, IAmDisposable {
@@ -13,18 +15,33 @@ export class MainCodeLensProvider implements CodeLensProvider, IAmDisposable {
 	private onDidChangeCodeLensesEmitter: EventEmitter<void> = new EventEmitter<void>();
 	public readonly onDidChangeCodeLenses: Event<void> = this.onDidChangeCodeLensesEmitter.event;
 
-	constructor(private readonly logger: Logger, private readonly analyzer: DasAnalyzer) {
-		this.disposables.push(this.analyzer.client.registerForAnalysisOutline((n) => {
+	constructor(private readonly logger: Logger, private readonly analyzer: LspAnalyzer) {
+		this.disposables.push(this.analyzer.fileTracker.onOutline(() => {
 			this.onDidChangeCodeLensesEmitter.fire();
 		}));
+		this.disposables.push(extensionApiModel.codeLensSuppressions.onDidChange(() => this.onDidChangeCodeLensesEmitter.fire()));
 	}
 
 	public async provideCodeLenses(document: TextDocument, token: CancellationToken): Promise<CodeLens[] | undefined> {
+		// Check if main code lenses are suppressed for this document
+		const suppressions = extensionApiModel.codeLensSuppressions.getOverrides(document.uri);
+		if (suppressions.main) {
+			return undefined;
+		}
+
 		// Without version numbers, the best we have to tell if an outline is likely correct or stale is
 		// if its length matches the document exactly.
+		const filename = path.basename(fsPath(document.uri));
 		const expectedLength = document.getText().length;
-		const outline = await this.analyzer.fileTracker.waitForOutlineWithLength(document.uri, expectedLength, token);
-		if (!outline || !outline.children || !outline.children.length)
+		const outline = await this.analyzer.fileTracker.waitForOutline(document, token);
+		if (!outline)
+			this.logger.info(`Failed to get outline for ${filename}, so unable to provide main CodeLens`);
+		else {
+			const actualLength = document.offsetAt(lspToPosition(outline.range.end));
+			if (actualLength !== expectedLength)
+				this.logger.info(`Outline for ${filename} has length ${actualLength} but expected ${actualLength}, so unable to provide main CodeLens`);
+		}
+		if (!outline?.children?.length)
 			return;
 
 		const fileType = isTestFile(fsPath(document.uri)) ? "test-file" : "file";
@@ -43,22 +60,22 @@ export class MainCodeLensProvider implements CodeLensProvider, IAmDisposable {
 		if (!templatesHaveDebug)
 			results.push(this.createCodeLens(document, mainFunction, "Debug", true));
 		if (fileType === "file" && !templatesHaveProfile && isInsideFlutterProject(document.uri))
-			results.push(this.createCodeLens(document, mainFunction, "Profile", false, { "flutterMode": "profile", "openDevTools": "performance" }));
+			results.push(this.createCodeLens(document, mainFunction, "Profile", false, { flutterMode: "profile", openDevTools: "performance" }));
 		return results.concat(templates.map((t) => this.createCodeLens(document, mainFunction, t.name, !t.noDebug, t)));
 	}
 
-	private createCodeLens(document: TextDocument, mainFunction: Outline, name: string, debug: boolean, template?: { [key: string]: string }): CodeLens {
+	private createCodeLens(document: TextDocument, mainFunction: Outline, name: string, debug: boolean, template?: Record<string, string>): CodeLens {
 		return new CodeLens(
-			toRange(document, mainFunction.offset, mainFunction.length),
+			lspToRange(mainFunction.codeRange),
 			{
-				arguments: template ? [document.uri, template] : [document.uri],
+				arguments: [{ resource: document.uri, launchTemplate: template }],
 				command: debug ? "dart.startDebugging" : "dart.startWithoutDebugging",
 				title: name,
 			}
 		);
 	}
 
-	public dispose(): any {
+	public dispose(): void {
 		disposeAll(this.disposables);
 	}
 }

@@ -2,19 +2,20 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vs from "vscode";
 import { androidStudioPaths, isMac } from "../../shared/constants";
-import { Logger, Sdks } from "../../shared/interfaces";
+import { IAmDisposable, Logger, Sdks } from "../../shared/interfaces";
+import { disposeAll } from "../../shared/utils";
 import { fsPath } from "../../shared/utils/fs";
 import { getFlutterConfigValue } from "../utils/misc";
 import { safeToolSpawn } from "../utils/processes";
 
-export class OpenInOtherEditorCommands implements vs.Disposable {
-	private disposables: vs.Disposable[] = [];
+export class OpenInOtherEditorCommands implements IAmDisposable {
+	private disposables: IAmDisposable[] = [];
 
 	constructor(private readonly logger: Logger, private readonly sdks: Sdks) {
 
 		this.disposables.push(
-			vs.commands.registerCommand("flutter.openInAndroidStudio", this.openInAndroidStudio, this),
-			vs.commands.registerCommand("flutter.openInXcode", this.openInXcode, this),
+			vs.commands.registerCommand("flutter.openInAndroidStudio", this.openInAndroidStudio.bind(this)),
+			vs.commands.registerCommand("flutter.openInXcode", this.openInXcode.bind(this)),
 		);
 	}
 
@@ -24,7 +25,7 @@ export class OpenInOtherEditorCommands implements vs.Disposable {
 		let androidStudioDir = await this.getAndroidStudioDir(folder);
 
 		if (!androidStudioDir) {
-			vs.window.showErrorMessage("Unable to find Android Studio");
+			void vs.window.showErrorMessage("Unable to find Android Studio");
 			return;
 		}
 
@@ -41,7 +42,7 @@ export class OpenInOtherEditorCommands implements vs.Disposable {
 				}
 			}
 		}
-		vs.window.showErrorMessage("Unable to locate Android Studio executable");
+		void vs.window.showErrorMessage("Unable to locate Android Studio executable");
 	}
 
 	private async openInXcode(resource: vs.Uri): Promise<void> {
@@ -50,24 +51,23 @@ export class OpenInOtherEditorCommands implements vs.Disposable {
 			.readdirSync(folder, { withFileTypes: true })
 			.filter((item) => item.isDirectory())
 			.filter((item) => item.name.endsWith(".xcworkspace") || item.name.endsWith(".xcodeproj"))
-			.sort((f1, f2) => f1.name.endsWith(".xcworkspace") ? -1 : 1);
+			.sort((f1) => f1.name.endsWith(".xcworkspace") ? -1 : 1);
 
-		if (!files || !files.length) {
+		if (!files?.length) {
 			const basename = path.basename(folder);
-			vs.window.showErrorMessage(`Unable to find an Xcode project in your '${basename}' folder`);
+			void vs.window.showErrorMessage(`Unable to find an Xcode project in your '${basename}' folder`);
 			return;
 		}
 
 		const file = path.join(folder, files[0].name);
-		safeToolSpawn(folder, "open", [file]);
+		safeToolSpawn(folder, "open", ["-b", "com.apple.dt.Xcode", file]);
 	}
 
 	private async getAndroidStudioDir(folder: string): Promise<string> {
 		return getFlutterConfigValue(this.logger, this.sdks.flutter, folder, "android-studio-dir");
 	}
 
-	public dispose(): any {
-		for (const command of this.disposables)
-			command.dispose();
+	public dispose(): void {
+		disposeAll(this.disposables);
 	}
 }

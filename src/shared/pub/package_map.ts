@@ -2,49 +2,59 @@ import * as fs from "fs";
 import * as path from "path";
 import * as url from "url";
 import { Logger } from "../interfaces";
-import { findFileInAncestor, uriToFilePath } from "../utils";
+import { findFileInAncestor } from "../utils";
 import { normalizeSlashes } from "../utils/fs";
+
+export class PackageMapLoader {
+	constructor(private readonly logger: Logger) { }
+
+	public loadForProject(projectFolder: string): PackageMap {
+		return PackageMap.loadForProject(this.logger, projectFolder);
+	}
+}
 
 export abstract class PackageMap {
 	public static findPackagesFile(entryPoint: string | undefined): string | undefined {
 		if (!entryPoint)
 			return undefined;
 
-		const file = findFileInAncestor([path.join(".dart_tool/package_config.json"), ".packages"], entryPoint);
+		const file = findFileInAncestor([path.join(".dart_tool/package_config.json")], entryPoint);
 		return file;
 	}
 
 	public static loadForProject(logger: Logger, projectFolder: string): PackageMap {
-		const paths = [
-			".dart_tool/package_config.json",
-			".packages",
-		];
-		for (const p of paths) {
-			const fullP = path.join(projectFolder, p);
-			if (fs.existsSync(fullP))
-				return this.load(logger, fullP);
+		const packagesFile = PackageMap.findPackagesFile(projectFolder);
+		try {
+			return packagesFile
+				? this.load(logger, packagesFile)
+				: new MissingPackageMap();
+		} catch (e) {
+			logger.warn(`Failed to load package map at ${packagesFile}, continuing as if package map does not exist: ${e}`);
+			return new MissingPackageMap();
 		}
-		return new MissingPackageMap();
 	}
 
 	public static load(logger: Logger, file: string | undefined): PackageMap {
 		if (!file)
 			return new MissingPackageMap();
 		try {
-			if (path.basename(file).toLowerCase() === ".packages")
-				return new DotPackagesPackageMap(file);
-			else
-				return new PackageConfigJsonPackageMap(logger, file);
+			return new PackageConfigJsonPackageMap(logger, file);
 		} catch (e) {
 			logger.error(e);
 			return new MissingPackageMap();
 		}
 	}
 
-	abstract get packages(): { [name: string]: string };
+	public abstract reload(): void;
+
+	abstract get packages(): Record<string, string>;
 
 	public getPackagePath(name: string): string | undefined {
 		return this.packages[name];
+	}
+
+	public get flutterRootPath(): string | undefined {
+		return undefined;
 	}
 
 	public resolvePackageUri(uri: string): string | undefined {
@@ -69,68 +79,51 @@ export abstract class PackageMap {
 	}
 }
 
-class MissingPackageMap extends PackageMap {
-	public get packages(): { [name: string]: string; } {
+export class MissingPackageMap extends PackageMap {
+	public get packages(): Record<string, string> {
 		return {};
 	}
-	public getPackagePath(name: string): string | undefined {
+	public getPackagePath(_name: string): string | undefined {
 		return undefined;
 	}
-	public resolvePackageUri(uri: string): string | undefined {
+	public resolvePackageUri(_uri: string): string | undefined {
 		return undefined;
 	}
-}
-
-class DotPackagesPackageMap extends PackageMap {
-	private map: { [name: string]: string } = {};
-	private readonly localPackageRoot: string | undefined;
-	public get packages(): { [name: string]: string } { return Object.assign({}, this.map); }
-
-	constructor(file?: string) {
-		super();
-		if (!file) return;
-		this.localPackageRoot = path.dirname(file);
-
-		const lines: string[] = fs.readFileSync(file, { encoding: "utf8" }).split("\n");
-		for (let line of lines) {
-			line = line.trim();
-
-			if (line.length === 0 || line.startsWith("#"))
-				continue;
-
-			const index = line.indexOf(":");
-			if (index !== -1) {
-				const name = line.substr(0, index);
-				const rest = line.substring(index + 1);
-
-				if (rest.startsWith("file:"))
-					this.map[name] = uriToFilePath(rest);
-				else
-					this.map[name] = path.join(this.localPackageRoot, rest);
-			}
-		}
-	}
-
-
+	public reload() { }
 }
 
 class PackageConfigJsonPackageMap extends PackageMap {
-	private readonly map: { [name: string]: string } = {};
-	private readonly config: PackageJsonConfig;
+	private map: Record<string, string> = {};
+	private config!: PackageJsonConfig;
 
 	constructor(private readonly logger: Logger, private readonly packageConfigPath: string) {
 		super();
-		const json = fs.readFileSync(this.packageConfigPath, "utf8");
-		this.config = JSON.parse(json);
+		this.load();
+	}
 
+	public reload() {
+		this.load();
+	}
+
+	private load() {
+		const json = fs.readFileSync(this.packageConfigPath, "utf8");
+		try {
+			this.config = JSON.parse(json);
+		} catch (e) {
+			this.logger.warn(`Failed to load package map at ${this.packageConfigPath}, continuing with empty map: ${e}`);
+			this.map = {};
+			return;
+		}
+
+		this.map = {};
 		for (const pkg of this.config.packages) {
-			try {
-				const packageConfigFolderPath = path.dirname(this.packageConfigPath);
-				const packageRootPath = this.getPathForUri(pkg.rootUri);
+			const packageConfigFolderPath = path.dirname(this.packageConfigPath);
+			const packageRootPath = this.getPathForUri(pkg.rootUri);
+			if (packageRootPath) {
 				const packageLibPath = this.getPathForUri(pkg.packageUri);
-				this.map[pkg.name] = path.resolve(packageConfigFolderPath, packageRootPath ?? "", packageLibPath ?? "");
-			} catch (e) {
-				logger.error(`Failed to resolve path for package ${pkg.name}: ${e}`);
+				this.map[pkg.name] = path.resolve(packageConfigFolderPath, packageRootPath, packageLibPath ?? "");
+			} else {
+				this.logger.error(`Failed to resolve path for package ${pkg.name}, did not resolve a valid rootUri`);
 			}
 		}
 	}
@@ -139,16 +132,30 @@ class PackageConfigJsonPackageMap extends PackageMap {
 		if (!uri)
 			return undefined;
 
-		const parsedPath = normalizeSlashes(
-			uri.startsWith("file:")
-				? url.fileURLToPath(uri)
-				: unescape(uri),
-		);
+		try {
+			const parsedPath = normalizeSlashes(
+				uri.startsWith("file:")
+					? url.fileURLToPath(uri)
+					: decodeURIComponent(uri),
+			);
 
-		return parsedPath.endsWith(path.sep) ? parsedPath : `${parsedPath}${path.sep}`;
+			return parsedPath.endsWith(path.sep) ? parsedPath : `${parsedPath}${path.sep}`;
+		} catch (e) {
+			// Could be an invalid path such as a package_config on Linux being run on Windows.
+			// https://github.com/Dart-Code/Dart-Code/issues/5909
+			// This only happens on Windows because the Linux paths with no drive letters are invalid
+			// for Windows, however the opposite is not true (`file:///C:/foo` parses fine on Linux).
+			this.logger.warn(`Failed to extract path from URI: ${uri}: ${e}`);
+			return undefined;
+		}
 	}
 
-	public get packages(): { [name: string]: string } { return Object.assign({}, this.map); }
+	public get packages(): Record<string, string> { return Object.assign({}, this.map); }
+
+	public get flutterRootPath(): string | undefined {
+		const flutterRootUri = this.config?.flutterRoot;
+		return flutterRootUri ? this.getPathForUri(flutterRootUri) : undefined;
+	}
 
 	public getPackagePath(name: string): string | undefined {
 		return this.map[name];
@@ -158,6 +165,7 @@ class PackageConfigJsonPackageMap extends PackageMap {
 interface PackageJsonConfig {
 	configVersion: number,
 	packages: PackageJsonConfigPackage[];
+	flutterRoot?: string;
 }
 
 interface PackageJsonConfigPackage {

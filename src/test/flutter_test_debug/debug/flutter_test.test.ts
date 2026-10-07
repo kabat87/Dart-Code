@@ -1,202 +1,35 @@
 import { strict as assert } from "assert";
 import * as path from "path";
+import { SinonStub } from "sinon";
 import * as vs from "vscode";
 import { DebuggerType, VmServiceExtension } from "../../../shared/enums";
 import { TestDoneNotification } from "../../../shared/test_protocol";
 import { fsPath } from "../../../shared/utils/fs";
 import { waitFor } from "../../../shared/utils/promises";
+import { getLaunchConfig } from "../../../shared/utils/test";
+import { DartFileCoverage } from "../../../shared/vscode/coverage";
 import { DartDebugClient } from "../../dart_debug_client";
-import { createDebugClient, killFlutterTester, startDebugger, waitAllThrowIfTerminates } from "../../debug_helpers";
-import { activate, captureDebugSessionCustomEvents, checkTreeNodeResults, customScriptExt, deferUntilLast, delay, ensureArrayContainsArray, ensureHasRunWithArgsStarting, extApi, flutterHelloWorldCounterAppFile, flutterHelloWorldFolder, flutterIntegrationTestFile, flutterTestAnotherFile, flutterTestBrokenFile, flutterTestDriverAppFile, flutterTestDriverTestFile, flutterTestMainFile, flutterTestOtherFile, getCodeLens, getExpectedResults, getResolvedDebugConfiguration, makeTestTextTree, openFile, positionOf, prepareHasRunFile, setConfigForTest, waitForResult, watchPromise } from "../../helpers";
+import { captureTestDebugConfigurations, createDebugClient, flutterTestDeviceId, killFlutterTester, startDebugger, waitAllThrowIfTerminates } from "../../debug_helpers";
+import { activateWithoutAnalysis, captureDebugSessionCustomEvents, checkTreeNodeResults, customScriptExt, deferUntilLast, delay, fakeCancellationToken, findSuiteNode, flutterHelloWorldCounterAppFile, flutterHelloWorldExamplePrinterFile, flutterHelloWorldExampleTestFile, flutterHelloWorldFolder, flutterHelloWorldMainFile, flutterHelloWorldPrinterFile, flutterIntegrationTestFile, flutterTestAnotherFile, flutterTestBrokenFile, flutterTestDriverAppFile, flutterTestDriverTestFile, flutterTestMainFile, flutterTestOtherFile, flutterTestSelective1File, flutterTestSelective2File, getCodeLens, getExpectedResults, getLaunchConfiguration, isTestDoneSuccessNotification, makeTestTextTree, openFile, positionOf, privateApi, sb, setConfigForTest, waitForResult, watchPromise } from "../../helpers";
 
 describe("flutter test debugger", () => {
-	beforeEach("activate flutterTestMainFile", () => activate(flutterTestMainFile));
+	beforeEach("activate flutterTestMainFile", () => activateWithoutAnalysis(flutterTestMainFile));
 
 	beforeEach(() => {
 		deferUntilLast("Kill flutter_tester", () => watchPromise("Killing flutter_tester processes", killFlutterTester()));
 	});
 
 	let dc: DartDebugClient;
-	beforeEach("create debug client", function () {
-		if (process.env.DART_CODE_FORCE_SDK_DAP === "true" && !extApi.flutterCapabilities.supportsSdkDap)
-			this.skip();
-
+	beforeEach("create debug client", () => {
 		dc = createDebugClient(DebuggerType.FlutterTest);
 	});
 
-	describe("resolves the correct debug config", () => {
-		it("for a simple script", async () => {
-			const resolvedConfig = await getResolvedDebugConfiguration({
-				args: ["--foo"],
-				program: fsPath(flutterTestMainFile),
-			})!;
-
-			assert.ok(resolvedConfig);
-			assert.equal(resolvedConfig.program, fsPath(flutterTestMainFile));
-			assert.equal(resolvedConfig.cwd, fsPath(flutterHelloWorldFolder));
-			assert.deepStrictEqual(resolvedConfig.args, ["--foo"]);
-		});
-
-		it("when flutterTestAdditionalArgs is set", async () => {
-			await setConfigForTest("dart", "flutterTestAdditionalArgs", ["--no-sound-null-safety"]);
-			const resolvedConfig = await getResolvedDebugConfiguration({
-				program: fsPath(flutterTestMainFile),
-			})!;
-
-			ensureArrayContainsArray(resolvedConfig.toolArgs!, ["--no-sound-null-safety"]);
-		});
-
-		it("when suppressTestTimeouts is set", async () => {
-			await setConfigForTest("dart", "suppressTestTimeouts", "always");
-			const resolvedConfig = await getResolvedDebugConfiguration({
-				program: fsPath(flutterTestMainFile),
-			})!;
-
-			ensureArrayContainsArray(resolvedConfig.toolArgs!, ["--timeout"]);
-		});
-	});
-
-	it("runs a Flutter test script to completion", async () => {
-		const config = await startDebugger(dc, flutterTestMainFile);
-		await waitAllThrowIfTerminates(dc,
-			dc.configurationSequence(),
-			dc.waitForEvent("terminated"),
-			dc.launch(config),
-		);
-	});
-
-	it("can run tests from codelens", async function () {
-		const editor = await openFile(flutterTestMainFile);
-		await waitForResult(() => !!extApi.fileTracker.getOutlineFor(flutterTestMainFile), "Outline for main file");
-
-		const fileCodeLens = await getCodeLens(editor.document);
-		const testPos = positionOf(`test^Widgets('Hello world test`);
-
-		const codeLensForTest = fileCodeLens.filter((cl) => cl.range.start.line === testPos.line);
-		assert.equal(codeLensForTest.length, 2);
-
-		if (!codeLensForTest[0].command) {
-			// If there's no command, skip the test. This happens very infrequently and appears to be a VS Code
-			// race condition. Rather than failing our test runs, skip.
-			// TODO: Remove this if https://github.com/microsoft/vscode/issues/79805 gets a reliable fix.
-			this.skip();
-			return;
-		}
-
-		const runAction = codeLensForTest.find((cl) => cl.command!.title === "Run")!;
-		assert.equal(runAction.command!.command, "_dart.startWithoutDebuggingTestFromOutline");
-		assert.equal(runAction.command!.arguments![0].fullName, "Hello world test");
-		assert.equal(runAction.command!.arguments![0].isGroup, false);
-
-		const customEvents = await captureDebugSessionCustomEvents(async () => {
-			const didStart = await vs.commands.executeCommand(runAction.command!.command, ...(runAction.command!.arguments ?? [])); // eslint-disable-line @typescript-eslint/no-unsafe-argument
-			assert.ok(didStart);
-		});
-		// Ensure we got at least a "testDone" notification so we know the test run started correctly.
-		const testDoneNotification = customEvents.find((e) => e.event === "dart.testNotification" && e.body.type === "testDone");
-		assert.ok(testDoneNotification, JSON.stringify(customEvents.map((e) => e.body), undefined, 4));
-	});
-
-	function isTestDoneNotification(e: vs.DebugSessionCustomEvent) {
-		if (e.event !== "dart.testNotification")
-			return false;
-		const notification = e.body as TestDoneNotification;
-		return notification.type === "testDone" && !notification.hidden;
-	}
-
-	it("does not attempt to run skipped tests from codelens if not supported", async function () {
-		if (extApi.flutterCapabilities.supportsRunSkippedTests)
-			this.skip();
-
-		const editor = await openFile(flutterTestMainFile);
-		await waitForResult(() => !!extApi.fileTracker.getOutlineFor(flutterTestMainFile), "Outline for main file");
-
-		const fileCodeLens = await getCodeLens(editor.document);
-		const testPos = positionOf(`test^Widgets('Skipped test`);
-
-		const codeLensForTest = fileCodeLens.filter((cl) => cl.range.start.line === testPos.line);
-		assert.equal(codeLensForTest.length, 2);
-
-		if (!codeLensForTest[0].command) {
-			// If there's no command, skip the test. This happens very infrequently and appears to be a VS Code
-			// race condition. Rather than failing our test runs, skip.
-			// TODO: Remove this if https://github.com/microsoft/vscode/issues/79805 gets a reliable fix.
-			this.skip();
-			return;
-		}
-
-		const runAction = codeLensForTest.find((cl) => cl.command!.title === "Run")!;
-		assert.equal(runAction.command!.command, "_dart.startWithoutDebuggingTestFromOutline");
-		assert.equal(runAction.command!.arguments![0].fullName, "Skipped test");
-		assert.equal(runAction.command!.arguments![0].isGroup, false);
-
-		const customEvents = await captureDebugSessionCustomEvents(async () => {
-			const didStart = await vs.commands.executeCommand(runAction.command!.command, ...(runAction.command!.arguments ?? [])); // eslint-disable-line @typescript-eslint/no-unsafe-argument
-			assert.ok(didStart);
-		});
-
-		const testDoneNotification = customEvents.find(isTestDoneNotification);
-		assert.ok(testDoneNotification, JSON.stringify(customEvents.map((e) => e.body), undefined, 4));
-
-		const testDone = testDoneNotification.body as TestDoneNotification;
-		assert.equal(testDone.skipped, true);
-	});
-
-	it("can run skipped tests from codelens if supported", async function () {
-		if (!extApi.flutterCapabilities.supportsRunSkippedTests)
-			this.skip();
-
-		const editor = await openFile(flutterTestMainFile);
-		await waitForResult(() => !!extApi.fileTracker.getOutlineFor(flutterTestMainFile), "Outline for main file");
-
-		const fileCodeLens = await getCodeLens(editor.document);
-		const testPos = positionOf(`test^Widgets('Skipped test`);
-
-		const codeLensForTest = fileCodeLens.filter((cl) => cl.range.start.line === testPos.line);
-		assert.equal(codeLensForTest.length, 2);
-
-		if (!codeLensForTest[0].command) {
-			// If there's no command, skip the test. This happens very infrequently and appears to be a VS Code
-			// race condition. Rather than failing our test runs, skip.
-			// TODO: Remove this if https://github.com/microsoft/vscode/issues/79805 gets a reliable fix.
-			this.skip();
-			return;
-		}
-
-		const runAction = codeLensForTest.find((cl) => cl.command!.title === "Run")!;
-		assert.equal(runAction.command!.command, "_dart.startWithoutDebuggingTestFromOutline");
-		assert.equal(runAction.command!.arguments![0].fullName, "Skipped test");
-		assert.equal(runAction.command!.arguments![0].isGroup, false);
-
-		const customEvents = await captureDebugSessionCustomEvents(async () => {
-			const didStart = await vs.commands.executeCommand(runAction.command!.command, ...(runAction.command!.arguments ?? [])); // eslint-disable-line @typescript-eslint/no-unsafe-argument
-			assert.ok(didStart);
-		});
-
-		const testDoneNotification = customEvents.find(isTestDoneNotification);
-		assert.ok(testDoneNotification, JSON.stringify(customEvents.map((e) => e.body), undefined, 4));
-
-		const testDone = testDoneNotification.body as TestDoneNotification;
-		assert.equal(testDone.skipped, false); // Test should have run.
-	});
-
-	it("receives the expected events from a Flutter test script", async () => {
-		const config = await startDebugger(dc, flutterTestMainFile);
-		await waitAllThrowIfTerminates(dc,
-			dc.configurationSequence(),
-			dc.assertOutputContains("stdout", `✓ Hello world test`),
-			dc.waitForEvent("terminated"),
-			dc.assertPassingTest(`Hello world test`),
-			dc.launch(config),
-		);
-	});
-
-	it("successfully runs a Flutter test script with a relative path", async () => {
+	it("runs a Flutter test script to completion, including via a relative path", async () => {
 		const config = await startDebugger(dc, flutterTestMainFile);
 		config.program = path.relative(fsPath(flutterHelloWorldFolder), fsPath(flutterTestMainFile));
 		await waitAllThrowIfTerminates(dc,
 			dc.configurationSequence(),
-			dc.assertOutputContains("stdout", `✓ Hello world test`),
+			dc.assertOutputContains("console", `✓ Hello world test`),
 			dc.assertPassingTest(`Hello world test`),
 			dc.waitForEvent("terminated"),
 			dc.launch(config),
@@ -208,7 +41,7 @@ describe("flutter test debugger", () => {
 		const config = await startDebugger(dc, flutterTestOtherFile);
 		await waitAllThrowIfTerminates(dc,
 			dc.configurationSequence(),
-			dc.assertOutputContains("stdout", `✓ Other tests group Other test\n`),
+			dc.assertOutputContains("console", `✓ Other tests group Other test\n`),
 			dc.assertPassingTest(`Other tests group Other test`),
 			dc.waitForEvent("terminated"),
 			dc.launch(config),
@@ -216,15 +49,11 @@ describe("flutter test debugger", () => {
 	});
 
 	it("runs the open script if no file is provided", async () => {
+		// This only verifies the program the extension resolves (without running
+		// the tests, which is slow). Running the resolved script is covered above.
 		await openFile(flutterTestOtherFile);
-		const config = await startDebugger(dc, undefined);
-		await waitAllThrowIfTerminates(dc,
-			dc.configurationSequence(),
-			dc.assertOutputContains("stdout", `✓ Other tests group Other test\n`),
-			dc.assertPassingTest(`Other tests group Other test`),
-			dc.waitForEvent("terminated"),
-			dc.launch(config),
-		);
+		const config = await getLaunchConfiguration(undefined);
+		assert.equal(config!.program, fsPath(flutterTestOtherFile));
 	});
 
 	it("runs all tests if given a folder", async () => {
@@ -246,7 +75,7 @@ describe("flutter test debugger", () => {
 		for (const file of testFiles) {
 			await openFile(file);
 			const expectedResults = getExpectedResults();
-			const actualResults = makeTestTextTree(file).join("\n");
+			const actualResults = makeTestTextTree({ uriFilter: file }).join("\n");
 
 			assert.ok(expectedResults);
 			assert.ok(actualResults);
@@ -258,11 +87,11 @@ describe("flutter test debugger", () => {
 		let startedSessions = 0;
 		let runningSessions = 0;
 
-		const startSub = vs.debug.onDidStartDebugSession((s) => {
+		const startSub = vs.debug.onDidStartDebugSession((_s) => {
 			startedSessions++;
 			runningSessions++;
 		});
-		const endSub = vs.debug.onDidTerminateDebugSession((s) => {
+		const endSub = vs.debug.onDidTerminateDebugSession((_s) => {
 			runningSessions--;
 		});
 
@@ -270,16 +99,19 @@ describe("flutter test debugger", () => {
 			await captureDebugSessionCustomEvents(async () => vs.commands.executeCommand("testing.runAll"));
 			// Allow some time for sessions to start so the startedSessions check doesn't
 			// fire immediately after only creating the first session.
-			await delay(1000);
+			await delay(500);
 			await waitFor(
-				() => startedSessions >= 0 && runningSessions === 0,
-				300, // check every 300ms
+				() => startedSessions > 0 && runningSessions === 0,
+				50, // check every 50ms
 				60000, // wait up to 60 seconds
 			);
 		} finally {
 			startSub.dispose();
 			endSub.dispose();
 		}
+
+		// Allow some time for all events to be processed to try and reduce flakes?
+		await delay(50);
 
 		const testFiles = [
 			flutterTestMainFile,
@@ -292,7 +124,7 @@ describe("flutter test debugger", () => {
 		for (const file of testFiles) {
 			await openFile(file);
 			const expectedResults = getExpectedResults();
-			const actualResults = makeTestTextTree(file).join("\n");
+			const actualResults = makeTestTextTree({ uriFilter: file }).join("\n");
 
 			assert.ok(expectedResults);
 			assert.ok(actualResults);
@@ -300,40 +132,41 @@ describe("flutter test debugger", () => {
 		}
 	});
 
-	it("can run using a custom tool", async () => {
+	it("passes custom tool through to the launch config", async () => {
+		// This only verifies the config the extension produces (without running the
+		// tests, which is slow). The debug adapter invoking the custom tool is covered
+		// by the adapter's own tests.
 		const root = fsPath(flutterHelloWorldFolder);
-		const hasRunFile = prepareHasRunFile(root, "flutter_test");
-
-		const config = await startDebugger(dc, flutterTestMainFile, {
-			customTool: path.join(root, `scripts/custom_flutter_test.${customScriptExt}`),
+		const customTool = path.join(root, `scripts/custom_flutter_test.${customScriptExt}`);
+		const config = await getLaunchConfiguration(flutterTestMainFile, {
+			customTool,
 			customToolReplacesArgs: 0,
+			deviceId: flutterTestDeviceId,
 		});
-		await waitAllThrowIfTerminates(dc,
-			dc.configurationSequence(),
-			dc.waitForEvent("terminated"),
-			dc.launch(config),
-		);
-
-		ensureHasRunWithArgsStarting(root, hasRunFile, "test --machine --start-paused");
+		assert.equal(config!.customTool, customTool);
+		assert.equal(config!.customToolReplacesArgs, 0);
+		// The device should still be passed through so the custom tool runs for the right device.
+		assert.ok(config!.toolArgs!.includes("-d"));
+		assert.ok(config!.toolArgs!.includes(flutterTestDeviceId));
 	});
 
-	it("can replace all args using custom tool", async () => {
+	it("passes custom tool args through to the launch config", async () => {
+		// This only verifies the config the extension produces (without running the
+		// tests, which is slow). The debug adapter replacing its args with these is
+		// covered by the adapter's own tests.
 		const root = fsPath(flutterHelloWorldFolder);
-		const hasRunFile = prepareHasRunFile(root, "flutter_test");
-
-		const config = await startDebugger(dc, flutterTestMainFile, {
-			customTool: path.join(root, `scripts/custom_flutter_test.${customScriptExt}`),
+		const customTool = path.join(root, `scripts/custom_flutter_test.${customScriptExt}`);
+		// These differ to the usual ones so we can detect they replaced them.
+		const toolArgs = ["test", "--total-shards", "1", "--shard-index", "0", "--start-paused", "--machine", "-d", "my-flutter-tester"];
+		const config = await getLaunchConfiguration(flutterTestMainFile, {
+			customTool,
 			customToolReplacesArgs: 999999,
-			// These differ to the usual ones so we can detect they replaced them.
-			toolArgs: ["test", "--total-shards", "1", "--shard-index", "0", "--start-paused", "--machine", "-d", "flutter-tester"],
+			deviceId: flutterTestDeviceId,
+			toolArgs,
 		});
-		await waitAllThrowIfTerminates(dc,
-			dc.configurationSequence(),
-			dc.waitForEvent("terminated"),
-			dc.launch(config),
-		);
-
-		ensureHasRunWithArgsStarting(root, hasRunFile, "test --total-shards 1 --shard-index 0 --start-paused --machine -d flutter-tester");
+		assert.equal(config!.customTool, customTool);
+		assert.equal(config!.customToolReplacesArgs, 999999);
+		assert.deepStrictEqual(config!.toolArgs!.slice(0, toolArgs.length), toolArgs);
 	});
 
 	it("stops at a breakpoint", async () => {
@@ -345,7 +178,7 @@ describe("flutter test debugger", () => {
 		});
 	});
 
-	it("stops on exception", async () => {
+	it("stops on exception and provides exception details", async () => {
 		await openFile(flutterTestBrokenFile);
 		const config = await startDebugger(dc, flutterTestBrokenFile);
 		await waitAllThrowIfTerminates(dc,
@@ -353,6 +186,13 @@ describe("flutter test debugger", () => {
 			dc.assertStoppedLocation("exception", {}),
 			dc.launch(config),
 		);
+
+		const variables = await dc.getTopFrameVariables("Exceptions");
+		assert.ok(variables);
+		const v = variables.find((v) => v.name === "message");
+		assert.ok(v);
+		assert.equal(v.evaluateName, "$_threadException.message");
+		assert.ok(v.value.startsWith(`"Expected: exactly one matching`));
 	});
 
 	it.skip("stops at the correct location on exception", async () => {
@@ -368,23 +208,6 @@ describe("flutter test debugger", () => {
 			}),
 			dc.launch(config),
 		);
-	});
-
-	it("provides exception details when stopped on exception", async () => {
-		await openFile(flutterTestBrokenFile);
-		const config = await startDebugger(dc, flutterTestBrokenFile);
-		await waitAllThrowIfTerminates(dc,
-			dc.configurationSequence(),
-			dc.assertStoppedLocation("exception", {}),
-			dc.launch(config),
-		);
-
-		const variables = await dc.getTopFrameVariables("Exceptions");
-		assert.ok(variables);
-		const v = variables.find((v) => v.name === "message");
-		assert.ok(v);
-		assert.equal(v.evaluateName, "$_threadException.message");
-		assert.ok(v.value.startsWith(`"Expected: exactly one matching node in the widget tree`));
 	});
 
 	it("send failure results for failing tests", async () => {
@@ -404,7 +227,6 @@ describe("flutter test debugger", () => {
 		// Start the instrumented app.
 		const appDc = createDebugClient(DebuggerType.Flutter);
 		const appConfig = await startDebugger(appDc, flutterTestDriverAppFile);
-		appConfig.noDebug = true;
 		await waitAllThrowIfTerminates(appDc,
 			appDc.configurationSequence(),
 			appDc.launch(appConfig),
@@ -412,7 +234,11 @@ describe("flutter test debugger", () => {
 
 		// Allow some time for the debug service to register its Driver extension so we can find it when
 		// looking for the app debug session later.
-		await waitFor(() => extApi.debugSessions.find((s) => s.loadedServiceExtensions.indexOf(VmServiceExtension.Driver) !== -1));
+		await waitFor(
+			() => privateApi.debugSessions.find((s) => s.loadedServiceExtensions.includes(VmServiceExtension.Driver)),
+			100, // checkEveryMilliseconds
+			30000, // tryForMilliseconds
+		);
 
 		// Run the integration tests
 		const config = await startDebugger(dc, flutterTestDriverTestFile);
@@ -424,10 +250,7 @@ describe("flutter test debugger", () => {
 		);
 	});
 
-	it("can run integration_test tests", async function () {
-		if (!extApi.flutterCapabilities.supportsRunningIntegrationTests)
-			this.skip();
-
+	it("can run integration_test tests", async () => {
 		const config = await startDebugger(dc, flutterIntegrationTestFile);
 		config.noDebug = true;
 
@@ -438,10 +261,7 @@ describe("flutter test debugger", () => {
 		);
 	});
 
-	it("stops at a breakpoint in test code in integration_test tests", async function () {
-		if (!extApi.flutterCapabilities.supportsRunningIntegrationTests)
-			this.skip();
-
+	it("stops at a breakpoint in test code in integration_test tests", async () => {
 		await openFile(flutterIntegrationTestFile);
 		const config = await startDebugger(dc, flutterIntegrationTestFile);
 
@@ -453,10 +273,7 @@ describe("flutter test debugger", () => {
 		);
 	});
 
-	it("stops at a breakpoint in app code in integration_test tests", async function () {
-		if (!extApi.flutterCapabilities.supportsRunningIntegrationTests)
-			this.skip();
-
+	it("stops at a breakpoint in app code in integration_test tests", async () => {
 		await openFile(flutterHelloWorldCounterAppFile);
 		const config = await startDebugger(dc, flutterIntegrationTestFile);
 
@@ -466,6 +283,237 @@ describe("flutter test debugger", () => {
 				path: fsPath(flutterHelloWorldCounterAppFile),
 			}),
 		);
+	});
+
+	for (const runByLine of [false, true]) {
+		describe(`when running tests by ${runByLine ? "line" : "name"}`, () => {
+			beforeEach("set config.testInvocationMode", async () => {
+				await setConfigForTest("dart", "testInvocationMode", runByLine ? "line" : "name");
+			});
+
+			// Only tests that pass a test selection are affected by the invocation
+			// mode, so only those run in both modes here.
+
+			it("can run tests from codelens", async function () {
+				const editor = await openFile(flutterTestMainFile);
+				await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(flutterTestMainFile), "Outline for main file");
+
+				const fileCodeLens = await getCodeLens(editor.document);
+				const testPos = positionOf(`test^Widgets('Hello world test`);
+
+				const codeLensForTest = fileCodeLens.filter((cl) => cl.range.start.line === testPos.line);
+				assert.equal(codeLensForTest.length, 2);
+
+				// If there's no command, skip the test. This happens very infrequently and appears to be a VS Code
+				// race condition. Rather than failing our test runs, skip.
+				// TODO: Remove this if https://github.com/microsoft/vscode/issues/79805 gets a reliable fix.
+				if (!codeLensForTest[0].command)
+					this.skip();
+
+				const runAction = codeLensForTest.find((cl) => cl.command!.title === "Run")!;
+				assert.equal(runAction.command!.command, "_dart.startWithoutDebuggingTestFromOutline");
+				assert.equal(runAction.command!.arguments![0].fullName, "Hello world test");
+				assert.equal(runAction.command!.arguments![0].isGroup, false);
+
+				const customEvents = await captureDebugSessionCustomEvents(async () => {
+					const didStart = await vs.commands.executeCommand(runAction.command!.command, ...(runAction.command!.arguments ?? [])); // eslint-disable-line @typescript-eslint/no-unsafe-argument
+					assert.ok(didStart);
+				});
+
+				// Ensure we got at least a "testDone" notification so we know the test run started correctly.
+				const testDoneNotification = customEvents.find(isTestDoneSuccessNotification);
+				assert.ok(testDoneNotification, JSON.stringify(customEvents.map((e: any) => e.body as unknown), undefined, 4));
+			});
+
+			it("can run test with multiline name from codelens", async function () {
+				const editor = await openFile(flutterTestMainFile);
+				await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(flutterTestMainFile), "Outline for main file");
+
+				const fileCodeLens = await getCodeLens(editor.document);
+				const testPos = positionOf(`test^Widgets('''multi`);
+
+				const codeLensForTest = fileCodeLens.filter((cl) => cl.range.start.line === testPos.line);
+				assert.equal(codeLensForTest.length, 2);
+
+				// If there's no command, skip the test. This happens very infrequently and appears to be a VS Code
+				// race condition. Rather than failing our test runs, skip.
+				// TODO: Remove this if https://github.com/microsoft/vscode/issues/79805 gets a reliable fix.
+				if (!codeLensForTest[0].command)
+					this.skip();
+
+				const runAction = codeLensForTest.find((cl) => cl.command!.title === "Run")!;
+				assert.equal(runAction.command!.command, "_dart.startWithoutDebuggingTestFromOutline");
+				assert.equal(runAction.command!.arguments![0].fullName, "multi\nline\ntest");
+				assert.equal(runAction.command!.arguments![0].isGroup, false);
+
+				const customEvents = await captureDebugSessionCustomEvents(async () => {
+					const didStart = await vs.commands.executeCommand(runAction.command!.command, ...(runAction.command!.arguments ?? [])); // eslint-disable-line @typescript-eslint/no-unsafe-argument
+					assert.ok(didStart);
+				});
+
+				// Ensure we got at least a "testDone" notification so we know the test run started correctly.
+				const testDoneNotification = customEvents.find(isTestDoneSuccessNotification);
+				assert.ok(testDoneNotification, JSON.stringify(customEvents.map((e: any) => e.body as unknown), undefined, 4));
+			});
+
+			it("can run skipped tests from codelens", async function () {
+				const editor = await openFile(flutterTestMainFile);
+				await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(flutterTestMainFile), "Outline for main file");
+
+				const fileCodeLens = await getCodeLens(editor.document);
+				const testPos = positionOf(`test^Widgets('Skipped test`);
+
+				const codeLensForTest = fileCodeLens.filter((cl) => cl.range.start.line === testPos.line);
+				assert.equal(codeLensForTest.length, 2);
+
+				// If there's no command, skip the test. This happens very infrequently and appears to be a VS Code
+				// race condition. Rather than failing our test runs, skip.
+				// TODO: Remove this if https://github.com/microsoft/vscode/issues/79805 gets a reliable fix.
+				if (!codeLensForTest[0].command)
+					this.skip();
+
+				const runAction = codeLensForTest.find((cl) => cl.command!.title === "Run")!;
+				assert.equal(runAction.command!.command, "_dart.startWithoutDebuggingTestFromOutline");
+				assert.equal(runAction.command!.arguments![0].fullName, "Skipped test");
+				assert.equal(runAction.command!.arguments![0].isGroup, false);
+
+				const customEvents = await captureDebugSessionCustomEvents(async () => {
+					const didStart = await vs.commands.executeCommand(runAction.command!.command, ...(runAction.command!.arguments ?? [])); // eslint-disable-line @typescript-eslint/no-unsafe-argument
+					assert.ok(didStart);
+				});
+
+				// Ensure we got at least a "testDone" notification so we know the test run started correctly.
+				const testDoneNotification = customEvents.find(isTestDoneSuccessNotification);
+				assert.ok(testDoneNotification, JSON.stringify(customEvents.map((e: any) => e.body as unknown), undefined, 4));
+
+				const testDone = testDoneNotification.body as TestDoneNotification;
+				assert.equal(testDone.skipped, false); // Test should have run.
+			});
+
+			it("can run a selection of tests across multiple files", async () => {
+				// Discover tests in these files.
+				await openFile(flutterTestSelective1File);
+				await openFile(flutterTestSelective2File);
+				await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(flutterTestSelective1File));
+				await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(flutterTestSelective2File));
+
+				const testItems: vs.TestItem[] = [];
+
+				// Pick multiple tests from multiple files to run.
+				const suite1Node = findSuiteNode(fsPath(flutterTestSelective1File));
+				testItems.push(suite1Node.children.get(`TEST:${fsPath(flutterTestSelective1File)}:pass one`)!);
+				testItems.push(suite1Node.children.get(`TEST:${fsPath(flutterTestSelective1File)}:pass two`)!);
+				const suite2Node = findSuiteNode(fsPath(flutterTestSelective2File));
+				testItems.push(suite2Node.children.get(`TEST:${fsPath(flutterTestSelective2File)}:fail one`)!);
+				testItems.push(suite2Node.children.get(`TEST:${fsPath(flutterTestSelective2File)}:fail two`)!);
+
+				const configs = await captureTestDebugConfigurations(() => new vs.TestRunRequest(testItems));
+				const launchText = configs.map((config) => [config.program, ...(config.args ?? []), ...(config.toolArgs ?? [])].join(" ")).join("\n");
+
+				// One launch per file, and each requested test is identified either by name or line.
+				assert.equal(configs.length, 2);
+				for (const item of testItems) {
+					assert.ok(launchText.includes(path.basename(fsPath(item.uri!))), launchText);
+					const selector = runByLine ? `?line=${item.range!.start.line + 1}` : item.label;
+					assert.ok(launchText.includes(selector), `Missing ${selector} in ${launchText}`);
+				}
+			});
+
+		});
+	}
+
+	describe("collects coverage", () => {
+		let addCoverageStub: SinonStub | undefined;
+
+		beforeEach(() => {
+			const controller = privateApi.testController!;
+			const createTestRunOriginal = controller.controller.createTestRun.bind(controller.controller);
+			const createTestRunStub = sb.stub(controller.controller, "createTestRun");
+			createTestRunStub.callsFake((request: vs.TestRunRequest) => {
+				const originalResult = createTestRunOriginal(request);
+				addCoverageStub = sb.stub(originalResult, "addCoverage").returns(null);
+				return originalResult;
+			});
+		});
+
+		it("for a basic test", async () => {
+			// Discover tests.
+			await openFile(flutterTestMainFile);
+			await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(flutterTestMainFile));
+			const controller = privateApi.testController!;
+
+			const suiteNode = findSuiteNode(fsPath(flutterTestMainFile));
+			const testRequest = new vs.TestRunRequest([suiteNode]);
+
+			await controller.runTests(false, true, testRequest, fakeCancellationToken);
+
+			assert(addCoverageStub?.calledOnce);
+			const coverage = addCoverageStub.firstCall.args[0] as DartFileCoverage;
+			assert.equal(fsPath(coverage.uri), fsPath(flutterHelloWorldMainFile)); // App file, not test file.
+			assert.ok(coverage.statementCoverage.covered > 0);
+			assert.ok(coverage.statementCoverage.total > 0);
+		});
+
+		it("and includes dependencies", async () => {
+			// Discover tests.
+			await openFile(flutterHelloWorldExampleTestFile);
+			await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(flutterHelloWorldExampleTestFile));
+
+			const controller = privateApi.testController!;
+			const suiteNode = findSuiteNode(fsPath(flutterHelloWorldExampleTestFile));
+			const testRequest = new vs.TestRunRequest([suiteNode]);
+
+			await controller.runTests(false, true, testRequest, fakeCancellationToken);
+
+			assert(addCoverageStub?.called);
+			const coverageFiles = addCoverageStub.getCalls().map((call) => fsPath((call.args[0] as DartFileCoverage).uri));
+			assert.deepStrictEqual(coverageFiles, [fsPath(flutterHelloWorldExamplePrinterFile), fsPath(flutterHelloWorldPrinterFile)]);
+		});
+
+		it("and excludes configured paths", async () => {
+			await setConfigForTest("dart", "coverageExcludePatterns", ["**/example/**"]);
+
+			// Discover tests.
+			await openFile(flutterHelloWorldExampleTestFile);
+			await waitForResult(() => !!privateApi.fileTracker.getOutlineFor(flutterHelloWorldExampleTestFile));
+
+			const controller = privateApi.testController!;
+			const suiteNode = findSuiteNode(fsPath(flutterHelloWorldExampleTestFile));
+			const testRequest = new vs.TestRunRequest([suiteNode]);
+
+			await controller.runTests(false, true, testRequest, fakeCancellationToken);
+
+			assert(addCoverageStub?.called);
+			const coverageFiles = addCoverageStub.getCalls().map((call) => fsPath((call.args[0] as DartFileCoverage).uri));
+			assert.deepStrictEqual(coverageFiles, [fsPath(flutterHelloWorldPrinterFile)]);
+		});
+
+		it("uses correct regex for --coverage-package", () => {
+			const config = getLaunchConfig(
+				false, // noDebug
+				true, // includeCoverage
+				true, // isFlutter
+				fsPath(flutterHelloWorldExampleTestFile),
+				undefined, // testSelection
+				false, // shouldRunTestByLine
+				undefined, // runSkipped
+				undefined, // template
+				undefined, // dartTestCapabilities, not used for Flutter
+				["flutter_hello_world", "flutter_hello_world_example"], // workspacePackageNames
+			);
+
+			const toolArgs = (config as { toolArgs?: string[] }).toolArgs ?? [];
+			const coveragePackages: string[] = [];
+			for (let i = 0; i < toolArgs.length - 1; i++) {
+				if (toolArgs[i] === "--coverage-package")
+					coveragePackages.push(toolArgs[i + 1]);
+			}
+
+			assert.deepStrictEqual(
+				coveragePackages,
+				[`^flutter_hello_world$`, `^flutter_hello_world_example$`],
+			);
+		});
 	});
 });
 

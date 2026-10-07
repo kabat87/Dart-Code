@@ -1,6 +1,7 @@
 import { strict as assert } from "assert";
 import * as vs from "vscode";
-import { activate, currentDoc, everythingFile, getPackages, positionOf, rangeOf } from "../../helpers";
+import { versionIsAtLeast } from "../../../shared/utils";
+import { activate, currentDoc, everythingFile, getPackages, positionOf, privateApi, rangeOf } from "../../helpers";
 
 describe("dart_hover_provider", () => {
 
@@ -46,14 +47,24 @@ describe("dart_hover_provider", () => {
 		return hovers[0];
 	}
 
-	function getExpectedSignature(method: string, returnType: string): string {
-		return `${returnType} ${method.startsWith("(") ? `Function${method}` : method}`;
+	function getExpectedSignature(method: string, returnType: string | undefined): string {
+		if (privateApi.dartCapabilities.omitsVoidForSetters && method.startsWith("set ") && returnType === "void")
+			return method;
+		else if (!returnType)
+			return `${method.startsWith("(") ? `Function${method}` : method}`;
+		else
+			return `${returnType} ${method.startsWith("(") ? `Function${method}` : method}`;
 	}
 
-	function getExpectedDoc(packagePath: string, doc: string): string {
-		return packagePath
-			? `*${packagePath}*\n\n${doc}`
-			: doc;
+	function getExpectedDoc(doc: string | undefined, packagePath: string, className?: string): string {
+		doc ??= "";
+		const em = versionIsAtLeast(privateApi.dartCapabilities.version, "3.12.0-0") ? "*" : "_";
+		return className
+			? `Declared in \`${className}\` in ${em}${packagePath}${em}.\n\n${doc}`.trim()
+			: packagePath
+				? `Declared in ${em}${packagePath}${em}.\n\n${doc}`.trim()
+				: doc;
+
 	}
 
 	it("does not return hovers for blank areas of the document", async () => {
@@ -64,7 +75,7 @@ describe("dart_hover_provider", () => {
 	it("returns expected information for a class", async () => {
 		const hover = await getHoverAt("class My^TestClass");
 		assert.equal(hover.displayText, "class MyTestClass");
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my class."));
+		assert.equal(hover.documentation, getExpectedDoc("This is my class.", "package:hello_world/everything.dart"));
 		assert.deepStrictEqual(hover.range, rangeOf("class |MyTestClass|"));
 	});
 
@@ -72,66 +83,62 @@ describe("dart_hover_provider", () => {
 		const hover = await getHoverAt("num? my^TestNumField");
 		assert.equal(hover.displayText, "num? myTestNumField");
 		if (hover.documentation?.includes("Type:"))
-			assert.equal(hover.documentation, "Type: `num?`\n" + getExpectedDoc("package:hello_world/everything.dart", "This is my num field."));
+			assert.equal(hover.documentation, `Type: \`num?\`\n\n` + getExpectedDoc("This is my num field.", "package:hello_world/everything.dart", "MyTestClass"));
 		else
-			assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my num field."));
+			assert.equal(hover.documentation, getExpectedDoc("This is my num field.", "package:hello_world/everything.dart", "MyTestClass"));
 		assert.deepStrictEqual(hover.range, rangeOf("num? |myTestNumField|"));
 	});
 
 	it("returns expected information for a getter", async () => {
 		const hover = await getHoverAt("get my^TestNumGetter");
 		assert.equal(hover.displayText, getExpectedSignature("get myTestNumGetter", "num"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my num getter."));
+		assert.equal(hover.documentation, getExpectedDoc("This is my num getter.", "package:hello_world/everything.dart", "MyTestClass"));
 		assert.deepStrictEqual(hover.range, rangeOf("get |myTestNumGetter|"));
 	});
 
-	// Skipped due to https://github.com/dart-lang/sdk/issues/32703
-	it.skip("returns expected information for a setter", async () => {
+	it("returns expected information for a setter", async () => {
 		const hover = await getHoverAt("my^TestNumSetter(");
 		assert.equal(hover.displayText, getExpectedSignature("set myTestNumSetter(num value)", "void"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my num setter."));
+		assert.equal(hover.documentation, getExpectedDoc("This is my num setter.", "package:hello_world/everything.dart", "MyTestClass"));
 		assert.deepStrictEqual(hover.range, rangeOf("|myTestNumSetter|"));
 	});
 
 	it("returns expected information for a constructor", async () => {
 		const hover = await getHoverAt("My^TestClass()");
-		assert.equal(hover.displayText, getExpectedSignature("MyTestClass()", "MyTestClass"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my class constructor."));
+		const className = privateApi.dartCapabilities.omitsClassNameForConstructors ? undefined : "MyTestClass";
+		assert.equal(hover.displayText, getExpectedSignature("MyTestClass()", className));
+		assert.equal(hover.documentation, getExpectedDoc("This is my class constructor.", "package:hello_world/everything.dart", "MyTestClass"));
 		assert.deepStrictEqual(hover.range, rangeOf("|MyTestClass|()"));
 	});
 
 	it("returns expected information for a named constructor", async () => {
-		// Note: Server seeems to return two different ranges for
-		// MyTestClass and named.
-		let hover = await getHoverAt("My^TestClass.myTestNamed()");
-		assert.equal(hover.displayText, getExpectedSignature("MyTestClass.myTestNamed()", "MyTestClass"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my class named constructor."));
-		assert.deepStrictEqual(hover.range, rangeOf("|MyTestClass|.myTestNamed()"));
-		// Check second part... ideally this would be rolled into above.
-		hover = await getHoverAt("MyTestClass.myTestN^amed()");
-		assert.equal(hover.displayText, getExpectedSignature("MyTestClass.myTestNamed()", "MyTestClass"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my class named constructor."));
-		assert.deepStrictEqual(hover.range, rangeOf("MyTestClass.|myTestNamed|()"));
+		const className = privateApi.dartCapabilities.omitsClassNameForConstructors ? undefined : "MyTestClass";
+
+		for (const hover of [await getHoverAt("My^TestClass.myTestNamed()"), await getHoverAt("MyTestClass.myTestN^amed()")]) {
+			assert.equal(hover.displayText, getExpectedSignature("MyTestClass.myTestNamed()", className));
+			assert.equal(hover.documentation, getExpectedDoc("This is my class named constructor.", "package:hello_world/everything.dart", "MyTestClass"));
+			assert.deepStrictEqual(hover.range, rangeOf("|MyTestClass.myTestNamed|()"));
+		}
 	});
 
 	it("returns expected information for a void returning method", async () => {
 		const hover = await getHoverAt("my^TestVoidReturningMethod()");
 		assert.equal(hover.displayText, getExpectedSignature("myTestVoidReturningMethod()", "void"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my void returning method."));
+		assert.equal(hover.documentation, getExpectedDoc("This is my void returning method.", "package:hello_world/everything.dart", "MyTestClass"));
 		assert.deepStrictEqual(hover.range, rangeOf("|myTestVoidReturningMethod|()"));
 	});
 
 	it("returns expected information for a string returning method", async () => {
 		const hover = await getHoverAt("my^TestStringReturningMethod()");
 		assert.equal(hover.displayText, getExpectedSignature("myTestStringReturningMethod()", "String"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my string returning method."));
+		assert.equal(hover.documentation, getExpectedDoc("This is my string returning method.", "package:hello_world/everything.dart", "MyTestClass"));
 		assert.deepStrictEqual(hover.range, rangeOf("|myTestStringReturningMethod|()"));
 	});
 
 	it("returns expected information for a method taking a string", async () => {
 		const hover = await getHoverAt("me^thodTakingString(");
 		assert.equal(hover.displayText, getExpectedSignature("methodTakingString(String a)", "void"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my method taking a string."));
+		assert.equal(hover.documentation, getExpectedDoc("This is my method taking a string.", "package:hello_world/everything.dart", "MyTestClass"));
 		assert.deepStrictEqual(hover.range, rangeOf("|methodTakingString|"));
 	});
 
@@ -139,8 +146,10 @@ describe("dart_hover_provider", () => {
 		const hover = await getHoverAt("methodTakingString(String ^a");
 		assert.equal(hover.displayText, "String a");
 		// Method args can't have their own docs so return the methods dartdoc.
-		if (hover.documentation?.includes("Type:"))
-			assert.equal(hover.documentation, "Type: `String`\nThis is my method taking a string.");
+		if (hover.documentation?.includes("Declared in"))
+			assert.equal(hover.documentation, `Type: \`String\`\n\nDeclared in \`methodTakingString\` in \`MyTestClass\` in *package:hello_world/everything.dart*.\n\nThis is my method taking a string.`);
+		else if (hover.documentation?.includes("Type:"))
+			assert.equal(hover.documentation, `Type: \`String\`\n\nThis is my method taking a string.`);
 		else
 			assert.equal(hover.documentation, "This is my method taking a string.");
 		assert.deepStrictEqual(hover.range, rangeOf("methodTakingString(String |a|)"));
@@ -149,21 +158,27 @@ describe("dart_hover_provider", () => {
 	it("returns expected information for a method taking a function", async () => {
 		const hover = await getHoverAt("me^thodTakingFunction(");
 		assert.equal(hover.displayText, getExpectedSignature(`methodTakingFunction(${getExpectedSignature("(String)", "void")} myFunc)`, "void"));
-		assert.equal(hover.documentation, getExpectedDoc("package:hello_world/everything.dart", "This is my method taking a function."));
+		assert.equal(hover.documentation, getExpectedDoc("This is my method taking a function.", "package:hello_world/everything.dart", "MyTestClass"));
 		assert.deepStrictEqual(hover.range, rangeOf("|methodTakingFunction|("));
 	});
 
 	it("returns expected information for a type from another package", async () => {
 		const hover = await getHoverAt("http.Cli^ent");
-		assert.equal(hover.displayText, "abstract class Client");
-		assert.ok(hover.documentation!.startsWith("*package:http/src/client.dart*"));
+		if (hover.displayText.includes("interface class"))
+			assert.equal(hover.displayText, "abstract interface class Client");
+		else
+			assert.equal(hover.displayText, "abstract class Client");
+		assert.ok(hover.documentation!.startsWith(getExpectedDoc(undefined, "package:http/src/client.dart")));
 		assert.deepStrictEqual(hover.range, rangeOf("http.|Client|"));
 	});
 
 	it("returns expected information for a type from an SDK library", async () => {
 		const hover = await getHoverAt("Fut^ure<String>");
-		assert.equal(hover.displayText, "abstract class Future<T>");
-		assert.ok(hover.documentation!.startsWith("*dart:async*"));
+		if (hover.displayText.includes("interface class"))
+			assert.equal(hover.displayText, "abstract interface class Future<T>");
+		else
+			assert.equal(hover.displayText, "abstract class Future<T>");
+		assert.ok(hover.documentation!.startsWith(getExpectedDoc(undefined, "dart:async")));
 		assert.deepStrictEqual(hover.range, rangeOf("|Future|<String>"));
 	});
 

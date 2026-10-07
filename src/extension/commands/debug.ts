@@ -2,25 +2,37 @@ import * as path from "path";
 import * as vs from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
 import { FlutterCapabilities } from "../../shared/capabilities/flutter";
-import { debugLaunchProgressId, debugTerminatingProgressId, devToolsPages, doNotAskAgainAction, isInFlutterDebugModeDebugSessionContext, isInFlutterProfileModeDebugSessionContext, isInFlutterReleaseModeDebugSessionContext, widgetInspectorPage } from "../../shared/constants";
-import { DebuggerType, DebugOption, debugOptionNames, LogSeverity, VmServiceExtension } from "../../shared/enums";
-import { DartWorkspaceContext, DevToolsPage, IAmDisposable, IFlutterDaemon, Logger, LogMessage, WidgetErrorInspectData } from "../../shared/interfaces";
-import { disposeAll, PromiseCompleter } from "../../shared/utils";
-import { fsPath, isFlutterProjectFolder } from "../../shared/utils/fs";
+import { CommandSource, debugLaunchProgressId, debugTerminatingProgressId, devToolsPages, doNotAskAgainAction, doNotShowAgainAction, moreInfoAction, widgetInspectorPage } from "../../shared/constants";
+import { isInDartDebugSessionContext, isInFlutterDebugModeDebugSessionContext, isInFlutterProfileModeDebugSessionContext, isInFlutterReleaseModeDebugSessionContext } from "../../shared/constants.contexts";
+import { DebugOption, DebuggerType, LogCategory, LogSeverity, VmService, VmServiceExtension, debugOptionNames } from "../../shared/enums";
+import { DartWorkspaceContext, DevToolsDeepLinkData, IAmDisposable, LegacyWidgetErrorInspectData, LogMessage, Logger } from "../../shared/interfaces";
+import { PromiseCompleter, disposeAll } from "../../shared/utils";
+import { fsPath, isFlutterProjectFolder, isWithinPath } from "../../shared/utils/fs";
+import { ANALYSIS_FILTERS } from "../../shared/vscode/constants";
+import { getLaunchConfigDefaultTemplate } from "../../shared/vscode/debugger";
+import { DartDebugSessionInformation, ProgressMessage } from "../../shared/vscode/interfaces";
+import { locateBestProjectRoot } from "../../shared/vscode/project";
+import { getLanguageStatusItem } from "../../shared/vscode/status_bar";
 import { showDevToolsNotificationIfAppropriate } from "../../shared/vscode/user_prompts";
 import { envUtils } from "../../shared/vscode/utils";
 import { Context } from "../../shared/vscode/workspace";
-import { Analytics } from "../analytics";
+import { FileTracker } from "../analysis/file_tracker";
 import { config } from "../config";
-import { timeDilationNormal, timeDilationSlow, VmServiceExtensions } from "../flutter/vm_service_extensions";
-import { locateBestProjectRoot } from "../project";
-import { PubGlobal } from "../pub/global";
-import { DevToolsManager } from "../sdk/dev_tools/manager";
+import { VmServiceExtensions, timeDilationNormal, timeDilationSlow } from "../flutter/vm_service_extensions";
+import { DevToolsLocation, DevToolsManager } from "../sdk/dev_tools/manager";
 import { isDartFile, isValidEntryFile } from "../utils";
-import { runToolProcess } from "../utils/processes";
-import { DartDebugSessionInformation, ProgressMessage } from "../utils/vscode/debug";
+import { LoggingCommands } from "./logging";
 
 export const debugSessions: DartDebugSessionInformation[] = [];
+const debugSessionsChangedEmitter = new vs.EventEmitter<void>();
+export const debugSessionsChanged = debugSessionsChangedEmitter.event;
+const debugSessionStartedEmitter = new vs.EventEmitter<DartDebugSessionInformation>();
+export const debugSessionStarted = debugSessionStartedEmitter.event;
+const debugSessionStoppedEmitter = new vs.EventEmitter<DartDebugSessionInformation>();
+export const debugSessionStopped = debugSessionStoppedEmitter.event;
+const debugSessionChangedEmitter = new vs.EventEmitter<DartDebugSessionInformation>();
+export const debugSessionChanged = debugSessionChangedEmitter.event;
+
 const CURRENT_FILE_RUNNABLE = "dart-code:currentFileIsRunnable";
 
 // Workaround for https://github.com/microsoft/vscode/issues/100115
@@ -30,8 +42,6 @@ const dynamicDebugSessionName = "Dart ";
 // will keep any events that arrive before their session "started" and then
 // replace them when the start event comes through.
 let pendingCustomEvents: vs.DebugSessionCustomEvent[] = [];
-
-let hasPromptedAboutDebugSettings = false;
 
 export let isInFlutterDebugModeDebugSession = false;
 export let isInFlutterProfileModeDebugSession = false;
@@ -47,10 +57,11 @@ export class LastTestDebugSession {
 }
 
 export class DebugCommands implements IAmDisposable {
-	protected readonly disposables: vs.Disposable[] = [];
+	protected readonly disposables: IAmDisposable[] = [];
 	private debugOptions = vs.window.createStatusBarItem("dartStatusDebugOptions", vs.StatusBarAlignment.Left, 0);
-	private currentDebugOption = DebugOption.MyCode;
+	public currentDebugOption = DebugOption.MyCode;
 	private debugMetrics = vs.window.createStatusBarItem("dartStatusDebugMetrics", vs.StatusBarAlignment.Right, 0);
+	private readonly debugSessionsStatusItem = getLanguageStatusItem("dart.debugSessions", ANALYSIS_FILTERS);
 	private onWillHotReloadEmitter = new vs.EventEmitter<void>();
 	public readonly onWillHotReload = this.onWillHotReloadEmitter.event;
 	private onWillHotRestartEmitter = new vs.EventEmitter<void>();
@@ -58,25 +69,50 @@ export class DebugCommands implements IAmDisposable {
 	private onDebugSessionVmServiceAvailableEmitter = new vs.EventEmitter<DartDebugSessionInformation>();
 	public readonly onDebugSessionVmServiceAvailable = this.onDebugSessionVmServiceAvailableEmitter.event;
 	public readonly vmServices: VmServiceExtensions;
-	public readonly devTools: DevToolsManager;
 	private suppressFlutterWidgetErrors = false;
 
-	constructor(private readonly logger: Logger, private context: Context, workspaceContext: DartWorkspaceContext, readonly dartCapabilities: DartCapabilities, readonly flutterCapabilities: FlutterCapabilities, private readonly analytics: Analytics, pubGlobal: PubGlobal, flutterDaemon: IFlutterDaemon | undefined) {
-		this.vmServices = new VmServiceExtensions(logger, this);
-		this.devTools = new DevToolsManager(logger, workspaceContext, this, analytics, pubGlobal, dartCapabilities, flutterCapabilities, flutterDaemon);
-		this.disposables.push(this.devTools);
+	public isInspectingWidget = false;
+	private autoCancelNextInspectWidgetMode = false;
+
+	public hasPromptedAboutDebugSettings = false;
+
+	/// The ID of the currently-shown hot reload progress indicator.
+	private currentHotReloadProgressId: string | undefined;
+
+	/// The ID of the currently-shown hot restart progress indicator.
+	private currentHotRestartProgressId: string | undefined;
+
+	constructor(
+		private readonly logger: Logger,
+		private readonly fileTracker: FileTracker,
+		private context: Context,
+		private workspaceContext: DartWorkspaceContext,
+		readonly dartCapabilities: DartCapabilities,
+		readonly flutterCapabilities: FlutterCapabilities,
+		private readonly devTools: DevToolsManager,
+		private readonly logging: LoggingCommands,
+	) {
+		this.vmServices = new VmServiceExtensions(logger, this, workspaceContext, flutterCapabilities);
+		this.devTools.debugCommands = this;
 		this.debugOptions.name = "Dart Debug Options";
 		this.disposables.push(this.debugOptions);
 		this.debugMetrics.name = "Dart Debug Metrics";
 		this.disposables.push(this.debugMetrics);
+		this.debugSessionsStatusItem.name = "Dart Debug Sessions";
+		this.updateDebugSessionsStatus();
 
 		this.disposables.push(vs.debug.onDidChangeBreakpoints((e) => this.handleBreakpointChange(e)));
 		this.disposables.push(vs.debug.onDidStartDebugSession((s) => this.handleDebugSessionStart(s)));
 		this.disposables.push(vs.debug.onDidReceiveDebugSessionCustomEvent((e) => this.handleDebugSessionCustomEvent(e)));
 		this.disposables.push(vs.debug.onDidTerminateDebugSession((s) => this.handleDebugSessionEnd(s)));
-		this.disposables.push(vs.window.onDidChangeActiveTextEditor((e) => this.updateEditorContexts(e)));
+		this.disposables.push(this.logging.onCaptureLogs((isCapturing) => this.setSendLogsToClient(isCapturing)));
+
+		// Handle enabling Run/Debug buttons for the file if an entry point or have a main() method.
+		if (this.fileTracker)
+			this.disposables.push(this.fileTracker.onOutline(() => this.updateRunnableContexts()));
+		this.disposables.push(vs.window.onDidChangeActiveTextEditor(() => this.updateRunnableContexts()));
 		// Run for current open editor.
-		this.updateEditorContexts(vs.window.activeTextEditor);
+		this.updateRunnableContexts();
 
 		this.disposables.push(vs.commands.registerCommand("flutter.overridePlatform", () => this.vmServices.overridePlatform()));
 		this.disposables.push(vs.commands.registerCommand("flutter.toggleDebugPainting", () => this.vmServices.toggle(VmServiceExtension.DebugPaint)));
@@ -84,87 +120,198 @@ export class DebugCommands implements IAmDisposable {
 		this.disposables.push(vs.commands.registerCommand("flutter.toggleBrightness", () => this.vmServices.toggle(VmServiceExtension.BrightnessOverride, "Brightness.dark", "Brightness.light")));
 		this.disposables.push(vs.commands.registerCommand("flutter.toggleRepaintRainbow", () => this.vmServices.toggle(VmServiceExtension.RepaintRainbow)));
 		this.disposables.push(vs.commands.registerCommand("flutter.toggleDebugModeBanner", () => this.vmServices.toggle(VmServiceExtension.DebugBanner)));
-		this.disposables.push(vs.commands.registerCommand("flutter.toggleCheckElevations", () => this.vmServices.toggle(VmServiceExtension.CheckElevations)));
 		this.disposables.push(vs.commands.registerCommand("flutter.togglePaintBaselines", () => this.vmServices.toggle(VmServiceExtension.PaintBaselines)));
 		this.disposables.push(vs.commands.registerCommand("flutter.toggleSlowAnimations", () => this.vmServices.toggle(VmServiceExtension.SlowAnimations, timeDilationNormal, timeDilationSlow)));
-		this.disposables.push(vs.commands.registerCommand("flutter.inspectWidget", () => this.vmServices.toggle(VmServiceExtension.InspectorSelectMode, true, true)));
-		this.disposables.push(vs.commands.registerCommand("flutter.cancelInspectWidget", () => this.vmServices.toggle(VmServiceExtension.InspectorSelectMode, false, false)));
+		this.disposables.push(vs.commands.registerCommand("flutter.inspectWidget", () => {
+			this.autoCancelNextInspectWidgetMode = false;
+			void this.vmServices.toggle(VmServiceExtension.InspectorSelectMode, true, true);
+		}));
+		this.disposables.push(vs.commands.registerCommand("flutter.inspectWidget.autoCancel", () => {
+			this.autoCancelNextInspectWidgetMode = true;
+			void this.vmServices.toggle(VmServiceExtension.InspectorSelectMode, true, true);
+		}));
+		this.disposables.push(vs.commands.registerCommand("flutter.cancelInspectWidget", () => {
+			this.autoCancelNextInspectWidgetMode = false;
+			void this.vmServices.toggle(VmServiceExtension.InspectorSelectMode, false, false);
+		}));
 
 		this.disposables.push(vs.commands.registerCommand("dart.openObservatory", async () => {
 			const session = await this.getDebugSession();
 			if (session && !session.session.configuration.noDebug && session.observatoryUri) {
 				await envUtils.openInBrowser(session.observatoryUri);
-				analytics.logDebuggerOpenObservatory();
 			} else if (session) {
 				logger.warn("Cannot start Observatory for session without debug/observatoryUri");
 			}
 		}));
-		this.disposables.push(vs.commands.registerCommand("_dart.openDevTools.touchBar", () => vs.commands.executeCommand("dart.openDevTools")));
+		this.disposables.push(vs.commands.registerCommand("dart.copyVmServiceUri", async () => {
+			const options: Array<vs.QuickPickItem & { session: DartDebugSessionInformation, vmServiceUri: string }> = [];
+
+			function addOption(s: DartDebugSessionInformation, vmServiceUri: string, vmServiceKindDescription: string | undefined) {
+				const description = [
+					s.session.workspaceFolder?.name,
+					s.session.configuration.deviceName,
+					`Started ${s.sessionStart.toLocaleTimeString()}`,
+				].filter((s) => s).join(", ");
+				options.push(
+					{
+						// TODO: add both vm service uri and description here somewhere
+						description,
+						detail: vmServiceKindDescription ? `${vmServiceUri} (${vmServiceKindDescription})` : vmServiceUri,
+						label: s.session.name,
+						session: s,
+						vmServiceUri,
+					}
+				);
+			}
+
+			for (const debugSession of debugSessions) {
+				const vmServiceUri = debugSession.vmServiceUri;
+				let exposedVmServiceUri = debugSession.clientVmServiceUri ?? (vmServiceUri ? await envUtils.exposeUrl(vmServiceUri, this.logger) : undefined);
+				if (exposedVmServiceUri === vmServiceUri)
+					exposedVmServiceUri = undefined;
+
+				if (vmServiceUri)
+					addOption(debugSession, vmServiceUri, exposedVmServiceUri ? "Local URI on the remote machine" : undefined);
+				if (exposedVmServiceUri)
+					addOption(debugSession, exposedVmServiceUri, "The URI exposed to the client");
+			}
+
+			if (options.length === 0) {
+				await vs.window.showInformationMessage(
+					debugSessions.length === 0
+						? "No Dart/Flutter debug session available"
+						: "No running Dart/Flutter debug sessions have VM Service connections available"
+				);
+				return;
+			}
+
+			const selectedOption = options.length === 1 ? options[0] : await vs.window.showQuickPick(options, { placeHolder: "Which debug session / VM Service URI?" });
+			if (!selectedOption)
+				return;
+
+			await vs.env.clipboard.writeText(selectedOption.vmServiceUri);
+		}));
+		this.disposables.push(vs.commands.registerCommand("dart.openDevTools.external", () => vs.commands.executeCommand("dart.openDevTools", { commandSource: CommandSource.commandPalette, location: "external" as DevToolsLocation })));
+		this.disposables.push(vs.commands.registerCommand("_dart.openDevTools.touchBar", () => vs.commands.executeCommand("dart.openDevTools", { commandSource: CommandSource.touchbar })));
 		devToolsPages.forEach((page) => {
-			this.disposables.push(vs.commands.registerCommand(page.commandId, async (options?: { debugSessionId?: string, triggeredAutomatically?: boolean }): Promise<{ url: string, dispose: () => void } | undefined> => {
-				options = Object.assign({}, options, { page });
+			void vs.commands.executeCommand("setContext", `dart-code:devToolsSupports${page.commandSuffix}`, this.devTools.isPageAvailable(true, page));
+			this.disposables.push(vs.commands.registerCommand(`dart.openDevTools${page.commandSuffix}`, async (options?: { debugSessionId?: string, triggeredAutomatically?: boolean }): Promise<{ url: string, dispose: () => void } | undefined> => {
+				options = Object.assign({}, options, { pageId: page.id });
 				return vs.commands.executeCommand("dart.openDevTools", options);
 			}));
 		});
-		this.disposables.push(vs.commands.registerCommand("flutter.openDevTools", async (options?: { debugSessionId?: string, triggeredAutomatically?: boolean, page?: DevToolsPage }): Promise<{ url: string, dispose: () => void } | undefined> =>
+		this.disposables.push(vs.commands.registerCommand("flutter.openDevTools.sidebar", () => vs.commands.executeCommand("flutter.openDevTools", { commandSource: CommandSource.sidebarTitle })));
+		this.disposables.push(vs.commands.registerCommand("flutter.openDevTools", async (options?: { debugSessionId?: string, triggeredAutomatically?: boolean, pageId?: string, commandSource?: string }): Promise<{ url: string, dispose: () => void } | undefined> =>
 			vs.commands.executeCommand("dart.openDevTools", options)));
-		this.disposables.push(vs.commands.registerCommand("dart.openDevTools", async (options?: { debugSessionId?: string, triggeredAutomatically?: boolean, page?: DevToolsPage }): Promise<{ url: string, dispose: () => void } | undefined> => {
-			if (!debugSessions.length)
-				return this.devTools.spawnForNoSession();
+		this.disposables.push(vs.commands.registerCommand("dart.openDevTools", async (options?: { debugSessionId?: string, triggeredAutomatically?: boolean, pageId?: string, location?: DevToolsLocation, commandSource?: string, requiresDebugSession?: boolean, prefersDebugSession?: boolean }): Promise<{ url: string, dispose: () => void } | undefined> => {
+			const commandSource = options?.commandSource ?? CommandSource.commandPalette;
+			const pageId = options?.pageId;
+			const location = options?.location;
+			const triggeredAutomatically = options?.triggeredAutomatically;
+			let requiresDebugSession = options?.requiresDebugSession;
+			let prefersDebugSession = options?.prefersDebugSession;
 
-			const session = options && options.debugSessionId
-				? debugSessions.find((s) => s.session.id === options.debugSessionId)
-				: await this.getDebugSession();
-			if (!session)
-				return; // User cancelled or specified session was gone
+			// Check whether we'll need a Debug Session to open this page.
+			// If we weren't given an explicit `requiresDebugSession` then require it only if we have a page ID
+			// _and_ we are not known to be a static page (that is, we're a page we don't recognise or a page
+			// we know to _not_ be static).
+			// Ideally we'll never fall into this, because the call will always have a requiresDebugSession
+			const page = devToolsPages.find((p) => p.id === pageId);
+			const isKnownStaticPage = page?.isStaticTool;
+			requiresDebugSession = requiresDebugSession ?? (!!pageId && !isKnownStaticPage);
+
+			// Also, _prefer_ a debug session if we haven't been told but we know we're not a static page.
+			prefersDebugSession = prefersDebugSession ?? !isKnownStaticPage;
+
+			// As a workaround for https://github.com/Dart-Code/Dart-Code/issues/5208, if this is
+			// a request to launch an extension and neither flag was set, then rather than defaulting
+			// to `requires` (and not `prefers`), fall back to just prefering.
+			if (
+				pageId && pageId.endsWith("_ext")
+				&& options?.requiresDebugSession === undefined
+				&& options?.prefersDebugSession === undefined
+				&& requiresDebugSession
+			) {
+				requiresDebugSession = false;
+				prefersDebugSession = true;
+			}
+
+			let session: DartDebugSessionInformation | undefined;
+			if (requiresDebugSession || (prefersDebugSession && debugSessions.length)) {
+				session = options?.debugSessionId
+					? debugSessions.find((s) => s.session.id === options.debugSessionId)
+					: await this.getDebugSession();
+				if (!session)
+					return; // User cancelled or specified session was gone
+			}
 
 			// Only show a notification if we were not triggered automatically.
-			const notify = !options || options.triggeredAutomatically !== true;
-			const page = options?.page;
+			const notify = !options || triggeredAutomatically !== true;
 
-			if (session.vmServiceUri) {
-				return this.devTools.spawnForSession(session as DartDebugSessionInformation & { vmServiceUri: string }, { notify, page });
+			if (!session || session?.vmServiceUri) {
+				return this.devTools.spawn(session as DartDebugSessionInformation & { vmServiceUri: string }, { notify, pageId, commandSource, location, triggeredAutomatically }, true);
 			} else if (session.session.configuration.noDebug) {
-				vs.window.showInformationMessage("You must start your app with debugging in order to use DevTools.");
+				void vs.window.showInformationMessage("You must start your app with debugging in order to use DevTools.");
+			} else if (session.configuration.args?.includes("--wasm") || session.configuration.toolArgs?.includes("--wasm")) {
+				void vs.window.showInformationMessage(`DevTools is not available for an app built with Wasm.`);
+			} else if (session.flutterMode && session.flutterDeviceId) {
+				void vs.window.showInformationMessage(`DevTools is not available for an app running in ${session.flutterMode} mode on device '${session.flutterDeviceId}'.`);
+			} else if (session.hasStarted) {
+				void vs.window.showInformationMessage("DevTools is not available for an app running in this mode.");
 			} else {
-				vs.window.showInformationMessage("This debug session is not ready yet or does not support DevTools.");
+				void vs.window.showInformationMessage("This debug session is not ready yet.");
 			}
 		}));
 
 		// Misc custom debug commands.
-		this.disposables.push(vs.commands.registerCommand("_dart.hotReload.touchBar", (args: any) => vs.commands.executeCommand("dart.hotReload", args)));
+		this.disposables.push(vs.commands.registerCommand("_dart.hotReload.touchBar", (args: any) => vs.commands.executeCommand("_dart.hotReload.withSave", args)));
 		this.disposables.push(vs.commands.registerCommand("flutter.hotReload", (args: any) => vs.commands.executeCommand("dart.hotReload", args)));
+		this.disposables.push(vs.commands.registerCommand("_dart.hotReload.withSave", async () => {
+			try {
+				const hasDirtyFiles = !!vs.workspace.textDocuments.find((td) => td.isDirty);
+				if (hasDirtyFiles) {
+					// Trigger save, but don't wait more than 100ms because if the user has configured codeActionsOnSave this might
+					// take a while. A request for a better API is here:
+					//   https://github.com/microsoft/vscode/issues/191639
+					await Promise.race([
+						vs.workspace.saveAll(false),
+						new Promise((resolve) => setTimeout(resolve, 100)),
+					]);
+				}
+			} finally {
+				await vs.commands.executeCommand("dart.hotReload");
+			}
+		}));
 		this.disposables.push(vs.commands.registerCommand("dart.hotReload", async (args?: any) => {
 			if (!debugSessions.length)
 				return;
 			const onlyDart = !!args?.onlyDart;
 			const onlyFlutter = !!args?.onlyFlutter;
-			if (!!workspaceContext.config?.flutterSyncScript && !onlyDart) {
-				await runToolProcess(logger, workspaceContext.sdks.flutter, workspaceContext.config.flutterSyncScript, []);
-			}
+
 			this.onWillHotReloadEmitter.fire();
 			await Promise.all(debugSessions.map(async (s) => {
 				const shouldReload = onlyDart
 					? (s.debuggerType === DebuggerType.Dart || s.debuggerType === DebuggerType.Web)
 					: onlyFlutter
-						? (s.debuggerType === DebuggerType.Flutter)
+						// When performing auto-hot-reloads for Flutter apps, only do so
+						// if the app has finished initializing.
+						? (s.debuggerType === DebuggerType.Flutter && s.hasStarted)
 						: true;
 				if (shouldReload)
 					await s.session.customRequest("hotReload", args);
 			}));
-			analytics.logDebuggerHotReload();
 		}));
 		this.disposables.push(vs.commands.registerCommand("flutter.hotRestart", async (args?: any) => {
 			if (!debugSessions.length)
 				return;
-			if (!!workspaceContext.config?.flutterSyncScript) {
-				await runToolProcess(logger, workspaceContext.sdks.flutter, workspaceContext.config.flutterSyncScript, []);
-			}
 			this.onWillHotRestartEmitter.fire();
 			await Promise.all(debugSessions.map((s) => s.session.customRequest("hotRestart", args)));
-			analytics.logDebuggerRestart();
 		}));
-		this.disposables.push(vs.commands.registerCommand("dart.startDebugging", (resource: vs.Uri, launchTemplate: any | undefined) => {
+		this.disposables.push(vs.commands.registerCommand("dart.startDebugging", async (arg: vs.Uri | { resource: vs.Uri, launchTemplate?: any | undefined }) => {
+			const resource = "resource" in arg ? arg.resource : arg;
+			let launchTemplate = "launchTemplate" in arg ? arg.launchTemplate : undefined;
+			launchTemplate ??= getLaunchConfigDefaultTemplate(resource, true);
+
 			const launchConfig = Object.assign(
 				{
 					name: dynamicDebugSessionName,
@@ -177,9 +324,13 @@ export class DebugCommands implements IAmDisposable {
 					program: fsPath(resource),
 				},
 			);
-			vs.debug.startDebugging(vs.workspace.getWorkspaceFolder(resource), launchConfig as vs.DebugConfiguration);
+			await vs.debug.startDebugging(vs.workspace.getWorkspaceFolder(resource), launchConfig as vs.DebugConfiguration);
 		}));
-		this.disposables.push(vs.commands.registerCommand("dart.startWithoutDebugging", (resource: vs.Uri, launchTemplate: any | undefined) => {
+		this.disposables.push(vs.commands.registerCommand("dart.startWithoutDebugging", async (arg: vs.Uri | { resource: vs.Uri, launchTemplate?: any | undefined }) => {
+			const resource = "resource" in arg ? arg.resource : arg;
+			let launchTemplate = "launchTemplate" in arg ? arg.launchTemplate : undefined;
+			launchTemplate ??= getLaunchConfigDefaultTemplate(resource, false);
+
 			const launchConfig = Object.assign(
 				{
 					name: dynamicDebugSessionName,
@@ -192,34 +343,34 @@ export class DebugCommands implements IAmDisposable {
 					program: fsPath(resource),
 				},
 			);
-			vs.debug.startDebugging(vs.workspace.getWorkspaceFolder(resource), launchConfig as vs.DebugConfiguration);
+			await vs.debug.startDebugging(vs.workspace.getWorkspaceFolder(resource), launchConfig as vs.DebugConfiguration);
 		}));
-		this.disposables.push(vs.commands.registerCommand("dart.createLaunchConfiguration", this.createLaunchConfiguration, this));
-		this.disposables.push(vs.commands.registerCommand("dart.rerunLastDebugSession", () => {
+		this.disposables.push(vs.commands.registerCommand("dart.createLaunchConfiguration", this.createLaunchConfiguration.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("dart.rerunLastDebugSession", async () => {
 			if (LastDebugSession.debugConfig) {
-				vs.debug.startDebugging(LastDebugSession.workspaceFolder, LastDebugSession.debugConfig);
+				await vs.debug.startDebugging(LastDebugSession.workspaceFolder, LastDebugSession.debugConfig);
 			} else {
-				vs.window.showErrorMessage("There is no previous debug session to run.");
+				void vs.window.showErrorMessage("There is no previous debug session to run.");
 			}
 		}));
-		this.disposables.push(vs.commands.registerCommand("dart.rerunLastTestDebugSession", () => {
+		this.disposables.push(vs.commands.registerCommand("dart.rerunLastTestDebugSession", async () => {
 			if (LastTestDebugSession.debugConfig) {
-				vs.debug.startDebugging(LastTestDebugSession.workspaceFolder, LastTestDebugSession.debugConfig);
+				await vs.debug.startDebugging(LastTestDebugSession.workspaceFolder, LastTestDebugSession.debugConfig);
 			} else {
-				vs.window.showErrorMessage("There is no previous test session to run.");
+				void vs.window.showErrorMessage("There is no previous test session to run.");
 			}
 		}));
 
 		// Attach commands.
-		this.disposables.push(vs.commands.registerCommand("dart.attach", () => {
-			vs.debug.startDebugging(undefined, {
+		this.disposables.push(vs.commands.registerCommand("dart.attach", async () => {
+			await vs.debug.startDebugging(undefined, {
 				name: "Dart: Attach to Process",
 				request: "attach",
 				type: "dart",
 			});
 		}));
-		this.disposables.push(vs.commands.registerCommand("flutter.attachProcess", () => {
-			vs.debug.startDebugging(undefined, {
+		this.disposables.push(vs.commands.registerCommand("flutter.attachProcess", async () => {
+			await vs.debug.startDebugging(undefined, {
 				name: "Flutter: Attach to Process",
 				request: "attach",
 				type: "dart",
@@ -236,7 +387,7 @@ export class DebugCommands implements IAmDisposable {
 			});
 			if (!this.context.hasNotifiedAboutProfileModeDefaultConfiguration) {
 				this.context.hasNotifiedAboutProfileModeDefaultConfiguration = true;
-				vs.window.showInformationMessage("Profiling Flutter app with default configuration. To customize this, create a launch configuration (and include 'flutterMode': 'profile').");
+				void vs.window.showInformationMessage("Profiling Flutter app with default configuration. To customize this, create a launch configuration (and include 'flutterMode': 'profile').");
 			}
 		}));
 		this.disposables.push(vs.commands.registerCommand("flutter.runReleaseMode", async () => {
@@ -247,8 +398,8 @@ export class DebugCommands implements IAmDisposable {
 				type: "dart",
 			});
 		}));
-		this.disposables.push(vs.commands.registerCommand("flutter.attach", () => {
-			vs.debug.startDebugging(undefined, {
+		this.disposables.push(vs.commands.registerCommand("flutter.attach", async () => {
+			await vs.debug.startDebugging(undefined, {
 				name: "Flutter: Attach to Device",
 				request: "attach",
 				type: "dart",
@@ -256,17 +407,16 @@ export class DebugCommands implements IAmDisposable {
 		}));
 		this.disposables.push(vs.commands.registerCommand("dart.promptForVmService", async (defaultValueOrConfig: string | vs.DebugConfiguration | undefined): Promise<string | undefined> => {
 			const defaultValue = typeof defaultValueOrConfig === "string" ? defaultValueOrConfig : undefined;
-			return vs.window.showInputBox({
+			let vmServiceUriOrPort = await vs.window.showInputBox({
 				ignoreFocusOut: true, // Don't close the window if the user tabs away to get the uri
-				placeHolder: "Paste an VM Service URI",
-				prompt: "Enter VM Service URI",
+				placeHolder: "Paste a VM Service URI or a port number",
+				prompt: "VM Service URI or port number",
 				validateInput: (input) => {
 					if (!input)
 						return;
 
 					input = input.trim();
 
-					// eslint-disable-next-line id-blacklist
 					if (Number.isInteger(parseFloat(input)))
 						return;
 
@@ -275,10 +425,16 @@ export class DebugCommands implements IAmDisposable {
 
 					if (!input.startsWith("http://") && !input.startsWith("https://")
 						&& !input.startsWith("ws://") && !input.startsWith("wss://"))
-						return "Please enter a valid VM Service URI";
+						return "Please enter a valid VM Service URI or a port number";
 				},
 				value: defaultValue,
 			});
+
+			// If the input is just a number, treat is as a localhost port.
+			if (vmServiceUriOrPort && /^[0-9]+$/.exec(vmServiceUriOrPort))
+				vmServiceUriOrPort = `http://127.0.0.1:${vmServiceUriOrPort}`;
+
+			return vmServiceUriOrPort;
 		}));
 
 		// Debug options.
@@ -288,14 +444,14 @@ export class DebugCommands implements IAmDisposable {
 			this.currentDebugOption = DebugOption.MyCodeSdk;
 		else if (config.debugExternalPackageLibraries)
 			this.currentDebugOption = DebugOption.MyCodePackages;
-		this.disposables.push(vs.commands.registerCommand("_dart.toggleDebugOptions", this.toggleDebugOptions, this));
+		this.disposables.push(vs.commands.registerCommand("_dart.toggleDebugOptions", this.toggleDebugOptions.bind(this)));
 		this.debugOptions.text = `Debug ${debugOptionNames[this.currentDebugOption]}`;
 		this.debugOptions.tooltip = `Controls whether to step into or stop at breakpoints in only files in this workspace or also those in SDK and/or external Pub packages`;
 		this.debugOptions.command = "_dart.toggleDebugOptions";
 	}
 
 	private async createLaunchConfiguration(resourceUri: vs.Uri) {
-		if (!resourceUri || resourceUri.scheme !== "file")
+		if (resourceUri?.scheme !== "file")
 			return;
 
 		const entryScriptPath = fsPath(resourceUri);
@@ -317,7 +473,6 @@ export class DebugCommands implements IAmDisposable {
 		const newLaunchConfig = {
 			name,
 			type: "dart",
-			// eslint-disable-next-line @typescript-eslint/tslint/config
 			request: "launch",
 			cwd: relativeCwdPath ? relativeCwdPath : undefined,
 			program: relativeEntryScriptPath,
@@ -338,14 +493,14 @@ export class DebugCommands implements IAmDisposable {
 
 		// Open the correct file based on workspace or workspace folder.
 		if (hasWorkspaceConfigs) {
-			vs.commands.executeCommand("workbench.action.openWorkspaceConfigFile");
+			void vs.commands.executeCommand("workbench.action.openWorkspaceConfigFile");
 		} else {
 			const launchConfig = path.join(workspaceFolderPath, ".vscode", "launch.json");
-			vs.workspace.openTextDocument(launchConfig).then((doc) => vs.window.showTextDocument(doc));
+			void vs.workspace.openTextDocument(launchConfig).then((doc) => vs.window.showTextDocument(doc));
 		}
 	}
 
-	private async getDebugSession(): Promise<DartDebugSessionInformation | undefined> {
+	public async getDebugSession(): Promise<DartDebugSessionInformation | undefined> {
 		if (debugSessions.length === 0) {
 			this.logger.info("No debug session to use!");
 			return undefined;
@@ -367,12 +522,12 @@ export class DebugCommands implements IAmDisposable {
 
 			const selectedItem = await vs.window.showQuickPick(sessions, { placeHolder: "Which debug session?" });
 
-			return selectedItem && selectedItem.session;
+			return selectedItem?.session;
 		}
 	}
 
 	public handleBreakpointChange(e: vs.BreakpointsChangeEvent): void {
-		if (hasPromptedAboutDebugSettings)
+		if (this.hasPromptedAboutDebugSettings)
 			return;
 
 		for (const bp of e.added)
@@ -380,29 +535,32 @@ export class DebugCommands implements IAmDisposable {
 	}
 
 	public promptAboutDebuggerSettingsIfBreakpointOutsideWorkspace(e: vs.Breakpoint): void {
-		// If the user has enabled any of these, assume they understand the setting.
-		if (config.debugSdkLibraries || config.debugExternalPackageLibraries)
+		if (this.hasPromptedAboutDebugSettings || this.context.breakpointInNonDebuggableFileDoNotShowAgain || !(e instanceof vs.SourceBreakpoint) || !e.enabled)
 			return;
 
-		if (hasPromptedAboutDebugSettings || this.context.breakpointOutsideWorkspaceDoNotShow || !(e instanceof vs.SourceBreakpoint) || !e.enabled)
-			return;
-
-		// Don't consider non-Dart files.
-		if (!fsPath(e.location.uri).toLocaleLowerCase().endsWith(".dart"))
+		// Don't consider non-files or non-Dart files.
+		if (e.location.uri.scheme !== "file" || !fsPath(e.location.uri).toLocaleLowerCase().endsWith(".dart"))
 			return;
 
 		// If it's inside the workspace we don't want to prompt.
 		if (vs.workspace.getWorkspaceFolder(e.location.uri))
 			return;
 
-		hasPromptedAboutDebugSettings = true;
+		const isSdkBreakpoint = isWithinPath(fsPath(e.location.uri), this.workspaceContext.sdks.dart);
+
+		if (isSdkBreakpoint && config.debugSdkLibraries)
+			return;
+		if (!isSdkBreakpoint && config.debugExternalPackageLibraries)
+			return;
+
+		this.hasPromptedAboutDebugSettings = true;
 		const message = `You have a breakpoint outside of your workspace but debug settings are set to 'my code'. Would you like to change settings? You can also change this from the status bar while debugging.`;
 
-		const debugJustMyCodeAction = "Debug just my code";
-		const debugEverything = "Debug my code + packages + SDK";
-		vs.window.showWarningMessage(message, debugJustMyCodeAction, debugEverything, doNotAskAgainAction).then((choice) => {
+		const debugJustMyCodeAction = "Debug my code";
+		const debugEverything = "Debug all code";
+		void vs.window.showWarningMessage(message, debugJustMyCodeAction, debugEverything, doNotAskAgainAction).then((choice) => {
 			if (choice === doNotAskAgainAction)
-				this.context.breakpointOutsideWorkspaceDoNotShow = true;
+				this.context.breakpointInNonDebuggableFileDoNotShowAgain = true;
 			if (choice !== debugEverything)
 				return;
 
@@ -411,30 +569,50 @@ export class DebugCommands implements IAmDisposable {
 		});
 	}
 
-	public handleDebugSessionStart(s: vs.DebugSession): void {
+	private updateDebugSessionsStatus(): void {
+		if (!debugSessions.length) {
+			this.debugSessionsStatusItem.text = "No Debug Sessions";
+			this.debugSessionsStatusItem.command = undefined;
+			return;
+		}
+
+		this.debugSessionsStatusItem.text = `${debugSessions.length} Debug Session${debugSessions.length === 1 ? "" : "s"}`;
+		this.debugSessionsStatusItem.command = {
+			command: "dart.copyVmServiceUri",
+			title: "copy vm service",
+		};
+	}
+
+	public handleDebugSessionStart(s: vs.DebugSession): DartDebugSessionInformation | undefined {
 		if (s.type !== "dart")
 			return;
 
-		const session = new DartDebugSessionInformation(s, s.configuration.debuggerType as DebuggerType);
+		const session = new DartDebugSessionInformation(s);
 		// If we're the first fresh debug session, reset all settings to default.
 		// Subsequent launches will inherit the "current" values.
 		if (debugSessions.length === 0)
 			this.vmServices.resetToDefaults();
 		debugSessions.push(session);
+		this.updateDebugSessionsStatus();
+		debugSessionStartedEmitter.fire(session);
+		debugSessionsChangedEmitter.fire();
 
 		if (s.configuration.debuggerType === DebuggerType.Flutter || s.configuration.debuggerType === DebuggerType.Web) {
+			// TODO(dantup): Can these use session.flutterMode in preference?
 			const isProfileMode = s.configuration.toolArgs?.includes("--profile");
 			const isReleaseMode = s.configuration.toolArgs?.includes("--release");
 
 			if (isReleaseMode) {
-				vs.commands.executeCommand("setContext", isInFlutterReleaseModeDebugSessionContext, true);
+				void vs.commands.executeCommand("setContext", isInFlutterReleaseModeDebugSessionContext, true);
 			} else if (isProfileMode) {
 				isInFlutterProfileModeDebugSession = true;
-				vs.commands.executeCommand("setContext", isInFlutterProfileModeDebugSessionContext, true);
+				void vs.commands.executeCommand("setContext", isInFlutterProfileModeDebugSessionContext, true);
 			} else {
 				isInFlutterDebugModeDebugSession = true;
-				vs.commands.executeCommand("setContext", isInFlutterDebugModeDebugSessionContext, true);
+				void vs.commands.executeCommand("setContext", isInFlutterDebugModeDebugSessionContext, true);
 			}
+		} else if (s.configuration.debuggerType === DebuggerType.Dart) {
+			void vs.commands.executeCommand("setContext", isInDartDebugSessionContext, true);
 		}
 
 		// Process any queued events that came in before the session start
@@ -444,11 +622,12 @@ export class DebugCommands implements IAmDisposable {
 
 		eventsToProcess.forEach((e) => {
 			this.logger.info(`Processing delayed event ${e.event} for session ${e.session.id}`);
-			// tslint:disable-next-line: no-floating-promises
-			this.handleCustomEventWithSession(session, e);
+			void this.handleCustomEventWithSession(session, e);
 		});
 
 		this.debugOptions.show();
+
+		return session;
 	}
 
 	public handleDebugSessionCustomEvent(e: vs.DebugSessionCustomEvent): void {
@@ -457,13 +636,12 @@ export class DebugCommands implements IAmDisposable {
 
 		const session = debugSessions.find((ds) => ds.session.id === e.session.id);
 		if (!session) {
-			this.logger.warn(`Did not find session ${e.session.id} to handle ${e.event}. There were ${debugSessions.length} sessions:\n${debugSessions.map((ds) => `  ${ds.session.id}`).join("\n")}`);
-			this.logger.warn(`Event will be queued and processed when the session start event fires`);
+			this.logger.info(`Did not find session ${e.session.id} to handle ${e.event}. There were ${debugSessions.length} sessions:\n${debugSessions.map((ds) => `  ${ds.session.id}`).join("\n")}`);
+			this.logger.info(`Event will be queued and processed when the session start event fires`);
 			pendingCustomEvents.push(e);
 			return;
 		}
-		// tslint:disable-next-line: no-floating-promises
-		this.handleCustomEventWithSession(session, e);
+		void this.handleCustomEventWithSession(session, e);
 	}
 
 	public handleDebugSessionEnd(s: vs.DebugSession): void {
@@ -475,13 +653,13 @@ export class DebugCommands implements IAmDisposable {
 		const session = debugSessions[sessionIndex];
 		session.hasEnded = true;
 		debugSessions.splice(sessionIndex, 1);
+		this.updateDebugSessionsStatus();
+		debugSessionStoppedEmitter.fire(session);
+		debugSessionsChangedEmitter.fire();
 
 		// Close any in-progress progress notifications.
-		for (const progressID of Object.keys(session.progress))
-			session.progress[progressID]?.complete();
-
-		const debugSessionEnd = new Date();
-		this.analytics.logDebugSessionDuration(DebuggerType[session.debuggerType], debugSessionEnd.getTime() - session.sessionStart.getTime());
+		for (const progressId of Object.keys(session.progress))
+			session.progress[progressId]?.complete();
 
 		// If this was the last session terminating, then remove all the flags for which service extensions are supported.
 		// Really we should track these per-session, but the changes of them being different given we only support one
@@ -494,52 +672,83 @@ export class DebugCommands implements IAmDisposable {
 			isInFlutterDebugModeDebugSession = false;
 			isInFlutterProfileModeDebugSession = false;
 			for (const debugContext of [
+				isInDartDebugSessionContext,
 				isInFlutterDebugModeDebugSessionContext,
 				isInFlutterProfileModeDebugSessionContext,
 				isInFlutterReleaseModeDebugSessionContext,
 			])
-				vs.commands.executeCommand("setContext", debugContext, false);
+				void vs.commands.executeCommand("setContext", debugContext, false);
 		}
 	}
 
 	private handleCustomEvent(e: vs.DebugSessionCustomEvent): boolean {
-		if (e.event === "dart.log") {
+		const event = e.event;
+		const body = e.body;
+		if (event === "dart.log") {
 			const message: LogMessage = e.body;
 			const logMessage = `[${e.session.name}] ${message.message}`;
+			const category = message.category ?? logMessage.includes("[VM]") ? LogCategory.VmService : LogCategory.DAP;
 			switch (message.severity) {
 				case LogSeverity.Warn:
-					this.logger.warn(logMessage, message.category);
+					this.logger.warn(logMessage, category);
 					break;
 				case LogSeverity.Error:
-					this.logger.error(logMessage, message.category);
+					this.logger.error(logMessage, category);
 					break;
 				default:
-					this.logger.info(logMessage, message.category);
+					this.logger.info(logMessage, category);
 			}
-		} else if (e.event === "dart.hotRestartRequest") {
+		} else if (event === "dart.hotRestartRequest") {
 			// This event comes back when the user restarts with the Restart button
 			// (eg. it wasn't intiated from our extension, so we don't get to log it
 			// in the command).
-			this.analytics.logDebuggerRestart();
 			this.onWillHotRestartEmitter.fire();
-		} else if (e.event === "dart.hotReloadRequest") {
+		} else if (event === "dart.hotReloadRequest") {
 			// This event comes back when the user restarts with the Restart button
 			// (eg. it wasn't intiated from our extension, so we don't get to log it
 			// in the command).
-			this.analytics.logDebuggerHotReload();
 			this.onWillHotReloadEmitter.fire();
-		} else if (e.event === "dart.debugMetrics") {
-			const memory = e.body.memory;
+		} else if (event === "dart.debugMetrics") {
+			const memory = body.memory;
 			const message = `${Math.ceil(memory.current / 1024 / 1024)}MB of ${Math.ceil(memory.total / 1024 / 1024)}MB`;
 			this.debugMetrics.text = message;
 			this.debugMetrics.tooltip = "This is the amount of memory being consumed by your applications heaps (out of what has been allocated).\n\nNote: memory usage shown in debug builds may not be indicative of usage in release builds. Use profile builds for more accurate figures when testing memory usage.";
 			this.debugMetrics.show();
-		} else if (e.event === "dart.navigate") {
-			if (e.body.file && e.body.line && e.body.column) {
+		} else if (event === "dart.toolEvent") {
+			const kind = body.kind;
+			const data = body.data;
+			switch (kind) {
+				case "navigate": {
+					const uri: string | undefined = data.resolvedFileUri ?? data.resolvedUri ?? data.fileUri ?? data.uri ?? data.file;
+					const line: string | undefined = data.line;
+					const col: string | undefined = data.column;
+					const isFlutterInspectorNavigation = data.source === "flutter.inspector";
+					if (uri && uri.startsWith("file://") && line && col) {
+						// Only navigate if it's not from inspector, or is from inspector but we're not in full-width mode.
+						const navigate = !isFlutterInspectorNavigation || this.devTools.getDevToolsLocation(widgetInspectorPage.id) !== "active";
+						if (navigate)
+							void vs.commands.executeCommand("_dart.jumpToLineColInUri", vs.Uri.parse(uri), line, col, true);
+						if (isFlutterInspectorNavigation && this.isInspectingWidget && this.autoCancelNextInspectWidgetMode) {
+							// Add a short delay because this will remove the visible selection.
+							setTimeout(() => vs.commands.executeCommand("flutter.cancelInspectWidget"), 1000);
+						}
+					}
+					break;
+				}
+				default:
+					return false;
+			}
+
+		} else if (event === "dart.navigate") {
+			if (body.file && body.line && body.column) {
 				// Only navigate if it's not from inspector, or is from inspector but we're not in full-width mode.
-				const navigate = !e.body.fromInspector || config.devToolsLocation !== "active";
+				const navigate = !body.fromInspector || this.devTools.getDevToolsLocation(widgetInspectorPage.id) !== "active";
 				if (navigate)
-					vs.commands.executeCommand("_dart.jumpToLineColInUri", vs.Uri.parse(e.body.file as string), e.body.line, e.body.column, e.body.inOtherEditorColumn);
+					void vs.commands.executeCommand("_dart.jumpToLineColInUri", vs.Uri.parse(body.file as string), body.line, body.column, body.inOtherEditorColumn);
+				if (this.isInspectingWidget && this.autoCancelNextInspectWidgetMode) {
+					// Add a short delay because this will remove the visible selection.
+					setTimeout(() => vs.commands.executeCommand("flutter.cancelInspectWidget"), 1000);
+				}
 			}
 		} else {
 			// Not handled, will fall through in the caller.
@@ -552,39 +761,114 @@ export class DebugCommands implements IAmDisposable {
 		this.vmServices.handleDebugEvent(session, e)
 			.catch((e) => this.logger.error(e));
 
-		if (e.event === "dart.webLaunchUrl") {
-			const launched = !!e.body.launched;
-			if (!launched) {
+		const event = e.event;
+		const body = e.body;
+
+		if (event === "dart.webLaunchUrl") {
+			const launched = !!body.launched;
+			if (!launched && !session.session.configuration.suppressWebServerDeviceBrowserLaunch) {
 				try {
-					await envUtils.openInBrowser(e.body.url as string, this.logger);
-				} catch (e: any) {
-					this.logger.error(`Failed to launch URL from Flutter app.webLaunchUrl event: ${e.body.url}`);
+					await envUtils.openInBrowser(body.url as string, this.logger);
+				} catch {
+					this.logger.error(`Failed to launch URL from Flutter app.webLaunchUrl event: ${body.url}`);
 				}
 			}
-		} else if (e.event === "dart.exposeUrl") {
-			const originalUrl = e.body.url as string;
+		} else if (event === "dart.exposeUrl") {
+			const originalUrl = body.url as string;
 			try {
 				const exposedUrl = await envUtils.exposeUrl(originalUrl, this.logger);
-				session.session.customRequest("exposeUrlResponse", { originalUrl, exposedUrl });
+				await session.session.customRequest("exposeUrlResponse", { originalUrl, exposedUrl });
 			} catch (e) {
 				this.logger.error(`Failed to expose URL ${originalUrl}: ${e}`);
-				session.session.customRequest("exposeUrlResponse", { originalUrl, exposedUrl: originalUrl });
+				await session.session.customRequest("exposeUrlResponse", { originalUrl, exposedUrl: originalUrl });
 			}
-		} else if (e.event === "dart.debuggerUris") {
-			session.observatoryUri = e.body.observatoryUri;
-			session.vmServiceUri = e.body.vmServiceUri;
+		} else if (event === "flutter.forwardedEvent") {
+			const event = body.event;
+			const params = body.params;
+			switch (event) {
+				case "app.webLaunchUrl": {
+					const url = params.url as string;
+					const launched = !!params.launched;
+					if (!launched && !session.session.configuration.suppressWebServerDeviceBrowserLaunch) {
+						try {
+							await envUtils.openInBrowser(url, this.logger);
+						} catch {
+							this.logger.error(`Failed to launch URL from Flutter app.webLaunchUrl event: ${url}`);
+						}
+					}
+					break;
+				}
+				case "app.warning": {
+					const warningId = params.warningId as string;
+					const warningText = params.warning as string;
+					if (!warningId || !warningText) {
+						this.logger.warn(`Received app.warning event with missing 'warningId' or 'warning' fields: ${JSON.stringify(params)}`);
+						break;
+					}
+
+					if (this.context.getAppWarningDoNotShow(warningId))
+						break;
+
+					const url = params.url as string | undefined;
+
+					const buttons = url ? [moreInfoAction] : [];
+					buttons.push(doNotShowAgainAction);
+
+					const userAction = await vs.window.showWarningMessage(warningText, ...buttons);
+					if (url && userAction === moreInfoAction) {
+						try {
+							await envUtils.openInBrowser(url, this.logger);
+						} catch (e) {
+							this.logger.error(`Failed to launch URL from Flutter app.warning event: ${url}: ${e}`);
+						}
+					} else if (userAction === doNotShowAgainAction) {
+						this.context.setAppWarningDoNotShow(warningId, true);
+					}
+					break;
+				}
+			}
+		} else if (event === "flutter.forwardedRequest") {
+			const id = body.id;
+			const method = body.method;
+			const params = body.params;
+			let result;
+			let error;
+			try {
+				switch (method) {
+					case "app.exposeUrl": {
+						const originalUrl = params.url as string;
+						let url;
+						try {
+							url = await envUtils.exposeUrl(originalUrl, this.logger);
+						} catch (e) {
+							this.logger.error(`Failed to expose URL ${originalUrl}: ${e}`);
+							url = originalUrl;
+						}
+						result = { url };
+						break;
+					}
+				}
+			} catch (e) {
+				error = `${e}`;
+			}
+			void session.session.customRequest("flutter.sendForwardedRequestResponse", { id, result, error });
+		} else if (event === "dart.debuggerUris") {
+			session.observatoryUri = body.observatoryUri;
+			session.vmServiceUri = body.vmServiceUri;
+			session.clientVmServiceUri = body.clientVmServiceUri;
 			this.onDebugSessionVmServiceAvailableEmitter.fire(session);
+			debugSessionChangedEmitter.fire(session);
+			debugSessionsChangedEmitter.fire();
 
 			// Open or prompt for DevTools when appropriate.
 			const debuggerType: DebuggerType = session.session.configuration.debuggerType;
 			if (debuggerType === DebuggerType.Dart || debuggerType === DebuggerType.Flutter || debuggerType === DebuggerType.Web) {
 				if (session.session.configuration.openDevTools) {
 					const pageId = session.session.configuration.openDevTools;
-					const page = devToolsPages.find((p) => p.id === pageId);
 					if (pageId) {
-						vs.commands.executeCommand("dart.openDevTools", { debugSessionId: session.session.id, triggeredAutomatically: true, page });
+						void vs.commands.executeCommand("dart.openDevTools", { debugSessionId: session.session.id, triggeredAutomatically: true, pageId, commandSource: CommandSource.launchConfiguration });
 					} else {
-						vs.window.showWarningMessage(`Debug configuration contain an invalid DevTools page '${pageId}' in 'openDevTools'`);
+						void vs.window.showWarningMessage(`Debug configuration contain an invalid DevTools page '${pageId}' in 'openDevTools'`);
 					}
 				} else if (config.openDevTools !== "never") {
 					const shouldLaunch = debuggerType !== DebuggerType.Dart || config.openDevTools === "always";
@@ -592,60 +876,101 @@ export class DebugCommands implements IAmDisposable {
 						// If embedded DevTools is enabled and it's a Flutter app, assume the user wants the Widget inspector.
 						// Otherwise, DevTools will be launched externally (since it's not clear which page they may want).
 						const page = debuggerType === DebuggerType.Flutter ? widgetInspectorPage : null;
-						vs.commands.executeCommand("dart.openDevTools", { debugSessionId: session.session.id, triggeredAutomatically: true, page });
+						const location = page ? undefined : "external";
+						void vs.commands.executeCommand("dart.openDevTools", { debugSessionId: session.session.id, triggeredAutomatically: true, pageId: page?.id, location, commandSource: CommandSource.onDebugAutomatic });
 					}
 				} else if (debuggerType === DebuggerType.Flutter) {
-					// tslint:disable-next-line: no-floating-promises
-					showDevToolsNotificationIfAppropriate(this.context).then((res) => {
+					void showDevToolsNotificationIfAppropriate(this.context).then((res) => {
 						if (res.shouldAlwaysOpen)
-							config.setOpenDevTools("flutter");
+							void config.setOpenDevTools("flutter");
 					});
 				}
 			}
-		} else if (e.event === "dart.progressStart") {
+		} else if (event === "dart.progressStart") {
+			const progressId = body.progressId as string | undefined;
+			if (!progressId) return;
+
 			// When a debug session is restarted by VS Code (eg. not handled by the DA), the session-end event
 			// will not fire so we need to clean up the "Terminating debug session" message manually. Doing it here
 			// means it will vanish at the same time as the new one appears, so there are no gaps in progress indicators.
-			if (e.body.progressID === debugLaunchProgressId) {
+			if (progressId === debugLaunchProgressId) {
 				session.progress[debugTerminatingProgressId]?.complete();
 				delete session.progress[debugTerminatingProgressId];
 			}
 
-			const isHotEvent = e.body.progressID.endsWith("-hot.reload") || e.body.progressID.endsWith("-hot.restart");
-			const progressLocation = isHotEvent && config.hotReloadProgress === "statusBar" ? vs.ProgressLocation.Window : vs.ProgressLocation.Notification;
+			const isHotReload = progressId?.toLowerCase().includes("reload");
+			const isHotRestart = progressId?.toLowerCase().includes("restart");
+			const progressLocation = (isHotRestart || isHotReload) && config.hotReloadProgress === "statusBar" ? vs.ProgressLocation.Window : vs.ProgressLocation.Notification;
 
-			vs.window.withProgress(
+			// Complete any existing one with this ID.
+			session.progress[progressId]?.complete();
+
+			// For hot reload / hot restart because we show toast notifications, we want to collapse any
+			// overlapping notifications into a single one to avoid them stacking up when they are debounced
+			// by Flutter. To do this, we will keep the first one active, and just reassign it into the ID
+			// of the latest one, and not start a new progress notification.
+			if (isHotReload) {
+				if (this.currentHotReloadProgressId) {
+					const currentHotReload = session.progress[this.currentHotReloadProgressId];
+					if (currentHotReload && !currentHotReload.isComplete) {
+						// Take over the previous progress.
+						session.progress[progressId] = currentHotReload;
+						delete session.progress[this.currentHotReloadProgressId];
+
+						this.currentHotReloadProgressId = progressId;
+						return;
+					}
+				}
+				this.currentHotReloadProgressId = progressId;
+			} else if (isHotRestart) {
+				if (this.currentHotRestartProgressId) {
+					const currentHotRestart = session.progress[this.currentHotRestartProgressId];
+					if (currentHotRestart && !currentHotRestart.isComplete) {
+						// Take over the previous progress.
+						session.progress[progressId] = currentHotRestart;
+						delete session.progress[this.currentHotRestartProgressId];
+
+						this.currentHotRestartProgressId = progressId;
+						return;
+					}
+				}
+				this.currentHotRestartProgressId = progressId;
+			}
+
+			await vs.window.withProgress(
 				// TODO: This was previously Window to match what we'd get using DAP progress
 				// notifications but users prefer larger notifications as they're easier to
 				// see (especially when it comes to things like waiting for debug extension).
 				// https://github.com/Dart-Code/Dart-Code/issues/2597
 				// If this is changed back, ensure the waiting-for-debug-extension notification
 				// is still displayed with additional description.
-				{ location: progressLocation },
+				{ location: progressLocation, title: body.title },
 				(progress) => {
-					// Complete any existing one with this ID.
-					session.progress[e.body.progressID]?.complete();
-
 					// Build a new progress and store it in the session.
 					const completer = new PromiseCompleter<void>();
-					session.progress[e.body.progressID] = new ProgressMessage(progress, completer);
-					session.progress[e.body.progressID]?.report(e.body.message as string);
+					session.progress[progressId] = new ProgressMessage(progress, completer);
+					if (body.message)
+						session.progress[progressId]?.report(body.message as string);
 					return completer.promise;
 				},
 			);
-		} else if (e.event === "dart.progressUpdate") {
-			session.progress[e.body.progressID]?.report(e.body.message as string);
-		} else if (e.event === "dart.progressEnd") {
-			if (e.body.message) {
-				session.progress[e.body.progressID]?.report(e.body.message as string);
-				await new Promise((resolve) => setTimeout(resolve, 400));
+		} else if (event === "dart.progressUpdate") {
+			session.progress[body.progressId]?.report(body.message as string);
+		} else if (event === "dart.progressEnd") {
+			const progress = session.progress[body.progressId];
+			if (progress) {
+				delete session.progress[body.progressId];
+				if (body.message) {
+					progress.report(body.message as string);
+					await new Promise((resolve) => setTimeout(resolve, 400));
+				}
+				progress.complete();
 			}
-			session.progress[e.body.progressID]?.complete();
-		} else if (e.event === "dart.flutter.widgetErrorInspectData") {
+		} else if (event === "dart.flutter.widgetErrorInspectData") { // Legacy DAP deep links
 			if (this.suppressFlutterWidgetErrors || !config.showInspectorNotificationsForWidgetErrors)
 				return;
 
-			const data = e.body as WidgetErrorInspectData;
+			const data = e.body as LegacyWidgetErrorInspectData;
 			if (data.devToolsUrl !== (await this.devTools.devtoolsUrl))
 				return;
 
@@ -657,18 +982,84 @@ export class DebugCommands implements IAmDisposable {
 			const inspectAction = `Inspect Widget`;
 			const choice = await vs.window.showWarningMessage(data.errorDescription, inspectAction, doNotAskAgainAction);
 			if (choice === inspectAction && session.vmServiceUri) {
-				this.devTools.spawnForSession(
+				void this.devTools.spawn(
 					session as DartDebugSessionInformation & { vmServiceUri: string },
 					{
 						inspectorRef: data.inspectorReference,
-						page: widgetInspectorPage,
+						pageId: widgetInspectorPage.id,
 					},
+					true,
 				);
 			} else if (choice === doNotAskAgainAction) {
-				config.setShowInspectorNotificationsForWidgetErrors(false);
+				void config.setShowInspectorNotificationsForWidgetErrors(false);
 			}
 			clearTimeout(timer);
 			this.suppressFlutterWidgetErrors = false;
+		} else if (event === "dart.flutter.devToolsDeepLink") { // New DAP deep links
+			if (this.suppressFlutterWidgetErrors || !config.showInspectorNotificationsForWidgetErrors)
+				return;
+
+			// "event":"dart.flutter.devToolsDeepLink",
+			// "body":{
+			//   "summary":"A RenderFlex overflowed by 266 pixels on the right.",
+			//   "deepLinkUrl":"http://example.org/#/inspector?uri&inspectorRef=inspector-0"
+			// }
+			const data = e.body as DevToolsDeepLinkData;
+
+			// To avoid spam, when we show this dialog we will set a flag that prevents any more
+			// of these types of dialogs until it is dismissed or 5 seconds have passed.
+			this.suppressFlutterWidgetErrors = true;
+			const timer = setTimeout(() => this.suppressFlutterWidgetErrors = false, 5000);
+
+			const inspectAction = `Inspect Widget`;
+			const choice = await vs.window.showWarningMessage(data.summary, inspectAction, doNotAskAgainAction);
+			if (choice === inspectAction && session.vmServiceUri) {
+				const link = this.parseDeepLinkUri(data.deepLinkUrl);
+				if (link) {
+					void this.devTools.spawn(
+						session as DartDebugSessionInformation & { vmServiceUri: string },
+						{
+							inspectorRef: link.inspectorRef,
+							pageId: link.pageId,
+						},
+						true,
+					);
+				}
+			} else if (choice === doNotAskAgainAction) {
+				void config.setShowInspectorNotificationsForWidgetErrors(false);
+			}
+			clearTimeout(timer);
+			this.suppressFlutterWidgetErrors = false;
+		} else if (event === "flutter.appStarted") {
+			session.hasStarted = true;
+			debugSessionChangedEmitter.fire(session);
+			debugSessionsChangedEmitter.fire();
+			// In noDebug mode, we won't see services registered but we can tell if Hot Reload
+			// is available.
+			if (session.supportsHotReload)
+				this.vmServices.handleServiceRegistered(VmService.HotReload, VmService.HotReload);
+		} else if (event === "flutter.appStart") {
+			session.flutterMode = body?.mode;
+			session.flutterDeviceId = body?.deviceId;
+			session.supportsHotReload = body?.supportsRestart;
+			debugSessionChangedEmitter.fire(session);
+			debugSessionsChangedEmitter.fire();
+		}
+	}
+
+	private parseDeepLinkUri(deepLinkUrl: string): { pageId: string, inspectorRef: string | undefined } | undefined {
+		try {
+			// http://example.org/#/inspector?uri&inspectorRef=inspector-0
+			const url = new URL(deepLinkUrl.replace("#/", ""));
+			const pageId = url.pathname.split("/")[1];
+			const inspectorRef = url.searchParams.get("inspectorRef") ?? undefined;
+			if (pageId) {
+				return { pageId, inspectorRef };
+			}
+			return undefined;
+		} catch {
+			this.logger.error(`Failed to parse DevTools deep link URL: ${deepLinkUrl}`);
+			return undefined;
 		}
 	}
 
@@ -678,29 +1069,55 @@ export class DebugCommands implements IAmDisposable {
 		this.applyNewDebugOption();
 	}
 
-	private applyNewDebugOption() {
+	public applyNewDebugOption() {
 		this.debugOptions.text = `Debug ${debugOptionNames[this.currentDebugOption]}`;
 
 		const debugExternalPackageLibraries = this.currentDebugOption === DebugOption.MyCodePackages || this.currentDebugOption === DebugOption.MyCodePackagesSdk;
 		const debugSdkLibraries = this.currentDebugOption === DebugOption.MyCodeSdk || this.currentDebugOption === DebugOption.MyCodePackagesSdk;
 
-		config.setGlobalDebugExternalPackageLibraries(debugExternalPackageLibraries);
-		config.setGlobalDebugSdkLibraries(debugSdkLibraries);
+		void config.setGlobalDebugExternalPackageLibraries(debugExternalPackageLibraries);
+		void config.setGlobalDebugSdkLibraries(debugSdkLibraries);
 
 		debugSessions.forEach((session) => {
-			session.session.customRequest("updateDebugOptions", {
+			void session.session.customRequest("updateDebugOptions", {
 				debugExternalPackageLibraries,
 				debugSdkLibraries,
 			});
 		});
 	}
 
-	private updateEditorContexts(e: vs.TextEditor | undefined): void {
-		const isRunnable = !!(e && e.document && e.document.uri.scheme === "file" && isValidEntryFile(fsPath(e.document.uri)));
-		vs.commands.executeCommand("setContext", CURRENT_FILE_RUNNABLE, isRunnable);
+	public setSendLogsToClient(enabled: boolean) {
+		// Only send values for sessions that didn't already have logging enabled.
+		debugSessions.filter((d) => !d.session.configuration.sendLogsToClient).forEach(async (session) => {
+			try {
+				await session.session.customRequest("updateSendLogsToClient", {
+					enabled,
+				});
+			} catch {
+				// Older SDKs don't support this, so just do nothing.
+			}
+		});
 	}
 
-	public dispose(): any {
+	private updateRunnableContexts(): void {
+		const editor = vs.window.activeTextEditor;
+		const documentUri = editor?.document.uri;
+		if (documentUri?.scheme !== "file")
+			return;
+
+		const documentPath = fsPath(documentUri);
+		// Try simple check first to avoid possible out-of-sync outline.
+		let isRunnable = isValidEntryFile(documentPath);
+
+		if (!isRunnable) {
+			const outline = this.fileTracker.getOutlineFor(documentUri);
+			isRunnable = !!outline?.children?.find((c) => c.element.name === "main");
+		}
+
+		void vs.commands.executeCommand("setContext", CURRENT_FILE_RUNNABLE, isRunnable);
+	}
+
+	public dispose(): void {
 		disposeAll(this.disposables);
 	}
 }

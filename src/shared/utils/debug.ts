@@ -1,8 +1,8 @@
 import { DebuggerType } from "../enums";
 
-export function getDebugAdapterName(debugType: DebuggerType) {
+export function getDebugAdapterName(debuggerType: DebuggerType) {
 	let debuggerName: string;
-	switch (debugType) {
+	switch (debuggerType) {
 		case DebuggerType.Flutter:
 			debuggerName = "flutter";
 			break;
@@ -22,23 +22,8 @@ export function getDebugAdapterName(debugType: DebuggerType) {
 			debuggerName = "dart_test";
 			break;
 		default:
-			throw new Error(`Unknown debugger type: ${debugType}`);
+			throw new Error(`Unknown debuggerType: ${debuggerType}`);
 	}
 
 	return debuggerName;
-}
-
-export function getDebugAdapterPort(debuggerName: string) {
-	const debugAdapterNames = [
-		"flutter",
-		"flutter_test",
-		"web",
-		"web_test",
-		"dart",
-		"dart_test",
-	];
-	const index = debugAdapterNames.indexOf(debuggerName);
-	if (index === -1)
-		throw new Error(`Unknown debugger type: ${debuggerName}`);
-	return 4711 + index;
 }

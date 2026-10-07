@@ -2,17 +2,19 @@ name: hello_world
 publish_to: none
 
 environment:
-  sdk: '>=2.12.0 <3.0.0'
+  sdk: '>=2.12.0 <4.0.0'
 
 dependencies:
   http:
   convert:
   my_package:
     path: ../my_package
+  test_reflective_loader: ^0.4.0
   protobuf:
     git:
       url: https://github.com/google/protobuf.dart.git
       path: protobuf
 
 dev_dependencies:
-  test: '>=0.12.34'
+  meta:
+  test: ^1.29.0

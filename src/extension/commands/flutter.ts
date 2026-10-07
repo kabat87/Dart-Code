@@ -5,51 +5,88 @@ import * as vs from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
 import { FlutterCapabilities } from "../../shared/capabilities/flutter";
 import { vsCodeVersion } from "../../shared/capabilities/vscode";
-import { defaultLaunchJson } from "../../shared/constants";
+import { CommandSource, defaultLaunchJson, ExtensionRestartReason, flutterCreateAvailablePlatforms, flutterCreateTemplatesSupportingPlatforms } from "../../shared/constants";
 import { DartWorkspaceContext, FlutterCreateCommandArgs, FlutterCreateTriggerData, FlutterProjectTemplate, Logger } from "../../shared/interfaces";
+import { RunProcessResult } from "../../shared/processes";
 import { sortBy } from "../../shared/utils/array";
 import { stripMarkdown } from "../../shared/utils/dartdocs";
-import { fsPath, mkDirRecursive, nextAvailableFilename } from "../../shared/utils/fs";
+import { fsPath, isFlutterProjectFolder, mkDirRecursive, nextAvailableFilename } from "../../shared/utils/fs";
 import { writeFlutterSdkSettingIntoProject, writeFlutterTriggerFile } from "../../shared/utils/projects";
 import { FlutterDeviceManager } from "../../shared/vscode/device_manager";
+import { getPackageOrFolderDisplayName } from "../../shared/vscode/display_names";
 import { createFlutterSampleInTempFolder } from "../../shared/vscode/flutter_samples";
-import { FlutterSampleSnippet } from "../../shared/vscode/interfaces";
+import { PickableSetting } from "../../shared/vscode/input";
+import { FlutterSampleSnippet, OperationProgress } from "../../shared/vscode/interfaces";
+import { getAllProjectFolders } from "../../shared/vscode/utils";
 import { Context } from "../../shared/vscode/workspace";
+import { Analytics } from "../analytics";
 import { config } from "../config";
 import { getFlutterSnippets } from "../sdk/flutter_docs_snippets";
 import { SdkUtils } from "../sdk/utils";
 import * as util from "../utils";
-import { PickableSetting, showInputBoxWithSettings, showSimpleSettingsEditor } from "../utils/vscode/input";
+import { editSetting, showInputBoxWithSettings, showSimpleSettingsEditor } from "../utils/vscode/input";
 import { getFolderToRunCommandIn } from "../utils/vscode/projects";
+import { runBatchFolderOperation } from "./batch_progress";
 import { BaseSdkCommands, commandState, packageNameRegex } from "./sdk";
 
 export class FlutterCommands extends BaseSdkCommands {
 	private flutterScreenshotPath?: string;
 
-	constructor(logger: Logger, context: Context, workspace: DartWorkspaceContext, private readonly sdkUtils: SdkUtils, dartCapabilities: DartCapabilities, private readonly flutterCapabilities: FlutterCapabilities, private readonly deviceManager: FlutterDeviceManager | undefined) {
+	constructor(logger: Logger, context: Context, workspace: DartWorkspaceContext, private readonly sdkUtils: SdkUtils, dartCapabilities: DartCapabilities, private readonly flutterCapabilities: FlutterCapabilities, private readonly deviceManager: FlutterDeviceManager | undefined, private readonly analytics: Analytics) {
 		super(logger, context, workspace, dartCapabilities);
 
-		this.disposables.push(vs.commands.registerCommand("flutter.clean", this.flutterClean, this));
+		this.disposables.push(vs.commands.registerCommand("flutter.clean", this.flutterClean.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("flutter.clean.all", this.flutterCleanAllProjects.bind(this)));
 		this.disposables.push(vs.commands.registerCommand("_flutter.screenshot.touchBar", (args: any) => vs.commands.executeCommand("flutter.screenshot", args)));
-		this.disposables.push(vs.commands.registerCommand("flutter.screenshot", this.flutterScreenshot, this));
-		this.disposables.push(vs.commands.registerCommand("flutter.doctor", this.flutterDoctor, this));
-		this.disposables.push(vs.commands.registerCommand("flutter.upgrade", this.flutterUpgrade, this));
-		this.disposables.push(vs.commands.registerCommand("flutter.createProject", this.createFlutterProject, this));
-		this.disposables.push(vs.commands.registerCommand("_dart.flutter.createSampleProject", this.createFlutterSampleProject, this));
-		this.disposables.push(vs.commands.registerCommand("_flutter.create", this.flutterCreate, this));
-		this.disposables.push(vs.commands.registerCommand("_flutter.clean", this.flutterClean, this));
+		this.disposables.push(vs.commands.registerCommand("flutter.screenshot", this.flutterScreenshot.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("flutter.doctor", this.flutterDoctor.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("flutter.doctor.sidebar", () => this.flutterDoctor({ commandSource: CommandSource.sidebarTitle })));
+		this.disposables.push(vs.commands.registerCommand("flutter.upgrade", this.flutterUpgrade.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("flutter.createProject", this.createFlutterProject.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("flutter.createProject.sidebar", () => this.createFlutterProject({ commandSource: CommandSource.sidebarTitle })));
+		this.disposables.push(vs.commands.registerCommand("_dart.flutter.createSampleProject", this.createFlutterSampleProject.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("_flutter.create", this.flutterCreate.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("_flutter.clean", this.flutterClean.bind(this)));
 	}
 
-
-	private async flutterClean(selection: vs.Uri | undefined): Promise<number | undefined> {
-		if (!selection) {
-			const path = await getFolderToRunCommandIn(this.logger, `Select the folder to run "flutter clean" in`, selection, true);
-			if (!path)
-				return;
-			selection = vs.Uri.file(path);
+	private async flutterClean(
+		uri: vs.Uri | vs.Uri[] | undefined,
+		operationProgress?: OperationProgress,
+	): Promise<RunProcessResult | undefined> {
+		// If we don't have a parent progress, add one.
+		if (!operationProgress) {
+			return vs.window.withProgress({
+				cancellable: true,
+				location: vs.ProgressLocation.Notification,
+				title: "flutter clean",
+			}, (progress, token) => this.flutterClean(uri, { progressReporter: progress, cancellationToken: token }));
 		}
 
-		return this.runFlutter(["clean"], selection);
+		// If we are a batch, run for each item.
+		if (Array.isArray(uri)) {
+			await runBatchFolderOperation(uri, operationProgress, this.flutterCleanForUri.bind(this));
+			return;
+		}
+
+		if (!uri) {
+			const path = await getFolderToRunCommandIn(this.logger, `Select the folder to run "flutter clean" in`, { selection: uri, flutterOnly: true });
+			if (!path)
+				return;
+			uri = vs.Uri.file(path);
+		}
+
+		return this.flutterCleanForUri(uri, operationProgress);
+	}
+
+	private async flutterCleanForUri(uri: vs.Uri, operationProgress?: OperationProgress): Promise<RunProcessResult | undefined> {
+		return this.runFlutter(["clean"], uri, false, operationProgress);
+	}
+
+	private async flutterCleanAllProjects(): Promise<void> {
+		const allFolders = await getAllProjectFolders(this.logger, util.getExcludedFolders, { requirePubspec: true, sort: true, searchDepth: config.projectSearchDepth });
+		const flutterFolders = allFolders.filter(isFlutterProjectFolder);
+		const folderUris = flutterFolders.map((f) => vs.Uri.file(f));
+		await vs.commands.executeCommand("flutter.clean", folderUris);
 	}
 
 	private async flutterScreenshot() {
@@ -81,11 +118,11 @@ export class FlutterCommands extends BaseSdkCommands {
 
 		const debugSession = vs.debug.activeDebugSession;
 		if (!debugSession) {
-			vs.window.showErrorMessage("You must have an active Flutter debug session to take screenshots");
+			void vs.window.showErrorMessage("You must have an active Flutter debug session to take screenshots");
 			return;
 		}
 		if (debugSession.type !== "dart") {
-			vs.window.showErrorMessage("The active debug session is not a Flutter app");
+			void vs.window.showErrorMessage("The active debug session is not a Flutter app");
 			return;
 		}
 
@@ -108,15 +145,18 @@ export class FlutterCommands extends BaseSdkCommands {
 		}
 	}
 
-	public flutterDoctor() {
+	public flutterDoctor(options?: { commandSource?: string }) {
 		if (!this.workspace.sdks.flutter) {
 			this.sdkUtils.showFlutterActivationFailure("flutter.doctor");
 			return;
 		}
+
+		this.analytics.logFlutterDoctor(options?.commandSource);
+
 		const tempDir = path.join(os.tmpdir(), "dart-code-cmd-run");
 		if (!fs.existsSync(tempDir))
 			fs.mkdirSync(tempDir);
-		return this.runFlutterInFolder(tempDir, ["doctor", "-v"], "flutter", true, this.workspace.config?.flutterDoctorScript);
+		return this.runFlutterInFolder(tempDir, ["doctor", "-v"], "flutter", true, undefined, this.workspace.config?.flutterDoctorScript);
 	}
 
 	private async flutterUpgrade() {
@@ -130,33 +170,46 @@ export class FlutterCommands extends BaseSdkCommands {
 		// Don't prompt to reload when the version changes, as we automatically reload here.
 		commandState.promptToReloadOnVersionChanges = false;
 		await this.runFlutterInFolder(tempDir, ["upgrade"], "flutter", true);
-		await util.promptToReloadExtension();
+		await util.promptToReloadExtension(this.logger, { restartReason: ExtensionRestartReason.AfterFlutterUpgrade });
 	}
 
-	private async flutterCreate({ projectName, projectPath, triggerData, platform }: FlutterCreateCommandArgs) {
-		if (!projectPath) {
-			projectPath = await getFolderToRunCommandIn(this.logger, `Select the folder to run "flutter create" in`, undefined, true);
-			if (!projectPath)
+	private async flutterCreate({ packageName, packagePath, triggerData, platform }: FlutterCreateCommandArgs) {
+		if (!packagePath) {
+			packagePath = await getFolderToRunCommandIn(this.logger, `Select the folder to run "flutter create" in`, { flutterOnly: true });
+			if (!packagePath)
 				return;
 		}
+
+		const template = triggerData?.template;
+		const templateAllowsPlatform = template === undefined || flutterCreateTemplatesSupportingPlatforms.includes(template);
+		const defaultPlatforms = config.flutterCreatePlatforms;
+		// Use "--empty" if either the user selected the empty option, or are we enabling a platform.
+		const useEmpty = (template && triggerData?.empty) || (templateAllowsPlatform && platform);
 
 		const args = ["create"];
 		if (config.flutterCreateOffline || config.offline) {
 			args.push("--offline");
 		}
-		if (platform) {
-			args.push("--platforms");
-			args.push(platform);
+		if (templateAllowsPlatform) {
+			if (platform) {
+				args.push("--platforms");
+				args.push(platform);
+			} else if (defaultPlatforms) {
+				for (const platform of defaultPlatforms) {
+					args.push("--platforms");
+					args.push(platform);
+				}
+			}
 		}
-		if (projectName) {
+		if (packageName) {
 			args.push("--project-name");
-			args.push(projectName);
+			args.push(packageName);
 		}
 		if (config.flutterCreateOrganization) {
 			args.push("--org");
 			args.push(config.flutterCreateOrganization);
 		}
-		if (config.flutterCreateIOSLanguage && config.flutterCreateIOSLanguage !== "swift") {
+		if (config.flutterCreateIOSLanguage && config.flutterCreateIOSLanguage !== "swift" && this.flutterCapabilities.supportsIOSLanguage) {
 			args.push("--ios-language");
 			args.push(config.flutterCreateIOSLanguage);
 		}
@@ -169,23 +222,26 @@ export class FlutterCommands extends BaseSdkCommands {
 			args.push(triggerData.sample);
 			args.push("--overwrite");
 		}
-		if (triggerData?.template) {
+		if (template) {
 			args.push("--template");
-			args.push(triggerData.template);
+			args.push(template);
 			args.push("--overwrite");
 		}
+		if (useEmpty)
+			args.push("--empty");
 		args.push(".");
 
-		const exitCode = await this.runFlutterInFolder(projectPath, args, projectName);
+		const packageOrFolderDisplayName = getPackageOrFolderDisplayName(packagePath, { packageName });
+		const exitCode = await this.runFlutterInFolder(packagePath, args, packageOrFolderDisplayName);
 
 		if (!vsCodeVersion.supportsDebugWithoutLaunchJson) {
-			this.writeDefaultLaunchJson(projectPath);
+			this.writeDefaultLaunchJson(packagePath);
 		}
 
 		return exitCode;
 	}
 
-	private writeDefaultLaunchJson(projectPath: string) {
+	public writeDefaultLaunchJson(projectPath: string) {
 		const launchJsonFolder = path.join(projectPath, vsCodeVersion.editorConfigFolder);
 		const launchJsonFile = path.join(launchJsonFolder, "launch.json");
 		if (!fs.existsSync(launchJsonFile)) {
@@ -194,65 +250,84 @@ export class FlutterCommands extends BaseSdkCommands {
 		}
 	}
 
-	private getFlutterTemplates(): Array<vs.QuickPickItem & { template: FlutterProjectTemplate }> {
-		const templates = [
+	public getFlutterTemplates(): Array<vs.QuickPickItem & { template?: FlutterProjectTemplate }> {
+		const templates: Array<vs.QuickPickItem & { template?: FlutterProjectTemplate }> = [
 			{
-				detail: "Generate a Flutter application.",
+				kind: vs.QuickPickItemKind.Separator,
+				label: "Applications",
+			},
+			{
+				detail: "A Flutter application with descriptive comments and tests.",
 				label: "Application",
 				template: { id: "app" },
 			},
 			{
-				detail: "Generate a project to add a Flutter module to an existing Android or iOS application.",
-				label: "Module",
-				template: { id: "module" },
-			},
-			{
-				detail: "Generate a shareable Flutter project containing modular Dart code.",
-				label: "Package",
-				template: { id: "package" },
-			},
-			{
-				detail: "Generate a shareable Flutter project containing an API in Dart code with a platform-specific implementation for Android, for iOS code, or for both.",
-				label: "Plugin",
-				template: { id: "plugin" },
+				detail: "A Flutter application without descriptive comments or tests.",
+				label: "Empty Application",
+				template: { id: "app", empty: true },
 			},
 		];
 
-		if (this.flutterCapabilities.supportsCreateSkeleton) {
+		if (this.flutterCapabilities.supportsSkeleton) {
 			templates.push({
-				detail: "Generate a List View / Detail View Flutter application that follows community best practices.",
-				label: "Skeleton",
+				detail: "A List View / Detail View Flutter application that follows community best practices.",
+				label: "Skeleton Application",
 				template: { id: "skeleton" },
 			});
 		}
 
+		templates.push(
+			{
+				kind: vs.QuickPickItemKind.Separator,
+				label: "Other Project Types",
+			},
+			{
+				detail: "A project to add a Flutter module to an existing Android or iOS application.",
+				label: "Module",
+				template: { id: "module" },
+			},
+			{
+				detail: "A shareable Flutter project containing modular Dart code.",
+				label: "Package",
+				template: { id: "package" },
+			},
+			{
+				detail: "A shareable Flutter project containing an API in Dart code with a platform-specific implementation for Android, for iOS code, or for both.",
+				label: "Plugin",
+				template: { id: "plugin" },
+			},
+		);
+
 		return templates;
 	}
 
-	private async createFlutterProject(): Promise<vs.Uri | undefined> {
-		if (!this.sdks || !this.sdks.flutter) {
+	private async createFlutterProject(options?: { commandSource?: string }): Promise<vs.Uri | undefined> {
+		if (!this.sdks?.flutter) {
 			this.sdkUtils.showFlutterActivationFailure("flutter.createProject");
 			return;
 		}
+
+		this.analytics.logFlutterNewProject(options?.commandSource);
 
 		const pickItems = this.getFlutterTemplates();
 
 		const selectedTemplate = await vs.window.showQuickPick(
 			pickItems,
 			{
+				ignoreFocusOut: true,
 				matchOnDescription: true,
 				placeHolder: "Which Flutter template?",
 			},
 		);
 
-		if (!selectedTemplate)
+		if (!selectedTemplate?.template)
 			return;
 
-		return this.createFlutterProjectForTemplate(selectedTemplate.template.id);
+		return this.createFlutterProjectForTemplate(selectedTemplate.template);
 	}
 
-	private async createFlutterProjectForTemplate(template: string): Promise<vs.Uri | undefined> {
-		if (!this.sdks || !this.sdks.flutter) {
+	private async createFlutterProjectForTemplate(template: FlutterProjectTemplate): Promise<vs.Uri | undefined> {
+		if (!this.sdks?.flutter) {
 			this.sdkUtils.showFlutterActivationFailure("flutter.createProject");
 			return;
 		}
@@ -263,44 +338,56 @@ export class FlutterCommands extends BaseSdkCommands {
 			defaultUri: this.context.lastUsedNewProjectPath ? vs.Uri.file(this.context.lastUsedNewProjectPath) : undefined,
 			openLabel: "Select a folder to create the project in",
 		});
-		if (!folders || folders.length !== 1)
+		if (folders?.length !== 1)
 			return;
 		const folderPath = fsPath(folders[0]);
 		this.context.lastUsedNewProjectPath = folderPath;
 
-		const defaultName = nextAvailableFilename(folderPath, "flutter_application_");
+		const projectKind = this.getProjectKind(template.id);
+		const defaultName = nextAvailableFilename(folderPath, `flutter_${projectKind}_`);
 		const name = await this.promptForNameWithSettings(defaultName, folderPath);
 		if (!name)
 			return;
+
+		// If enabled, show the platform selector, which persists the selection options to config automatically.
+		const templateAllowsPlatform = flutterCreateTemplatesSupportingPlatforms.includes(template.id);
+		if (config.flutterCreatePromptForPlatforms && templateAllowsPlatform) {
+			if (!await editSetting(this.getCurrentFlutterPlatformSettingEditMetadata(), true)) {
+				return;
+			}
+		}
 
 		const projectFolderUri = vs.Uri.file(path.join(folderPath, name));
 		const projectFolderPath = fsPath(projectFolderUri);
 
 		if (fs.existsSync(projectFolderPath)) {
-			vs.window.showErrorMessage(`A folder named ${name} already exists in ${folderPath}`);
+			void vs.window.showErrorMessage(`A folder named ${name} already exists in ${folderPath}`);
 			return;
 		}
 
 		// Create the empty folder so we can open it.
 		fs.mkdirSync(projectFolderPath);
 
-		const triggerData: FlutterCreateTriggerData | undefined = template ? { template } : undefined;
+		const triggerData: FlutterCreateTriggerData | undefined = template
+			? { template: template.id, empty: template.empty }
+			: undefined;
 		writeFlutterTriggerFile(projectFolderPath, triggerData);
 
 		// If we're using a custom SDK, we need to apply it to the new project too.
 		if (config.workspaceFlutterSdkPath)
 			writeFlutterSdkSettingIntoProject(config.workspaceFlutterSdkPath, projectFolderPath);
 
-		vs.commands.executeCommand("vscode.openFolder", projectFolderUri);
+		void vs.commands.executeCommand("vscode.openFolder", projectFolderUri);
 
 		return projectFolderUri;
 	}
 
-	private async promptForNameWithSettings(defaultName: string, folderPath: string): Promise<string | undefined> {
+	public async promptForNameWithSettings(defaultName: string, folderPath: string): Promise<string | undefined> {
 		while (true) {
 			const response = await showInputBoxWithSettings(
 				this.context,
 				{
+					ignoreFocusOut: true,
 					placeholder: defaultName,
 					prompt: "Enter a name for your new project",
 					title: "Project Name",
@@ -313,7 +400,7 @@ export class FlutterCommands extends BaseSdkCommands {
 				await showSimpleSettingsEditor(
 					"Settings for new Flutter projects",
 					"Select a setting to change (or 'Escape' to cancel)",
-					() => getCurrentFlutterCreateSettings(),
+					() => this.getCurrentFlutterCreateSettingsEditMetadata(),
 				);
 				continue;
 			} else if (response) {
@@ -325,7 +412,7 @@ export class FlutterCommands extends BaseSdkCommands {
 	}
 
 	private async createFlutterSampleProject(): Promise<vs.Uri | undefined> {
-		if (!this.sdks || !this.sdks.flutter) {
+		if (!this.sdks?.flutter) {
 			this.sdkUtils.showFlutterActivationFailure("_dart.flutter.createSampleProject");
 			return;
 		}
@@ -333,9 +420,9 @@ export class FlutterCommands extends BaseSdkCommands {
 		// Fetch the JSON for the available samples.
 		let snippets: FlutterSampleSnippet[];
 		try {
-			snippets = await getFlutterSnippets(this.logger, this.sdks, this.flutterCapabilities);
+			snippets = await getFlutterSnippets(this.logger, this.sdks);
 		} catch {
-			vs.window.showErrorMessage("Unable to retrieve Flutter documentation snippets");
+			void vs.window.showErrorMessage("Unable to retrieve Flutter documentation snippets");
 			return;
 		}
 
@@ -349,6 +436,7 @@ export class FlutterCommands extends BaseSdkCommands {
 				snippet: s,
 			})),
 			{
+				ignoreFocusOut: true,
 				matchOnDescription: true,
 				placeHolder: "Which Flutter sample?",
 			},
@@ -363,50 +451,84 @@ export class FlutterCommands extends BaseSdkCommands {
 		if (!packageNameRegex.test(input))
 			return "Flutter project names should be all lowercase, with underscores to separate words";
 
-		const bannedNames = ["flutter", "flutter_test", "test", "integration_test"];
+		const bannedNames = ["flutter", "flutter_test", "test", "integration_test", "this"];
 		if (bannedNames.includes(input))
 			return `You may not use ${input} as the name for a flutter project`;
 
 		if (fs.existsSync(path.join(folderDir, input)))
 			return `A project with this name already exists within the selected directory`;
 	}
-}
 
-function getCurrentFlutterCreateSettings(): PickableSetting[] {
-	return [
-		{
-			currentValue: config.flutterCreateOrganization || "com.example",
-			description: config.flutterCreateOrganization || "com.example",
-			detail: "The organization responsible for your new Flutter project, in reverse domain name notation. This string is used in Java package names and as prefix in the iOS bundle identifier.",
-			label: "Organization",
-			setValue: (newValue: string | undefined) => config.setFlutterCreateOrganization(newValue),
-			settingKind: "STRING",
-		},
-		{
-			currentValue: config.flutterCreateAndroidLanguage || "kotlin",
-			description: config.flutterCreateAndroidLanguage || "kotlin",
-			detail: "The language to use for Android-specific code, either Java (legacy) or Kotlin (recommended).",
-			enumValues: ["kotlin", "java"],
-			label: "Android Language",
-			setValue: (newValue: "kotlin" | "java" | undefined) => config.setFlutterCreateAndroidLanguage(newValue),
-			settingKind: "ENUM",
-		},
-		{
-			currentValue: config.flutterCreateIOSLanguage || "swift",
-			description: config.flutterCreateIOSLanguage || "swift",
-			detail: "The language to use for iOS-specific code, either ObjectiveC (legacy) or Swift (recommended).",
-			enumValues: ["swift", "objc"],
-			label: "iOS Language",
-			setValue: (newValue: "swift" | "objc" | undefined) => config.setFlutterCreateIOSLanguage(newValue),
-			settingKind: "ENUM",
-		},
-		{
-			currentValue: config.flutterCreateOffline ? "enabled" : "not enabled",
-			description: config.flutterCreateOffline ? "enabled" : "not enabled",
-			detail: "When \"flutter pub get\" is run by the create command, this indicates whether to run it in offline mode or not. In offline mode, it will need to have all dependencies already available in the pub cache to succeed.",
-			label: "Create Projects Offline",
-			setValue: (newValue: boolean | undefined) => config.setFlutterCreateOffline(newValue),
-			settingKind: "BOOL",
-		},
-	];
+	private getProjectKind(templateName: string) {
+		if (templateName.includes("module"))
+			return "module";
+		if (templateName.includes("package"))
+			return "package";
+		if (templateName.includes("plugin"))
+			return "plugin";
+
+		return "application";
+	}
+
+	private getCurrentFlutterPlatformSettingEditMetadata(): PickableSetting {
+		return {
+			currentValue: config.flutterCreatePlatforms ?? flutterCreateAvailablePlatforms,
+			doNotAskNextTimeOption: {
+				currentValue: config.flutterCreatePromptForPlatforms,
+				inverted: true,
+				setValue: (newValue: boolean | undefined) => config.setFlutterCreatePromptForPlatforms(newValue ? undefined : false),
+			},
+			description: config.flutterCreatePlatforms ? config.flutterCreatePlatforms.join(", ") : "all",
+			detail: "The platforms that should be enabled for new Flutter applications.",
+			enumValues: flutterCreateAvailablePlatforms,
+			label: "Platforms",
+			setValue: async (newValues: any[]) => {
+				const valueToSave = newValues.length === flutterCreateAvailablePlatforms.length
+					? undefined // all
+					: newValues;
+				await config.setFlutterCreatePlatforms(valueToSave);
+			},
+			settingKind: "MULTI_ENUM",
+		};
+	}
+
+	public getCurrentFlutterCreateSettingsEditMetadata(): PickableSetting[] {
+		return [
+			{
+				currentValue: config.flutterCreateOrganization || "com.example",
+				description: config.flutterCreateOrganization || "com.example",
+				detail: "The organization responsible for your new Flutter project, in reverse domain name notation. This string is used in Java package names and as prefix in the iOS bundle identifier.",
+				label: "Organization",
+				setValue: (newValue: string | undefined) => config.setFlutterCreateOrganization(newValue),
+				settingKind: "STRING",
+			},
+			{
+				currentValue: config.flutterCreateAndroidLanguage || "kotlin",
+				description: config.flutterCreateAndroidLanguage || "kotlin",
+				detail: "The language to use for Android-specific code, either Java (legacy) or Kotlin (recommended).",
+				enumValues: ["kotlin", "java"],
+				label: "Android Language",
+				setValue: (newValue: "kotlin" | "java" | undefined) => config.setFlutterCreateAndroidLanguage(newValue),
+				settingKind: "ENUM",
+			},
+			{
+				currentValue: config.flutterCreateIOSLanguage || "swift",
+				description: config.flutterCreateIOSLanguage || "swift",
+				detail: "The language to use for iOS-specific code (Flutter <= 3.22 only), either ObjectiveC (legacy) or Swift (recommended).",
+				enumValues: ["swift", "objc"],
+				label: "iOS Language",
+				setValue: (newValue: "swift" | "objc" | undefined) => config.setFlutterCreateIOSLanguage(newValue),
+				settingKind: "ENUM",
+			},
+			{
+				currentValue: config.offline ? "enabled" : "not enabled",
+				description: config.offline ? "enabled" : "not enabled",
+				detail: "When commands like \"flutter pub get\" or \"flutter create\" are run, this indicates whether to run in offline mode or not. In offline mode, it will need to have all dependencies already available in the pub cache to succeed.",
+				label: "Offline Mode",
+				setValue: (newValue: boolean | undefined) => config.setOffline(newValue),
+				settingKind: "BOOL",
+			},
+			this.getCurrentFlutterPlatformSettingEditMetadata(),
+		];
+	}
 }

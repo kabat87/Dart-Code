@@ -1,29 +1,31 @@
 import * as path from "path";
 import * as vs from "vscode";
-import { DART_IS_CAPTURING_LOGS_CONTEXT } from "../../shared/constants";
+import { captureLogsMaxLineLength } from "../../shared/constants";
+import { DART_IS_CAPTURING_LOGS_CONTEXT } from "../../shared/constants.contexts";
 import { LogCategory } from "../../shared/enums";
+import { IAmDisposable } from "../../shared/interfaces";
 import { captureLogs, EmittingLogger } from "../../shared/logging";
-import { PromiseCompleter } from "../../shared/utils";
-import { forceWindowsDriveLetterToUppercase, fsPath } from "../../shared/utils/fs";
-import { config } from "../config";
-import { createFolderForFile } from "../utils";
+import { disposeAll, PromiseCompleter } from "../../shared/utils";
+import { createFolderForFile, forceWindowsDriveLetterToUppercase, fsPath } from "../../shared/utils/fs";
 import { analysisServerLogCategories, debuggingLogCategories, extensionsLogCategories, getExtensionLogPath, getLogHeader, userSelectableLogCategories } from "../utils/log";
 
 export let isLogging = false;
 
-export class LoggingCommands implements vs.Disposable {
-	private disposables: vs.Disposable[] = [];
+export class LoggingCommands implements IAmDisposable {
+	private disposables: IAmDisposable[] = [];
 	private currentLogCompleter: PromiseCompleter<void> | undefined;
+	private onCaptureLogsEmitter = new vs.EventEmitter<boolean>();
+	public readonly onCaptureLogs = this.onCaptureLogsEmitter.event;
 
 	constructor(private readonly logger: EmittingLogger, private extensionLogPath: string) {
 		this.disposables.push(
-			vs.commands.registerCommand("dart.startLogging", this.startLoggingViaPicker, this),
-			vs.commands.registerCommand("dart.startLoggingDebugging", this.startLoggingDebugging, this),
-			vs.commands.registerCommand("dart.startLoggingAnalysisServer", this.startLoggingAnalysisServer, this),
-			vs.commands.registerCommand("dart.startLoggingAnalysisServerTimings", this.startLoggingAnalysisServerTimings, this),
-			vs.commands.registerCommand("dart.startLoggingExtensionOnly", this.startLoggingExtensionOnly, this),
-			vs.commands.registerCommand("dart.openExtensionLog", this.openExtensionLog, this),
-			vs.commands.registerCommand("dart.stopLogging", this.stopLogging, this),
+			vs.commands.registerCommand("dart.startLogging", this.startLoggingViaPicker.bind(this)),
+			vs.commands.registerCommand("dart.startLoggingDebugging", this.startLoggingDebugging.bind(this)),
+			vs.commands.registerCommand("dart.startLoggingAnalysisServer", this.startLoggingAnalysisServer.bind(this)),
+			vs.commands.registerCommand("dart.startLoggingAnalysisServerTimings", this.startLoggingAnalysisServerTimings.bind(this)),
+			vs.commands.registerCommand("dart.startLoggingExtensionOnly", this.startLoggingExtensionOnly.bind(this)),
+			vs.commands.registerCommand("dart.openExtensionLog", this.openExtensionLog.bind(this)),
+			vs.commands.registerCommand("dart.stopLogging", this.stopLogging.bind(this)),
 		);
 	}
 
@@ -39,7 +41,7 @@ export class LoggingCommands implements vs.Disposable {
 				placeHolder: "Select which categories to include in the log",
 			},
 		);
-		if (!selectedLogCategories || !selectedLogCategories.length)
+		if (!selectedLogCategories?.length)
 			return;
 
 		return this.startLogging(selectedLogCategories.map((s) => s.logCategory));
@@ -68,10 +70,11 @@ export class LoggingCommands implements vs.Disposable {
 
 		const allLoggedCategories = [LogCategory.General].concat(categoriesToLog);
 
-		const logger = captureLogs(this.logger, fsPath(logUri), getLogHeader(), config.maxLogLineLength, allLoggedCategories);
+		const logger = captureLogs(this.logger, fsPath(logUri), getLogHeader(), captureLogsMaxLineLength, allLoggedCategories);
 		isLogging = true;
+		this.onCaptureLogsEmitter.fire(isLogging);
 		this.disposables.push(logger);
-		vs.commands.executeCommand("setContext", DART_IS_CAPTURING_LOGS_CONTEXT, true);
+		void vs.commands.executeCommand("setContext", DART_IS_CAPTURING_LOGS_CONTEXT, true);
 		const completer = new PromiseCompleter<void>();
 		this.currentLogCompleter = completer;
 
@@ -88,6 +91,7 @@ export class LoggingCommands implements vs.Disposable {
 		);
 
 		isLogging = false;
+		this.onCaptureLogsEmitter.fire(isLogging);
 		await logger.dispose();
 
 		const doc = await vs.workspace.openTextDocument(logUri);
@@ -113,8 +117,7 @@ export class LoggingCommands implements vs.Disposable {
 		return `Dart-Code-Log-${formattedDate}.txt`;
 	}
 
-	public dispose(): any {
-		for (const command of this.disposables)
-			command.dispose();
+	public dispose(): void {
+		disposeAll(this.disposables);
 	}
 }

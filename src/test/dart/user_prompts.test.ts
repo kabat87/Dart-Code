@@ -3,14 +3,15 @@ import * as sinon from "sinon";
 import * as vs from "vscode";
 import { doNotAskAgainAction, flutterSurveyDataUrl, longRepeatPromptThreshold, noRepeatPromptThreshold, openAction, skipThisSurveyAction, takeSurveyAction, twoHoursInMs, wantToTryDevToolsPrompt } from "../../shared/constants";
 import { Analytics } from "../../shared/interfaces";
+import { nullLogger } from "../../shared/logging";
 import { waitFor } from "../../shared/utils/promises";
-import { showDevToolsNotificationIfAppropriate, showFlutterSurveyNotificationIfAppropriate } from "../../shared/vscode/user_prompts";
-import { activateWithoutAnalysis, clearAllContext, extApi, flutterTestSurveyID, logger, sb } from "../helpers";
+import { showDevToolsNotificationIfAppropriate, showFlutterSurveyNotificationIfAppropriate, showSdkDeprecationNoticeIfAppropriate } from "../../shared/vscode/user_prompts";
+import { activateWithoutAnalysis, clearAllContext, flutterTestSurveyID, logger, privateApi, sb } from "../helpers";
 
 describe("DevTools notification", async () => {
 	beforeEach("activate", () => activateWithoutAnalysis());
-	beforeEach("clearExtensionContext", () => clearAllContext(extApi.context));
-	afterEach("clearExtensionContext", () => clearAllContext(extApi.context));
+	beforeEach("clearExtensionContext", () => clearAllContext(privateApi.context));
+	afterEach("clearExtensionContext", () => clearAllContext(privateApi.context));
 
 	it("is shown from a blank slate and updates context values", async () => {
 		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
@@ -19,7 +20,7 @@ describe("DevTools notification", async () => {
 		const executeCommand = sb.stub(vs.commands, "executeCommand").callThrough();
 		const openDevToolsCommand = executeCommand.withArgs("dart.openDevTools").resolves();
 
-		const res = await showDevToolsNotificationIfAppropriate(extApi.context);
+		const res = await showDevToolsNotificationIfAppropriate(privateApi.context);
 
 		// Was asked, and launched..
 		assert.equal(wantToTryPrompt.calledOnce, true);
@@ -27,14 +28,14 @@ describe("DevTools notification", async () => {
 		assert.equal(res.didOpen, true);
 
 		// Flags were updated.
-		const context = extApi.context;
+		const context = privateApi.context;
 		assert.equal(context.devToolsNotificationDoNotShow, false);
 		// Marked as shown within the last 10 seconds.
 		assert.equal(context.devToolsNotificationLastShown && context.devToolsNotificationLastShown > Date.now() - 10000 && context.devToolsNotificationLastShown <= Date.now(), true);
 	});
 
 	it("shows and updates context values when already set", async () => {
-		const context = extApi.context;
+		const context = privateApi.context;
 		context.devToolsNotificationLastShown = Date.now() - (noRepeatPromptThreshold + twoHoursInMs);
 
 		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
@@ -43,7 +44,7 @@ describe("DevTools notification", async () => {
 		const executeCommand = sb.stub(vs.commands, "executeCommand").callThrough();
 		const openDevToolsCommand = executeCommand.withArgs("dart.openDevTools").resolves();
 
-		const res = await showDevToolsNotificationIfAppropriate(extApi.context);
+		const res = await showDevToolsNotificationIfAppropriate(privateApi.context);
 
 		// Was asked, and launched..
 		assert.equal(wantToTryPrompt.calledOnce, true);
@@ -57,7 +58,7 @@ describe("DevTools notification", async () => {
 	});
 
 	it("does not show if shown in the last 20 hours", async () => {
-		const context = extApi.context;
+		const context = privateApi.context;
 		const fiveHoursInMs = 1000 * 60 * 60 * 5;
 		context.devToolsNotificationLastShown = Date.now() - fiveHoursInMs;
 
@@ -67,7 +68,7 @@ describe("DevTools notification", async () => {
 		const executeCommand = sb.stub(vs.commands, "executeCommand").callThrough();
 		const openDevToolsCommand = executeCommand.withArgs("dart.openDevTools").resolves();
 
-		const res = await showDevToolsNotificationIfAppropriate(extApi.context);
+		const res = await showDevToolsNotificationIfAppropriate(privateApi.context);
 
 		// Was not asked, or launched.
 		assert.equal(wantToTryPrompt.called, false);
@@ -82,7 +83,7 @@ describe("DevTools notification", async () => {
 		const executeCommand = sb.stub(vs.commands, "executeCommand").callThrough();
 		const openDevToolsCommand = executeCommand.withArgs("dart.openDevTools", sinon.match.any).resolves();
 
-		const res = await showDevToolsNotificationIfAppropriate(extApi.context);
+		const res = await showDevToolsNotificationIfAppropriate(privateApi.context);
 
 		// Was asked, but not launched.
 		assert.equal(wantToTryPrompt.called, true);
@@ -90,11 +91,11 @@ describe("DevTools notification", async () => {
 		assert.equal(res.didOpen, false);
 
 		// Flag was written.
-		assert.equal(extApi.context.devToolsNotificationDoNotShow, true);
+		assert.equal(privateApi.context.devToolsNotificationDoNotShow, true);
 	});
 
 	it("does not prompt if told not to ask again", async () => {
-		extApi.context.devToolsNotificationDoNotShow = true;
+		privateApi.context.devToolsNotificationDoNotShow = true;
 
 		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
 		const wantToTryPrompt = showInformationMessage.withArgs(wantToTryDevToolsPrompt, sinon.match.any).resolves(doNotAskAgainAction);
@@ -102,7 +103,7 @@ describe("DevTools notification", async () => {
 		const executeCommand = sb.stub(vs.commands, "executeCommand").callThrough();
 		const openDevToolsCommand = executeCommand.withArgs("dart.openDevTools", sinon.match.any).resolves();
 
-		const res = await showDevToolsNotificationIfAppropriate(extApi.context);
+		const res = await showDevToolsNotificationIfAppropriate(privateApi.context);
 
 		// Was not asked, or launched.
 		assert.equal(wantToTryPrompt.called, false);
@@ -113,11 +114,11 @@ describe("DevTools notification", async () => {
 
 describe("Survey notification", async () => {
 	beforeEach("activate", () => activateWithoutAnalysis());
-	beforeEach("clearExtensionContext", () => clearAllContext(extApi.context));
-	afterEach("clearExtensionContext", () => clearAllContext(extApi.context));
+	beforeEach("clearExtensionContext", () => clearAllContext(privateApi.context));
+	afterEach("clearExtensionContext", () => clearAllContext(privateApi.context));
 
 	beforeEach("setUpSurveyJsonMock", () => {
-		const fetch = sb.stub(extApi.webClient, "fetch").callThrough();
+		const fetch = sb.stub(privateApi.webClient, "fetch").callThrough();
 		fetch.withArgs(flutterSurveyDataUrl).resolves(`
 			{
 				"_comments": [
@@ -160,9 +161,9 @@ describe("Survey notification", async () => {
 		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
 		const openSurveyPrompt = showInformationMessage.withArgs(matchPrompt, sinon.match.any).resolves(takeSurveyAction);
 
-		const openBrowserCommand = sb.stub(extApi.envUtils, "openInBrowser").resolves();
+		const openBrowserCommand = sb.stub(privateApi.envUtils, "openInBrowser").resolves();
 
-		const res = await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, surveyIsOpenDate, logger);
+		const res = await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), surveyIsOpenDate, logger);
 
 		// Was asked, and launched..
 		assert.equal(openSurveyPrompt.calledOnce, true);
@@ -173,23 +174,40 @@ describe("Survey notification", async () => {
 		assert.equal(surveyClicked.calledOnce, true);
 
 		// Flags were updated.
-		const context = extApi.context;
+		const context = privateApi.context;
 		assert.equal(context.getFlutterSurveyNotificationDoNotShow(flutterTestSurveyID), true);
 		// Marked as shown within the last 10 seconds.
 		const lastShown = context.getFlutterSurveyNotificationLastShown(flutterTestSurveyID);
 		assert.equal(lastShown && lastShown > Date.now() - 10000 && lastShown <= Date.now(), true);
 	});
 
+	it("URL-encodes query parameters", async () => {
+		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
+		showInformationMessage.withArgs(matchPrompt, sinon.match.any).resolves(takeSurveyAction);
+
+		sb.stub(vs.env, "appName").value("Danny's Super Editor?/Beta");
+		sb.stub(privateApi.workspaceContext.sdks, "dartVersion").get(() => "3.4.0 dev+1");
+		sb.stub(privateApi.workspaceContext.sdks, "flutterVersion").get(() => "3.22.0 (custom)");
+
+		const openBrowserCommand = sb.stub(privateApi.envUtils, "openInBrowser").resolves();
+
+		const res = await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), surveyIsOpenDate, logger);
+
+		assert.equal(res, true);
+		await waitFor(() => openBrowserCommand.calledOnce);
+		assert.equal(openBrowserCommand.firstCall.args[0], "https://example.org/?Source=Danny's%20Super%20Editor%3F%2FBeta&DartVersion=3.4.0%20dev%2B1&FlutterVersion=3.22.0%20(custom)");
+	});
+
 	it("shows and updates context values when already seen", async () => {
-		const context = extApi.context;
+		const context = privateApi.context;
 		context.setFlutterSurveyNotificationLastShown(flutterTestSurveyID, surveyIsOpenDate - (longRepeatPromptThreshold + twoHoursInMs));
 
 		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
 		const openSurveyPrompt = showInformationMessage.withArgs(matchPrompt, sinon.match.any).resolves(takeSurveyAction);
 
-		const openBrowserCommand = sb.stub(extApi.envUtils, "openInBrowser").resolves();
+		const openBrowserCommand = sb.stub(privateApi.envUtils, "openInBrowser").resolves();
 
-		const res = await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, surveyIsOpenDate, logger);
+		const res = await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), surveyIsOpenDate, logger);
 
 		// Was asked, and launched..
 		assert.equal(openSurveyPrompt.calledOnce, true);
@@ -206,7 +224,7 @@ describe("Survey notification", async () => {
 	});
 
 	it("does not show if shown in the last 40 hours", async () => {
-		const context = extApi.context;
+		const context = privateApi.context;
 		const now = surveyIsOpenDate;
 		const fiveHoursInMs = 1000 * 60 * 60 * 5;
 		context.setFlutterSurveyNotificationLastShown(flutterTestSurveyID, now - fiveHoursInMs);
@@ -214,9 +232,9 @@ describe("Survey notification", async () => {
 		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
 		const openSurveyPrompt = showInformationMessage.withArgs(matchPrompt, sinon.match.any).resolves(takeSurveyAction);
 
-		const openBrowserCommand = sb.stub(extApi.envUtils, "openInBrowser").resolves();
+		const openBrowserCommand = sb.stub(privateApi.envUtils, "openInBrowser").resolves();
 
-		const res = await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, now, logger);
+		const res = await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), now, logger);
 
 		// Was not asked, or launched.
 		assert.equal(openSurveyPrompt.called, false);
@@ -229,9 +247,9 @@ describe("Survey notification", async () => {
 		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
 		const openSurveyPrompt = showInformationMessage.withArgs(matchPrompt, sinon.match.any).resolves(skipThisSurveyAction);
 
-		const openBrowserCommand = sb.stub(extApi.envUtils, "openInBrowser").resolves();
+		const openBrowserCommand = sb.stub(privateApi.envUtils, "openInBrowser").resolves();
 
-		const res = await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, surveyIsOpenDate, logger);
+		const res = await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), surveyIsOpenDate, logger);
 
 		// Was asked, but not launched.
 		assert.equal(openSurveyPrompt.called, true);
@@ -241,19 +259,19 @@ describe("Survey notification", async () => {
 		assert.equal(surveyDismissed.calledOnce, true);
 
 		// Flag was written.
-		await waitFor(() => extApi.context.getFlutterSurveyNotificationDoNotShow(flutterTestSurveyID));
-		assert.equal(extApi.context.getFlutterSurveyNotificationDoNotShow(flutterTestSurveyID), true);
+		await waitFor(() => privateApi.context.getFlutterSurveyNotificationDoNotShow(flutterTestSurveyID));
+		assert.equal(privateApi.context.getFlutterSurveyNotificationDoNotShow(flutterTestSurveyID), true);
 	});
 
 	it("does not prompt if told not to ask again", async () => {
-		extApi.context.setFlutterSurveyNotificationDoNotShow(flutterTestSurveyID, true);
+		privateApi.context.setFlutterSurveyNotificationDoNotShow(flutterTestSurveyID, true);
 
 		const showInformationMessage = sb.stub(vs.window, "showInformationMessage");
 		const openSurveyPrompt = showInformationMessage.withArgs(matchPrompt, sinon.match.any).resolves(skipThisSurveyAction);
 
-		const openBrowserCommand = sb.stub(extApi.envUtils, "openInBrowser").resolves();
+		const openBrowserCommand = sb.stub(privateApi.envUtils, "openInBrowser").resolves();
 
-		const res = await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, surveyIsOpenDate, logger);
+		const res = await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), surveyIsOpenDate, logger);
 
 		// Was not asked, or launched.
 		assert.equal(openSurveyPrompt.called, false);
@@ -263,20 +281,152 @@ describe("Survey notification", async () => {
 	});
 
 	it("does not show before survey opens", async () => {
-		assert.equal(await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, immediatelyBeforeSurveyOpensDate, logger), false);
+		assert.equal(await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), immediatelyBeforeSurveyOpensDate, logger), false);
 		assert.equal(surveyShown.called, false);
 	});
 	it("shows after survey opens", async () => {
-		assert.equal(await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, immediatelyAfterSurveyOpensDate, logger), true);
+		assert.equal(await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), immediatelyAfterSurveyOpensDate, logger), true);
 		assert.equal(surveyShown.calledOnce, true);
 	});
 	it("shows before survey closes", async () => {
-		assert.equal(await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, immediatelyBeforeSurveyClosesDate, logger), true);
+		assert.equal(await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), immediatelyBeforeSurveyClosesDate, logger), true);
 		assert.equal(surveyShown.calledOnce, true);
 	});
 	it("does not show after survey closes", async () => {
-		assert.equal(await showFlutterSurveyNotificationIfAppropriate(extApi.context, extApi.webClient, mockAnalytics, extApi.envUtils.openInBrowser, immediatelyAfterSurveyClosesDate, logger), false);
+		assert.equal(await showFlutterSurveyNotificationIfAppropriate(privateApi.context, privateApi.webClient, mockAnalytics, privateApi.workspaceContext, (url) => privateApi.envUtils.openInBrowser(url), immediatelyAfterSurveyClosesDate, logger), false);
 		assert.equal(surveyShown.called, false);
 	});
 });
 
+describe("SDK deprecation notice", async () => {
+	let showWarningMessage: sinon.SinonStub;
+
+	beforeEach("activate", () => activateWithoutAnalysis());
+	beforeEach("set showWarningMessage stub", () => {
+		showWarningMessage = sb.stub(vs.window, "showWarningMessage").resolves();
+	});
+	beforeEach("clearExtensionContext", () => clearAllContext(privateApi.context));
+	afterEach("clearExtensionContext", () => clearAllContext(privateApi.context));
+
+
+	function configure(options: {
+		dartVersion?: string,
+		flutterVersion?: string,
+		dartIsFromFlutter?: boolean,
+		isUnsupported: boolean,
+		isUnsupportedSoon: boolean,
+	}) {
+		sb.stub(privateApi.workspaceContext.sdks, "dartVersion").get(() => options.dartVersion ?? "1.1.1");
+		sb.stub(privateApi.workspaceContext.sdks, "flutterVersion").get(() => options.flutterVersion ?? "2.2.2");
+		sb.stub(privateApi.workspaceContext.sdks, "dartSdkIsFromFlutter").get(() => options.dartIsFromFlutter ?? false);
+		sb.stub(privateApi.dartCapabilities, "isUnsupportedNow").get(() => options.isUnsupported);
+		sb.stub(privateApi.dartCapabilities, "isUnsupportedSoon").get(() => options.isUnsupportedSoon);
+	}
+
+	async function testNotification() {
+		await showSdkDeprecationNoticeIfAppropriate(nullLogger, privateApi.context, privateApi.workspaceContext, privateApi.dartCapabilities);
+	}
+
+	it("is not shown if the current SDK is supported", async () => {
+		configure({
+			isUnsupported: false,
+			isUnsupportedSoon: false,
+		});
+		await testNotification();
+
+		assert.equal(showWarningMessage.called, false);
+	});
+
+	it("is shown if the current SDK is unsupported now (Dart)", async () => {
+		configure({
+			isUnsupported: true,
+			isUnsupportedSoon: true, // isUnsupported is always checked first.
+		});
+		await testNotification();
+
+		assert.equal(showWarningMessage.calledOnce, true);
+		assert.equal(showWarningMessage.firstCall.args[0], "v1.1 of the Dart SDK is not supported by this version of the Dart extension. Update to a more recent Dart SDK or switch to an older version of the extension.");
+	});
+
+	it("is shown if the current SDK is unsupported now (Flutter)", async () => {
+		configure({
+			dartIsFromFlutter: true,
+			isUnsupported: true, // isUnsupported is always checked first.
+			isUnsupportedSoon: true,
+		});
+		await testNotification();
+
+		assert.equal(showWarningMessage.calledOnce, true);
+		assert.equal(showWarningMessage.firstCall.args[0], "v2.2 of the Flutter SDK is not supported by this version of the Dart extension. Update to a more recent Flutter SDK or switch to an older version of the extension.");
+	});
+
+	it("is shown if the current SDK is unsupported soon (Dart)", async () => {
+		configure({
+			isUnsupported: false,
+			isUnsupportedSoon: true,
+		});
+		await testNotification();
+
+
+		assert.equal(showWarningMessage.calledOnce, true);
+		assert.equal(showWarningMessage.firstCall.args[0], "Support for v1.1 of the Dart SDK will be removed in an upcoming release of the Dart extension. Consider updating to a more recent Dart SDK.");
+	});
+
+	it("is shown if the current SDK is unsupported soon (Flutter)", async () => {
+		configure({
+			dartIsFromFlutter: true,
+			isUnsupported: false,
+			isUnsupportedSoon: true,
+		});
+		await testNotification();
+
+		assert.equal(showWarningMessage.calledOnce, true);
+		assert.equal(showWarningMessage.firstCall.args[0], "Support for v2.2 of the Flutter SDK will be removed in an upcoming release of the Dart extension. Consider updating to a more recent Flutter SDK.");
+	});
+
+	it("is shown every time if the current SDK is unsupported now", async () => {
+		configure({
+			isUnsupported: true,
+			isUnsupportedSoon: true,
+		});
+		await testNotification();
+		await testNotification();
+
+		assert.equal(showWarningMessage.calledTwice, true);
+	});
+
+	it("is only once if the current SDK is unsupported soon", async () => {
+		configure({
+			isUnsupported: false,
+			isUnsupportedSoon: true,
+		});
+		await testNotification();
+		await testNotification();
+
+		assert.equal(showWarningMessage.calledOnce, true);
+	});
+
+	it("is shown for different major/minor SDK versions that are unsupported soon", async () => {
+		configure({
+			dartVersion: "1.1.1",
+			isUnsupported: false,
+			isUnsupportedSoon: true,
+		});
+		await testNotification();
+		configure({
+			dartVersion: "1.1.2",
+			isUnsupported: false,
+			isUnsupportedSoon: true,
+		});
+		await testNotification();
+		configure({
+			dartVersion: "1.2.3",
+			isUnsupported: false,
+			isUnsupportedSoon: true,
+		});
+		await testNotification();
+
+		// Expect only two, because the first two are same major+minor
+		assert.equal(showWarningMessage.calledTwice, true);
+	});
+});

@@ -5,17 +5,17 @@ export interface Request<T> {
 	params: T;
 }
 
-export interface Response<T> {
+interface Response<T> {
 	id: string;
 	error: any;
 	result: T;
 }
 
-export interface UnknownResponse extends Response<any> { }
+export type UnknownResponse = Response<any>;
 
-export interface Notification<T> {
+interface Notification<T> {
 	event: string;
 	params: T;
 }
 
-export interface UnknownNotification extends Notification<any> { }
+export type UnknownNotification = Notification<any>;

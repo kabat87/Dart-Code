@@ -4,43 +4,51 @@ on:
   push:
   pull_request:
   schedule:
-     - cron: '0 6 * * 1-5'
+     - cron: '0 6 * * 1' # 6am Monday
+  workflow_dispatch:
 
 jobs:
 
 
   build_exclusions:
 
+    # We want to run on external PRs, but not on our own internal PRs as they'll be run
+    # by the push to the branch.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+
+    permissions:
+      contents: none
     runs-on: ubuntu-latest
     outputs:
       excludes: ${{ join(steps.*.outputs.excludes) }}
     steps:
       - id: no_exclude
         name: Run all builds
-        if: github.event_name == 'schedule'
-        run: echo "::set-output name=excludes::[]"
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        # We only exclude beta versions of "other IDEs" that don't have insiders versions.
+        run: echo 'excludes=[{"build-version":"beta","bot":"dart-antigravity"},{"build-version":"beta","bot":"dart_debug-antigravity"}]' >> $GITHUB_OUTPUT
       - id: exclude
         name: Exclude some builds if not running on schedule
-        if: github.event_name != 'schedule'
-        run: echo "::set-output name=excludes::[{\"build-version\":\"dev\"},{\"os\":\"windows-latest\"},{\"os\":\"macos-latest\"}]"
-
+        if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' && !startsWith(github.ref, 'refs/tags/')
+        # Exclude:
+        # - all betas
+        # - windows
+        # - macOS
+        run: echo 'excludes=[{"build-version":"beta"},{"os":"windows-latest"},{"os":"macos-latest"}]' >> $GITHUB_OUTPUT
 
   build:
 
     name: "${{ matrix.bot }} (${{ matrix.build-version }} ${{ matrix.os }})"
     runs-on: ${{ matrix.os }}
     needs: build_exclusions
-    # We want to run on external PRs, but not on our own internal PRs as they'll be run
-    # by the push to the branch.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
 
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macOS-latest]
-        node-version: [14]
-        build-version: [stable, dev]
-        bot: [flutter_debug, flutter_debug_chrome, flutter_debug_sdk_dap, flutter_debug_chrome_sdk_dap, flutter_test_debug, flutter_test_debug_sdk_dap, dart_web_debug, flutter_repo, dart_debug, dart_debug_sdk_dap, dart, dart_lsp, flutter, flutter_lsp, misc]
+        node-version: [22]
+        build-version: [stable, beta]
+        bot: [flutter_debug, flutter_debug_chrome, flutter_test_debug, dart_web_debug, flutter_repo, dart_debug, dart, flutter, misc, dart-antigravity, dart_debug-antigravity]
         include:
           - os: ubuntu-latest
             bot: flutter_snap
@@ -48,7 +56,7 @@ jobs:
 
     steps:
 
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v7
 
       # upload-artifact fails if the path does not exist (it only supports
       # silent failure for no-files-found, but the path must exist), so
@@ -56,35 +64,74 @@ jobs:
       # get additional failures reported on the artifact uploads that make
       # it less clear what the failure is.
       - run: |
+          mkdir -p .crash_dumps
           mkdir -p .dart_code_test_logs
           mkdir -p .test_results
           mkdir -p coverage
         shell: pwsh
 
-      - name: Setup XVFB
+      - name: Set up XVFB
         if: matrix.os == 'ubuntu-latest'
         run: Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
 
-      - name: Setup Node v${{ matrix.node-version }}
-        uses: actions/setup-node@v2
+      - name: Set up Node v${{ matrix.node-version }}
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Setup Flutter ${{ matrix.build-version }}
+      - name: Install Antigravity (Linux)
+        if: endsWith(matrix.bot, '-antigravity') && matrix.os == 'ubuntu-latest'
+        run: |
+          sudo mkdir -p /etc/apt/keyrings
+          curl -fsSL https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg | sudo gpg --dearmor --yes -o /etc/apt/keyrings/antigravity-repo-key.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/antigravity-repo-key.gpg] https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev antigravity-debian main" | sudo tee /etc/apt/sources.list.d/antigravity.list
+          sudo apt-get update && sudo apt-get install antigravity -y
+          echo "ANTIGRAVITY_EXE=/usr/share/antigravity/antigravity" >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Install Antigravity (macOS)
+        if: endsWith(matrix.bot, '-antigravity') && matrix.os == 'macOS-latest'
+        run: |
+          brew install --cask antigravity-ide
+          echo "ANTIGRAVITY_EXE=/Applications/Antigravity IDE.app/Contents/MacOS/Electron" >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Install Antigravity (Windows)
+        if: endsWith(matrix.bot, '-antigravity') && matrix.os == 'windows-latest'
+        # HACK: We can use:
+        #     Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1"
+        #     refreshenv
+        # To update PATH, but it goes to the `bin` folder and we want the .exe, so we just
+        # hard-code it for now.
+        run: |
+          choco install antigravity-ide --yes
+          "ANTIGRAVITY_EXE=C:\Users\runneradmin\AppData\Local\Programs\Antigravity IDE\Antigravity IDE.exe" >> $env:GITHUB_ENV
+        shell: pwsh
+
+      - name: Set up Flutter ${{ matrix.build-version }}
         id: flutter
         if: matrix.bot != 'flutter_snap' && !startsWith(matrix.bot, 'dart')
-        uses: DanTup/gh-actions/setup-flutter@v1.1.0
+        uses: DanTup/gh-actions/setup-flutter@27c44eb7d43bced080fc5c9b6c3e4cfdd4cdcc41
         with:
           channel: ${{ matrix.build-version }}
 
-      - name: Setup Dart ${{ matrix.build-version }}
+      - name: Set up Dart ${{ matrix.build-version }}
         if: startsWith(matrix.bot, 'dart') || matrix.bot == 'misc'
-        uses: DanTup/gh-actions/setup-dart@v1.1.0
+        uses: dart-lang/setup-dart@6e0ff0bc3a029a9532ae6a86b1ea4906038921bc
         with:
-          channel: ${{ matrix.build-version }}
+          sdk: ${{ matrix.build-version }}
 
-      - run: sudo snap install flutter --classic
+      - name: Set up Flutter (snap) w/ DBUS_SESSION_BUS_ADDRESS fix
+        run: |
+          sudo snap install flutter --classic
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> $GITHUB_ENV
         if: matrix.bot == 'flutter_snap'
+
+      - run: dart --disable-analytics
+        if: matrix.bot != 'flutter_snap'
+
+      - run: flutter config --no-analytics
+        if: matrix.bot != 'flutter_snap' && !startsWith(matrix.bot, 'dart')
 
       - run: flutter update-packages
         if: matrix.bot == 'flutter_repo'
@@ -101,14 +148,17 @@ jobs:
         if: startsWith(matrix.bot, 'flutter') && matrix.bot != 'flutter_snap'
         run: flutter config --enable-web
 
+      - name: Flutter precache
+        if: matrix.bot == 'flutter_debug_chrome'
+        run: flutter precache --web
+
       - run: |
-          dart pub global activate --no-executables devtools
+          dart pub global activate --no-executables crypto
           dart pub global activate --no-executables webdev
-          dart pub global activate --no-executables stagehand
-          dart pub global activate --no-executables args 1.5.0
-          dart pub global activate --no-executables meta 1.1.6
-          dart pub global activate --no-executables pedantic 1.4.0
-          dart pub global activate --no-executables json_annotation 1.2.0
+          dart pub global activate --no-executables args 2.3.0
+          dart pub global activate --no-executables meta 1.7.0
+          dart pub global activate --no-executables lints 1.0.0
+          dart pub global activate --no-executables json_annotation 4.0.1
         if: matrix.bot != 'flutter_snap'
         shell: pwsh
 
@@ -131,10 +181,40 @@ jobs:
         run: dart pub get
         working-directory: src/test/test_projects/hello_world/example
 
+      - name: dart pub get (dart_nested)
+        if: matrix.bot == 'misc'
+        run: dart pub get
+        working-directory: src/test/test_projects/dart_nested
+
+      - name: dart pub get (dart_nested/nested1)
+        if: matrix.bot == 'misc'
+        run: dart pub get
+        working-directory: src/test/test_projects/dart_nested/nested1
+
+      - name: dart pub get (web/hello_world)
+        if: startsWith(matrix.bot, 'dart_web')
+        run: dart pub get
+        working-directory: src/test/test_projects/web/hello_world
+
+      - name: dart pub get (web/broken)
+        if: startsWith(matrix.bot, 'dart_web')
+        run: dart pub get
+        working-directory: src/test/test_projects/web/broken
+
+      - name: dart pub get (dart_nested/nested1/nested2)
+        if: matrix.bot == 'misc'
+        run: dart pub get
+        working-directory: src/test/test_projects/dart_nested/nested1/nested2
+
       - name: flutter pub get (dart_nested_flutter/nested_flutter_example)
         if: matrix.bot == 'misc'
         run: flutter pub get
         working-directory: src/test/test_projects/dart_nested_flutter/nested_flutter_example
+
+      - name: flutter pub get (dart_nested_flutter2/nested_flutter_example)
+        if: matrix.bot == 'misc'
+        run: flutter pub get
+        working-directory: src/test/test_projects/dart_nested_flutter2/nested_flutter_example
 
       - name: flutter create (flutter_hello_world)
         if: startsWith(matrix.bot, 'flutter') && matrix.bot != 'flutter_snap'
@@ -156,6 +236,10 @@ jobs:
         run: flutter packages get
         working-directory: src/test/test_projects/bazel_workspace/flutter_hello_world_bazel
 
+      - name: ps -x (before)
+        if: matrix.os != 'windows-latest'
+        run: ps -x
+
       - name: npm test
         run: npm test
         env:
@@ -164,65 +248,180 @@ jobs:
           DISPLAY: ":99.0"
           BOT: ${{ matrix.bot }}
           BUILD_VERSION: ${{ matrix.build-version }}
-          LOGS_NAME: ${{ matrix.build-version }}_${{ matrix.build-version }}
+          LOGS_NAME: ${{ matrix.build-version }}
           FLUTTER_REPO_PATH: ${{ steps.flutter.outputs.flutter-sdk }}
 
+      - name: npm run test-grammar
+        if: matrix.bot == 'misc'
+        run: npm run test-grammar
+
+      - name: ps -x (after)
+        if: matrix.os != 'windows-latest'
+        run: ps -x
+
       - name: Store logs
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: test-logs-${{ matrix.os }}
+          name: test-logs-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
           path: .dart_code_test_logs
+          include-hidden-files: true
+          if-no-files-found: ignore
 
       - name: Store test results
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: test-results-${{ matrix.os }}
+          name: test-results-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
           path: .test_results
+          include-hidden-files: true
+          if-no-files-found: ignore
 
       - name: Store coverage
-        uses: actions/upload-artifact@v1
+        uses: actions/upload-artifact@v7
         if: success() && matrix.build-version == 'stable'
         with:
-          name: coverage-${{ matrix.os }}
+          name: coverage-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
           path: coverage
+          if-no-files-found: ignore
+
+      - name: Store CPU profiles
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: cpu-profiles-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
+          path: |
+            /tmp/*.cpuprofile
+            ${{ runner.temp }}/*.cpuprofile
+            ${{ env.TMPDIR }}/*.cpuprofile
+            ${{ env.TMP }}/*.cpuprofile
+            ${{ env.TEMP }}/*.cpuprofile
+          if-no-files-found: ignore
+
+      - name: Store crash dumps
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: crash-dumps-${{ matrix.build-version }}-${{ matrix.os }}-${{ matrix.bot }}
+          path: .crash_dumps
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  link_check:
+    name: Check Links (Lychee)
+    runs-on: ubuntu-latest
+    needs: build_exclusions
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run Lychee Link Checker
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: >
+            --root-dir ./
+            --exclude-all-private
+            --exclude '\$\%7B[^}]+\%7D'
+            --exclude "^file://"
+            ./src/**/*.ts
+            ./*.md
+            ./**/*.license
+            package.json
+
+  merge_artifacts:
+
+    name: Merge Artifacts
+    needs: build
+    # Using always() (to run on failure) will cause us to also run regardless of whether "build" ran, so
+    # explicitly check that ran and passed or failed (and was not skipped/cancelled).
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'failure')
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Merge logs
+        uses: actions/upload-artifact/merge@v7
+        if: always()
+        with:
+          name: test-logs
+          pattern: test-logs-*
+          separate-directories: true
+          delete-merged: true
+        continue-on-error: true # fails if empty
+
+      - name: Merge test results
+        uses: actions/upload-artifact/merge@v7
+        if: always()
+        with:
+          name: test-results
+          pattern: test-results-*
+          separate-directories: true
+          delete-merged: true
+        continue-on-error: true # fails if empty
+
+      - name: Merge coverage
+        uses: actions/upload-artifact/merge@v7
+        if: success()
+        with:
+          name: coverage
+          pattern: coverage-*
+          delete-merged: true
+        continue-on-error: true # fails if empty
+
+      - name: Merge crash dumps
+        uses: actions/upload-artifact/merge@v7
+        if: always()
+        with:
+          name: crash-dumps
+          pattern: crash-dumps-*
+          separate-directories: true
+          delete-merged: true
+        continue-on-error: true # fails if empty
+
+      - name: Merge CPU profiles
+        uses: actions/upload-artifact/merge@v7
+        if: always()
+        with:
+          name: cpu-profiles
+          pattern: cpu-profiles-*
+          separate-directories: true
+          delete-merged: true
+        continue-on-error: true # fails if empty
 
   upload_coverage:
 
-    name: Send Coverage to CodeClimate
-    needs: build
+    name: Send Coverage to Codecov
+    needs: merge_artifacts
     if: always() && github.event_name == 'push'
     runs-on: ubuntu-latest
 
     steps:
 
-      - uses: actions/checkout@v1
+      - uses: actions/checkout@v7
 
-      - name: Fetch Linux coverage
-        uses: actions/download-artifact@v1
+      - name: Download coverage
+        uses: actions/download-artifact@v8
         with:
-          name: coverage-ubuntu-latest
-          path: coverage/linux
+          name: coverage
+          path: coverage
 
-      - name: Upload to CodeClimate
-        run: |
-          curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > ./cc-test-reporter
-          chmod +x ./cc-test-reporter
-          export GIT_BRANCH="${GITHUB_REF/refs\/heads\//}"
-          export GIT_SHA="${GITHUB_SHA}"
-          find coverage/**/**/lcov.info | cut -d '/' -f2- | xargs -I % -n1 ./cc-test-reporter format-coverage -t lcov -o coverage/%.json coverage/% # -p /home/runner/work/Dart-Code/Dart-Code
-          ./cc-test-reporter sum-coverage -o coverage/codeclimate.json coverage/**/**/lcov.info.json
-          ./cc-test-reporter upload-coverage
-        env:
-          CC_TEST_REPORTER_ID: ${{ secrets.CC_TEST_REPORTER_ID }}
-
+      - name: Upload coverage reports to Codecov with GitHub Action
+        uses: codecov/codecov-action@v7
+        with:
+          directory: coverage
+          verbose: true
 
   notify_failure:
 
+    permissions:
+      contents: none
     name: Notify Discord of Failure
     needs: build
-    if: failure() && github.event_name == 'push'
+    if: failure() && (github.event_name == 'push' || github.event_name == 'schedule') && github.ref == 'refs/heads/master' && github.repository == 'Dart-Code/Dart-Code'
     runs-on: ubuntu-latest
 
     steps:

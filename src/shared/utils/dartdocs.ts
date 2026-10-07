@@ -82,9 +82,9 @@ function fixVariant(variant: string): string {
 	return variant === "round" ? "rounded" : variant;
 }
 
-const identifierPrefixRewritePattern = new RegExp(`3d|\\d+`);
+const identifierPrefixRewritePattern = new RegExp(`^(?:3d|\\d+)`);
 
-const identifierPrefixRewrites: { [key: string]: string | undefined } = {
+const identifierPrefixRewrites: Record<string, string | undefined> = {
 	// See identifierPrefixRewrites in
 	// https://github.com/flutter/flutter/blob/master/dev/tools/update_icons.dart
 	"1": "one_",
@@ -118,22 +118,24 @@ const identifierPrefixRewrites: { [key: string]: string | undefined } = {
 	"8": "eight_",
 	"9": "nine_",
 };
-const identifierExactRewrites: { [key: string]: string | undefined } = {
+const identifierExactRewrites: Record<string, string | undefined> = {
 	// See identifierExactRewrites in
 	// https://github.com/flutter/flutter/blob/master/dev/tools/update_icons.dart
-	"class": "class_",
-	"door_back": "door_back_door",
-	"door_front": "door_front_door",
-	"new": "new_",
-	"switch": "switch_",
-	"try": "try_sms_star",
+	class: "class_",
+	// eslint-disable-next-line camelcase
+	door_back: "door_back_door",
+	// eslint-disable-next-line camelcase
+	door_front: "door_front_door",
+	new: "new_",
+	switch: "switch_",
+	try: "try_sms_star",
 };
 
 function fixIcon(icon: string): string {
 	// Things starting with numbers are textual in their names too.
 	const prefixMatch = identifierPrefixRewritePattern.exec(icon);
 	if (prefixMatch) {
-		const prefix = prefixMatch[0]!;
+		const prefix = prefixMatch[0];
 		const newPrefix = identifierPrefixRewrites[prefix];
 		if (newPrefix)
 			return `${newPrefix}${icon.slice(prefix.length)}`;

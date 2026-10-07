@@ -1,9 +1,12 @@
 import * as vs from "vscode";
+import { URI } from "vscode-uri";
+import { IAmDisposable, Position, Range } from "../interfaces";
 import { disposeAll } from "../utils";
 
-export class DocumentPositionTracker implements vs.Disposable {
-	private readonly disposables: vs.Disposable[] = [];
-	private readonly tracker: DocumentOffsetTracker = new DocumentOffsetTracker();
+export class SingleDocumentPositionTracker implements IAmDisposable {
+	// TODO(dantup): Deprecate and remove this in favour of DocumentPositionTracker
+	private readonly disposables: IAmDisposable[] = [];
+	private readonly tracker: SingleDocumentOffsetTracker = new SingleDocumentOffsetTracker();
 	private readonly positionMap: Map<vs.Position, number> = new Map<vs.Position, number>();
 
 	private onPositionsChangedEmitter = new vs.EventEmitter<[vs.TextDocument, Map<vs.Position, vs.Position>]>();
@@ -49,8 +52,9 @@ export class DocumentPositionTracker implements vs.Disposable {
 	}
 }
 
-export class DocumentOffsetTracker implements vs.Disposable {
-	private readonly disposables: vs.Disposable[] = [];
+export class SingleDocumentOffsetTracker implements IAmDisposable {
+	// TODO(dantup): Deprecate and remove this in favour of DocumentPositionTracker
+	private readonly disposables: IAmDisposable[] = [];
 	private document: vs.TextDocument | undefined;
 	private readonly offsetMap: Map<number, number> = new Map<number, number>();
 
@@ -113,5 +117,200 @@ export class DocumentOffsetTracker implements vs.Disposable {
 
 	public dispose() {
 		disposeAll(this.disposables);
+	}
+}
+
+interface PositionTrackerEntry {
+	offset: number;
+	position: vs.Position;
+	callback: (newPosition: vs.Position | undefined) => void;
+	dispose(): void;
+}
+
+export class DocumentPositionTracker implements IAmDisposable {
+	private readonly disposables: IAmDisposable[] = [];
+	private readonly trackers: Map<string, PositionTrackerEntry[]> = new Map<string, PositionTrackerEntry[]>();
+
+	constructor() {
+		this.disposables.push(vs.workspace.onDidChangeTextDocument((e) => this.handleDocumentChange(e)));
+		this.disposables.push(vs.workspace.onDidOpenTextDocument((doc) => this.handleDocumentOpen(doc)));
+	}
+
+	public trackPosition(document: vs.TextDocument, position: Position, callback: (newPosition: vs.Position | undefined) => void): IAmDisposable {
+		const vsPosition = new vs.Position(position.line, position.character);
+		const offset = document.offsetAt(vsPosition);
+		const key = document.uri.toString();
+		const entry: PositionTrackerEntry = {
+			offset,
+			position: vsPosition,
+			callback,
+			dispose: () => {
+				const trackers = this.trackers.get(key);
+				if (!trackers)
+					return;
+
+				const index = trackers.indexOf(entry);
+				if (index !== -1) {
+					trackers.splice(index, 1);
+				}
+				if (trackers.length === 0) {
+					this.trackers.delete(key);
+				}
+			}
+		};
+
+		if (!this.trackers.has(key)) {
+			this.trackers.set(key, []);
+		}
+		this.trackers.get(key)!.push(entry);
+
+		return entry;
+	}
+
+	private handleDocumentChange(e: vs.TextDocumentChangeEvent) {
+		// Some "document changes" are things like metadata and don't
+		// actually change the content. We don't care about those.
+		if (!e.contentChanges.length)
+			return;
+
+		const trackers = this.trackers.get(e.document.uri.toString());
+		if (!trackers)
+			return;
+
+		const trackersToDispose: PositionTrackerEntry[] = [];
+		// Don't call callbacks inline, as they might try to modify the trackers.
+		const callbacksToCall: Array<() => void> = [];
+		for (const entry of trackers) {
+			const newOffset = this.updateOffset(entry.offset, e);
+			const newPosition = newOffset !== undefined ? e.document.positionAt(newOffset) : undefined;
+
+			callbacksToCall.push(() => entry.callback(newPosition));
+			if (newOffset === undefined) {
+				trackersToDispose.push(entry);
+			} else {
+				entry.offset = newOffset;
+				entry.position = newPosition!;
+			}
+		}
+
+		for (const callback of callbacksToCall)
+			callback();
+
+		for (const tracker of trackersToDispose)
+			tracker.dispose();
+	}
+
+	private handleDocumentOpen(doc: vs.TextDocument) {
+		const trackers = this.trackers.get(doc.uri.toString());
+		if (!trackers)
+			return;
+
+		// When a document opens, verify that the offsets are still valid.
+		// If the file was modified outside of VS Code while closed, the offsets might be invalid.
+		// If we can detect this, we should clear all trackers for that file. If all positions are
+		// still valid we will just assume no changes.
+		const docLength = doc.getText().length;
+		const hasInvalidOffsets = trackers.some((entry) => entry.offset > docLength || !entry.position.isEqual(doc.positionAt(entry.offset)));
+		if (hasInvalidOffsets) {
+			const trackersToDispose = [...trackers];
+			for (const tracker of trackersToDispose) {
+				tracker.callback(undefined);
+			}
+			for (const tracker of trackersToDispose)
+				tracker.dispose();
+		}
+	}
+
+	private updateOffset(offset: number, change: vs.TextDocumentChangeEvent): number | undefined {
+		// If any edit spans us, consider us deleted.
+		if (change.contentChanges.find((edit) => edit.rangeOffset < offset && edit.rangeOffset + edit.rangeLength > offset)) {
+			return undefined;
+		}
+
+		// Otherwise, shift us along to account for any edits before us.
+		const totalDiff = change.contentChanges
+			// Edits that end before us.
+			.filter((edit) => edit.rangeOffset + edit.rangeLength <= offset)
+			// Get the difference in lengths to know if we inserted or removed.
+			.map((edit) => edit.text.length - edit.rangeLength)
+			.reduce((total, n) => total + n, 0);
+
+		return offset + totalDiff;
+	}
+
+	public dispose() {
+		this.trackers.clear();
+		disposeAll(this.disposables);
+	}
+}
+
+interface RangeTrackerEntry {
+	dispose: () => void;
+}
+
+export class DocumentRangeTracker implements IAmDisposable {
+	private readonly positionTracker = new DocumentPositionTracker();
+	private readonly rangeTrackers: RangeTrackerEntry[] = [];
+
+	public async trackRangeForUri(documentUri: URI, range: Range, callback: (newRange: Range | undefined) => void): Promise<IAmDisposable> {
+		// TODO(dantup): This being async doesn't feel good.
+		const document = vs.workspace.textDocuments.find((d) => d.uri.toString() === documentUri.toString())
+			?? await vs.workspace.openTextDocument(documentUri);
+
+		return this.trackRange(document, range, callback);
+	}
+
+	public trackRange(document: vs.TextDocument, range: Range, callback: (newRange: Range | undefined) => void): IAmDisposable {
+		let start: Position | undefined = range.start;
+		let end: Position | undefined = range.end;
+
+		// TODO(dantup): If start/end are the same, just short-cut this with one position tracker.
+		// TODO(dantup): Because both the start/end positions move when content is modified before
+		//  this range and we track both start/end, we end up firing once after the start moves, then
+		//  the end. It would be better if we just atomically update the range once (which might
+		//  mean just not using position tracker as-is?)
+
+		const startDisposable = this.positionTracker.trackPosition(document, range.start, (newPos) => {
+			start = newPos;
+			updateRange();
+		});
+
+		const endDisposable = this.positionTracker.trackPosition(document, range.end, (newPos) => {
+			end = newPos;
+			updateRange();
+		});
+
+		const updateRange = () => {
+			const newRange = (start && end) ? { start, end } : undefined;
+			callback(newRange);
+
+			// If we don't have a range because one position went away, be sure to dispose the other tracker.
+			if (!newRange) {
+				startDisposable.dispose();
+				endDisposable.dispose();
+			}
+		};
+
+		const entry: RangeTrackerEntry = {
+			dispose: () => {
+				startDisposable.dispose();
+				endDisposable.dispose();
+				const index = this.rangeTrackers.indexOf(entry);
+				if (index !== -1) {
+					this.rangeTrackers.splice(index, 1);
+				}
+			}
+		};
+
+		this.rangeTrackers.push(entry);
+
+		return entry;
+	}
+
+	public dispose() {
+		this.positionTracker.dispose();
+		// We don't need to dispose these manually, because disposing the position tracker
+		// already disposes all tracked positions.
+		this.rangeTrackers.length = 0;
 	}
 }

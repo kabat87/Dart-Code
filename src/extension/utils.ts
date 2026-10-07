@@ -1,18 +1,20 @@
 import * as fs from "fs";
 import * as https from "https";
+import { minimatch } from "minimatch";
 import * as os from "os";
 import * as path from "path";
 import { commands, Uri, window, workspace, WorkspaceFolder } from "vscode";
-import { showLogAction } from "../shared/constants";
-import { BasicDebugConfiguration } from "../shared/debug/interfaces";
-import { WorkspaceConfig } from "../shared/interfaces";
-import { fsPath, getRandomInt, hasPubspec, isFlutterProjectFolder, isWithinPath, mkDirRecursive } from "../shared/utils/fs";
+import { ExtensionRestartReason, showLogAction } from "../shared/constants";
+import { BasicDebugConfiguration } from "../shared/debugging/interfaces";
+import { Logger, WorkspaceConfig } from "../shared/interfaces";
+import { filenameSafe } from "../shared/utils";
+import { existsAndIsDirectorySync, existsAndIsFileSync, fsPath, getRandomInt, hasPubspec, isFlutterProjectFolder } from "../shared/utils/fs";
+import { isWithinWorkspace, locateBestProjectRoot } from "../shared/vscode/project";
 import { isDartWorkspaceFolder } from "../shared/vscode/utils";
 import { config } from "./config";
 import { ringLog } from "./extension";
-import { locateBestProjectRoot } from "./project";
 
-export function isFlutterWorkspaceFolder(folder?: WorkspaceFolder): boolean {
+function isFlutterWorkspaceFolder(folder?: WorkspaceFolder): boolean {
 	return !!(folder && isDartWorkspaceFolder(folder) && isFlutterProjectFolder(fsPath(folder.uri)));
 }
 
@@ -28,6 +30,8 @@ export function isInsideFlutterProject(uri?: Uri): boolean {
 }
 
 export function isPathInsideFlutterProject(path: string): boolean {
+	// TODO(dantup): This can be called quite a lot when discovering tests, so consider
+	//  maintaining a model for the workspace.
 	const projectRoot = locateBestProjectRoot(path);
 	if (!projectRoot)
 		return false;
@@ -35,40 +39,17 @@ export function isPathInsideFlutterProject(path: string): boolean {
 	return isFlutterProjectFolder(projectRoot);
 }
 
-export function resolvePaths<T extends string | undefined>(p: T): string | (undefined extends T ? undefined : never) {
+export function insertSessionName(args: { name: string }, logPath: string | undefined) {
+	return logPath
+		? logPath.replace(/\${name}/ig, filenameSafe(args.name || "unnamed-session"))
+		: logPath;
+}
+
+export function insertWorkspaceName<T extends string | undefined>(p: T): string | (undefined extends T ? undefined : never) {
 	if (typeof p !== "string")
 		return undefined as (undefined extends T ? undefined : never);
 
-	if (p.startsWith("~/"))
-		return path.join(os.homedir(), p.substr(2));
-	if (!path.isAbsolute(p) && workspace.workspaceFolders && workspace.workspaceFolders.length)
-		return path.join(fsPath(workspace.workspaceFolders[0].uri), p);
-	return p;
-}
-
-/// Shortens a path to use ~ if it's inside the home directory.
-export function homeRelativePath(p?: string) {
-	if (!p) return undefined;
-	const homedir = os.homedir();
-	if (isWithinPath(p, homedir))
-		return path.join("~", path.relative(homedir, p));
-	return p;
-}
-
-export function createFolderForFile(file?: string): string | undefined {
-	try {
-		if (!file || !path.isAbsolute(file))
-			return undefined;
-
-		const folder = path.dirname(file);
-		if (!fs.existsSync(folder))
-			mkDirRecursive(folder);
-
-		return file;
-	} catch {
-		console.warn(`Ignoring invalid file path ${file}`);
-		return undefined;
-	}
+	return p.replace(/\${workspaceName}/ig, filenameSafe(workspace.name ?? "unnamed-workspace"));
 }
 
 export function isAnalyzable(file: { uri: Uri, isUntitled?: boolean, languageId?: string }): boolean {
@@ -79,34 +60,33 @@ export function isAnalyzable(file: { uri: Uri, isUntitled?: boolean, languageId?
 	const analyzableFilenames = [".analysis_options", "analysis_options.yaml", "pubspec.yaml"];
 	// We have to include dart/html extensions as this function may be called without a language ID
 	// (for example when triggered by a file system watcher).
-	const analyzableFileExtensions = ["dart", "htm", "html"].concat(config.additionalAnalyzerFileExtensions);
+	const analyzableFileExtensions = ["dart", "htm", "html"];
 
 	const extName = path.extname(fsPath(file.uri));
 	const extension = extName ? extName.substr(1) : undefined;
 
-	return (file.languageId && analyzableLanguages.indexOf(file.languageId) >= 0)
-		|| analyzableFilenames.indexOf(path.basename(fsPath(file.uri))) >= 0
+	return (file.languageId && analyzableLanguages.includes(file.languageId))
+		|| analyzableFilenames.includes(path.basename(fsPath(file.uri)))
 		|| (extension !== undefined && analyzableFileExtensions.includes(extension));
 }
 
 export function shouldHotReloadFor(file: { uri: Uri, isUntitled?: boolean, languageId?: string }): boolean {
-	if (file.isUntitled || !fsPath(file.uri) || file.uri.scheme !== "file")
+	if (file.isUntitled || file.uri.scheme !== "file")
 		return false;
 
-	const reloadableFileExtensions = ["dart", "htm", "html", "css"];
+	const filePath = fsPath(file.uri);
+	const extension = path.extname(filePath).substr(1);
 
-	const extName = path.extname(fsPath(file.uri));
-	const extension = extName ? extName.substr(1) : undefined;
+	const reloadableFileExtensions = ["dart", "htm", "html", "css", "frag"];
+	if (reloadableFileExtensions.includes(extension))
+		return true;
 
-	return extension !== undefined && reloadableFileExtensions.includes(extension);
+	const resourceConf = config.for(file.uri);
+	return !!resourceConf.hotReloadPatterns.find((p) => minimatch(filePath, p, { dot: true }));
 }
 
 export function isAnalyzableAndInWorkspace(file: { uri: Uri, isUntitled?: boolean, languageId?: string }): boolean {
 	return isAnalyzable(file) && isWithinWorkspace(fsPath(file.uri));
-}
-
-export function isWithinWorkspace(file: string) {
-	return !!workspace.getWorkspaceFolder(Uri.file(file));
 }
 
 export function isTestFileOrFolder(path: string | undefined): boolean {
@@ -114,7 +94,7 @@ export function isTestFileOrFolder(path: string | undefined): boolean {
 }
 
 export function isTestFile(file: string): boolean {
-	// To be a test, you must be _test.dart AND inside a test folder.
+	// To be a test, you must be _test.dart AND inside a test folder (unless allowTestsOutsideTestFolder).
 	// https://github.com/Dart-Code/Dart-Code/issues/1165
 	// https://github.com/Dart-Code/Dart-Code/issues/2021
 	// https://github.com/Dart-Code/Dart-Code/issues/2034
@@ -130,8 +110,8 @@ export function isTestFile(file: string): boolean {
 
 // Similar to isTestFile, but requires that the file is _test.dart because it will be used as
 // an entry point for pub test running.
-export function isPubRunnableTestFile(file: string): boolean {
-	return !!file && isDartFile(file) && file.toLowerCase().endsWith("_test.dart");
+export function isRunnableTestFile(file: string): boolean {
+	return !!file && file.toLowerCase().endsWith("_test.dart") && isDartFile(file);
 }
 
 export function isTestFolder(path: string | undefined): boolean {
@@ -139,16 +119,21 @@ export function isTestFolder(path: string | undefined): boolean {
 		&& (
 			isInsideFolderNamed(path, "test")
 			|| isInsideFolderNamed(path, "integration_test")
-		) && fs.existsSync(path)
-		&& fs.statSync(path).isDirectory();
+		) && existsAndIsDirectorySync(path);
 }
 
-export function projectShouldUsePubForTests(folder: string, config: WorkspaceConfig): boolean {
-	return hasPubspec(folder) && !config.useVmForTests;
+export function projectCanUsePackageTest(folder: string, config: WorkspaceConfig): boolean {
+	// Handle explicit flags.
+	if (config.supportsPackageTest === true)
+		return true;
+	else if (config.supportsPackageTest === false)
+		return false;
+
+	return hasPubspec(folder);
 }
 
 export function isDartFile(file: string): boolean {
-	return !!file && path.extname(file.toLowerCase()) === ".dart" && fs.existsSync(file) && fs.statSync(file).isFile();
+	return !!file && path.extname(file).toLowerCase() === ".dart" && existsAndIsFileSync(file);
 }
 
 export function isInsideFolderNamed(file: string | undefined, folderName: string): boolean {
@@ -163,15 +148,11 @@ export function isInsideFolderNamed(file: string | undefined, folderName: string
 	const relPath = path.relative(fsPath(ws.uri).toLowerCase(), file.toLowerCase());
 	const segments = relPath.split(path.sep);
 
-	return segments.indexOf(folderName.toLowerCase()) !== -1;
+	return segments.includes(folderName.toLowerCase());
 }
 
-export function hasTestNameFilter(...argss: Array<string[] | undefined>) {
-	for (const args of argss) {
-		if (args && (args.includes("--name") || args.includes("--pname")))
-			return true;
-	}
-	return false;
+export function hasTestFilter(args: string[]) {
+	return args.includes("--name") || args.includes("--pname");
 }
 
 /// Ensures a debug config always has a unique ID we can use to match things up.
@@ -185,7 +166,7 @@ export function ensureDebugLaunchUniqueId(config: BasicDebugConfiguration): stri
 		const dartCodeDebugSessionID = `session-${getRandomInt(0x10000, 0x100000).toString(16)}`;
 		conf.dartCodeDebugSessionID = dartCodeDebugSessionID;
 	}
-	return conf.dartCodeDebugSessionID;
+	return conf.dartCodeDebugSessionID as string;
 }
 
 export function isValidEntryFile(file: string | undefined) {
@@ -211,14 +192,14 @@ export function getLatestSdkVersion(): Promise<string> {
 		};
 
 		const req = https.request(options, (resp) => {
-			if (!resp || !resp.statusCode || resp.statusCode < 200 || resp.statusCode > 300) {
-				reject({ message: `Failed to get Dart SDK Version ${resp && resp.statusCode}: ${resp && resp.statusMessage}` });
+			if (!resp?.statusCode || resp.statusCode < 200 || resp.statusCode > 300) {
+				reject({ message: `Failed to get Dart SDK Version ${resp?.statusCode}: ${resp?.statusMessage}` });
 			} else {
 				resp.on("data", (d: Buffer | string) => {
 					try {
 						const latestVersion = JSON.parse(d.toString()).version as string;
 						resolve(latestVersion);
-					} catch (e) {
+					} catch {
 						reject({ message: `Failed to parse latest Dart SDK Version from JSON: ${d.toString()}` });
 					}
 				});
@@ -228,36 +209,35 @@ export function getLatestSdkVersion(): Promise<string> {
 	});
 }
 
-// Escapes a set of command line arguments so that the escaped string is suitable for passing as an argument
-// to another shell command.
-// Implementation is taken from https://github.com/xxorax/node-shell-escape
-export function escapeShell(args: string[]) {
-	const ret: string[] = [];
-	args.forEach((arg) => {
-		if (/[^A-Za-z0-9_\/:=-]/.test(arg)) {
-			arg = "'" + arg.replace(/'/g, "'\\''") + "'";
-			arg = arg.replace(/^(?:'')+/g, "") // unduplicate single-quote at the beginning
-				.replace(/\\'''/g, "\\'"); // remove non-escaped single-quote if there are enclosed between 2 escaped
-		}
-		ret.push(arg);
-	});
-	return ret.join(" ");
-}
-
-export async function promptToReloadExtension(prompt?: string, buttonText?: string, offerLog?: boolean): Promise<void> {
-	const restartAction = buttonText || "Reload";
+export async function promptToReloadExtension(
+	logger: Logger,
+	{ prompt, buttonText, offerLog, specificLog, severity, restartReason, restartData }:
+		{ prompt?: string; buttonText?: string; offerLog?: boolean; specificLog?: string; severity?: "ERROR" | "WARNING"; restartReason: ExtensionRestartReason, restartData?: string, },
+): Promise<void> {
+	const restartAction = buttonText || "Restart Extension";
 	const actions = offerLog ? [restartAction, showLogAction] : [restartAction];
+
+	logger.warn(`Prompting to reload: (${prompt}) (actions: ${actions.join(", ")})`);
+
 	const ringLogContents = ringLog.toString();
 	let showPromptAgain = true;
 	const tempLogPath = path.join(os.tmpdir(), `log-${getRandomInt(0x1000, 0x10000).toString(16)}.txt`);
 	while (showPromptAgain) {
 		showPromptAgain = false;
-		const chosenAction = prompt && await window.showInformationMessage(prompt, ...actions);
+		const show = severity === "ERROR"
+			? window.showErrorMessage
+			: severity === "WARNING"
+				? window.showWarningMessage
+				: window.showInformationMessage;
+		const chosenAction = prompt && await show(prompt, ...actions);
 		if (chosenAction === showLogAction) {
 			showPromptAgain = true;
-			openLogContents(undefined, ringLogContents, tempLogPath);
+			if (specificLog && fs.existsSync(specificLog))
+				void workspace.openTextDocument(specificLog).then(window.showTextDocument);
+			else
+				void openLogContents(undefined, ringLogContents, tempLogPath);
 		} else if (!prompt || chosenAction === restartAction) {
-			commands.executeCommand("_dart.reloadExtension");
+			void commands.executeCommand("_dart.reloadExtension", restartReason, restartData);
 		}
 	}
 }
@@ -278,11 +258,11 @@ export const logTime = (taskFinished?: string) => {
 	last = end;
 };
 
-export function openLogContents(logType = `txt`, logContents: string, tempPath?: string) {
+export async function openLogContents(logType = `txt`, logContents: string, tempPath?: string) {
 	if (!tempPath)
 		tempPath = path.join(os.tmpdir(), `log-${getRandomInt(0x1000, 0x10000).toString(16)}.${logType}`);
 	fs.writeFileSync(tempPath, logContents);
-	workspace.openTextDocument(tempPath).then(window.showTextDocument);
+	await workspace.openTextDocument(tempPath).then(window.showTextDocument);
 }
 
 /// Gets all excluded folders (full absolute paths) for a given workspace

@@ -8,15 +8,15 @@ export class WorkspaceContext implements IAmDisposable {
 	constructor(
 		public readonly sdks: Sdks,
 		public readonly config: WorkspaceConfig,
-		public readonly hasAnyFlutterMobileProjects: boolean,
+		public readonly hasAnyFlutterProjects: boolean,
 		public readonly hasAnyWebProjects: boolean,
 		public readonly hasAnyStandardDartProjects: boolean,
 		public readonly hasProjectsInFuchsiaTree: boolean,
+		public readonly firstFlutterProject: string | undefined,
 	) {
 		this.workspaceTypeDescription = this.buildWorkspaceTypeDescription();
 	}
 
-	get hasAnyFlutterProjects() { return this.hasAnyFlutterMobileProjects; }
 	get shouldLoadFlutterExtension() { return this.hasAnyFlutterProjects; }
 
 	/// Used only for display (for ex stats), not behaviour.
@@ -26,7 +26,7 @@ export class WorkspaceContext implements IAmDisposable {
 		// Dart, Flutter and also Flutter, Dart.
 		if (this.hasAnyStandardDartProjects)
 			types.push("Dart");
-		if (this.hasAnyFlutterMobileProjects)
+		if (this.hasAnyFlutterProjects)
 			types.push("Flutter");
 		if (this.hasProjectsInFuchsiaTree)
 			types.push("Fuchsia");
@@ -34,9 +34,9 @@ export class WorkspaceContext implements IAmDisposable {
 		// If we didn't detect any projects, record as unknown, but include info
 		// on the type of SDK we had found.
 		if (types.length === 0) {
-			if (this.sdks && this.sdks.dartSdkIsFromFlutter)
+			if (this.sdks?.dartSdkIsFromFlutter)
 				types.push("Unknown (Flutter SDK)");
-			else if (this.sdks && this.sdks.dart)
+			else if (this.sdks?.dart)
 				types.push("Unknown (Dart SDK)");
 			else
 				types.push("Unknown (No SDK)");
@@ -45,7 +45,7 @@ export class WorkspaceContext implements IAmDisposable {
 		return types.join(", ");
 	}
 
-	public dispose(): any {
+	public dispose(): void {
 		this.events.dispose();
 	}
 
@@ -56,7 +56,7 @@ export class WorkspaceContext implements IAmDisposable {
 class WorkspaceEvents implements IAmDisposable {
 	public readonly onPackageMapChange = new EventEmitter<void>();
 
-	public dispose(): any {
+	public dispose(): void {
 		this.onPackageMapChange.dispose();
 	}
 }

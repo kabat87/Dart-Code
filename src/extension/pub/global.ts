@@ -2,7 +2,7 @@ import * as vs from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
 import { moreInfoAction, noRepeatPromptThreshold, pubGlobalDocsUrl } from "../../shared/constants";
 import { LogCategory, VersionStatus } from "../../shared/enums";
-import { CustomScript, DartSdks, Logger } from "../../shared/interfaces";
+import { DartSdks, Logger } from "../../shared/interfaces";
 import { logProcess } from "../../shared/logging";
 import { getPubExecutionInfo } from "../../shared/processes";
 import { PubApi } from "../../shared/pub/api";
@@ -83,15 +83,6 @@ export class PubGlobal {
 		return undefined;
 	}
 
-	public async backgroundActivate(packageName: string, packageID: string, silent: boolean): Promise<void> {
-		const actionName = `Activating ${packageName}`;
-		const args = ["global", "activate", packageID];
-		if (silent)
-			await this.runCommand(packageName, args);
-		else
-			await this.runCommandWithProgress(packageName, `${actionName}...`, args);
-	}
-
 	public async uninstall(packageID: string): Promise<void> {
 		const args = ["global", "deactivate", packageID];
 		await this.runCommand(packageID, args);
@@ -145,7 +136,7 @@ export class PubGlobal {
 		return installedVersion;
 	}
 
-	private runCommandWithProgress(packageName: string, title: string, args: string[], customScript?: CustomScript): Thenable<string> {
+	private runCommandWithProgress(packageName: string, title: string, args: string[]): Thenable<string> {
 		return vs.window.withProgress({
 			location: vs.ProgressLocation.Notification,
 			title,
@@ -153,7 +144,7 @@ export class PubGlobal {
 	}
 
 	private runCommand(packageName: string, args: string[]): Thenable<string> {
-		const pubExecution = getPubExecutionInfo(this.dartCapabilities, this.sdks.dart, args);
+		const pubExecution = getPubExecutionInfo(this.sdks.dart, args);
 
 		return new Promise((resolve, reject) => {
 			this.logger.info(`Spawning ${pubExecution.executable} with args ${JSON.stringify(pubExecution.args)}`);

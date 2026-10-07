@@ -1,7 +1,10 @@
+.crash_dumps/
 .dart_code_test_data_dir/**
-.dcud/**
 .dart_code_test_logs/**
+.dcud/**
+.devcontainer/
 .eslintrc.js
+.gemini/
 .gitattributes
 .github/
 .gitignore
@@ -15,8 +18,11 @@
 **/.git
 **/.gitattributes
 **/*.map
+AGENTS.md
 CONTRIBUTING.md
+codecov.yml
 coverage/**
+eslint.config.js
 lints/**
 logs/**
 media/screenshots/**

@@ -3,26 +3,22 @@ import * as path from "path";
 import * as semver from "semver";
 import { executableNames, isWin } from "./constants";
 import { LogCategory } from "./enums";
-import { CustomScript, IAmDisposable, Logger } from "./interfaces";
+import { CustomScript, IAmDisposable, IAmDisposableAsync, Logger } from "./interfaces";
 import { ExecutionInfo } from "./processes";
 
+export type PromiseOr<T> = Promise<T> | T;
+
 export function uniq<T>(array: T[]): T[] {
-	return array.filter((value, index) => array.indexOf(value) === index);
+	return [...new Set(array)];
 }
 
 export function flatMap<T1, T2>(input: readonly T1[], f: (input: T1) => readonly T2[]): T2[] {
 	return input.reduce((acc, x) => acc.concat(f(x)), [] as T2[]);
 }
 
-export async function flatMapAsync<T1, T2>(input: T1[], f: (input: T1) => Promise<readonly T2[]>): Promise<T2[]> {
-	let res: T2[] = [];
-	for (const x of input)
-		res = res.concat(await f(x));
-	return res;
-}
 
 export function filenameSafe(input: string) {
-	return input.replace(/[^a-z0-9]+/gi, "_").toLowerCase();
+	return input.replace(/[^a-z0-9]+/gi, "_").replace(/_{2,}/g, "_").replace(/_$/g, "").toLowerCase();
 }
 
 export function escapeRegExp(input: string): string {
@@ -34,10 +30,19 @@ export class PromiseCompleter<T> {
 	public resolve!: (value: T | PromiseLike<T>) => void;
 	public reject!: (error?: any, stackTrace?: string) => void;
 
+	private _isComplete = false;
+	public get isComplete() { return this._isComplete; }
+
 	constructor() {
 		this.promise = new Promise((res, rej) => {
-			this.resolve = res;
-			this.reject = rej;
+			this.resolve = (x) => {
+				this._isComplete = true;
+				res(x);
+			};
+			this.reject = (x) => {
+				this._isComplete = true;
+				rej(x);
+			};
 		});
 	}
 }
@@ -57,6 +62,12 @@ export function findFileInAncestor(files: string[], startLocation: string) {
 	}
 
 	return undefined;
+}
+
+/// Converts a file URI to file path without a dependency on vs.Uri.
+export function maybeUriToFilePath(uri: string | undefined): string | undefined {
+	// TODO(dantup): Review the handling of non-file URIs passed here.
+	return uri === undefined ? uri : uriToFilePath(uri);
 }
 
 /// Converts a file URI to file path without a dependency on vs.Uri.
@@ -100,16 +111,16 @@ export function pubVersionIsAtLeast(inputVersion: string, requiredVersion: strin
 	// https://github.com/dart-lang/pub_semver/
 
 	// If only one of them has build metadata, it's newest.
-	if (inputVersion.indexOf("+") !== -1 && requiredVersion.indexOf("+") === -1)
+	if (inputVersion.includes("+") && !requiredVersion.includes("+"))
 		return true;
-	if (inputVersion.indexOf("+") === -1 && requiredVersion.indexOf("+") !== -1)
+	if (!inputVersion.includes("+") && requiredVersion.includes("+"))
 		return false;
 
 	// Otherwise, since they're both otherwise equal and both have build
 	// metadata we can treat the build metadata like pre-release by converting
 	// it to pre-release (with -) or appending it to existing pre-release.
-	inputVersion = inputVersion.replace("+", inputVersion.indexOf("-") === -1 ? "-" : ".");
-	requiredVersion = requiredVersion.replace("+", requiredVersion.indexOf("-") === -1 ? "-" : ".");
+	inputVersion = inputVersion.replace("+", !inputVersion.includes("-") ? "-" : ".");
+	requiredVersion = requiredVersion.replace("+", !requiredVersion.includes("-") ? "-" : ".");
 	return versionIsAtLeast(inputVersion, requiredVersion);
 }
 
@@ -135,7 +146,7 @@ export function errorString(error: any): string {
 	else if (error instanceof Error)
 		return error.message + (error.stack ? `\n${error.stack}` : "");
 	else if (error.message)
-		return error.message;
+		return error.message as string;
 	else if (typeof error === "string")
 		return error;
 	else
@@ -178,11 +189,12 @@ export class BufferedLogger implements Logger {
 					break;
 			}
 		}
+		this.buffer.length = 0;
 		logger.info("Done flushing log messages...");
 	}
 }
 
-export type NullAsUndefined<T> = null extends T ? Exclude<T, null> | undefined : T;
+export type NullAsUndefined<T> = null extends T ? NonNullable<T> | undefined : T;
 
 export function nullToUndefined<T>(value: T): NullAsUndefined<T> {
 	return (value === null ? undefined : value) as NullAsUndefined<T>;
@@ -192,29 +204,12 @@ export function notUndefined<T>(x: T | undefined): x is T {
 	return x !== undefined;
 }
 
-export function notNull<T>(x: T | null): x is T {
+function notNull<T>(x: T | null): x is T {
 	return x !== null;
 }
 
 export function notNullOrUndefined<T>(x: T | null | undefined): x is T {
 	return notUndefined(x) && notNull(x);
-}
-
-export function asHexColor({ r, g, b, a }: { r: number, g: number, b: number, a: number }): string {
-	r = clamp(r, 0, 255);
-	g = clamp(g, 0, 255);
-	b = clamp(b, 0, 255);
-	a = clamp(a, 0, 255);
-
-	return `${asHex(a)}${asHex(r)}${asHex(g)}${asHex(b)}`.toLowerCase();
-}
-
-export function asHex(v: number) {
-	return Math.round(v).toString(16).padStart(2, "0");
-}
-
-export function clamp(v: number, min: number, max: number) {
-	return Math.min(Math.max(min, v), max);
 }
 
 export function generateTestNameFromFileName(input: string) {
@@ -229,14 +224,69 @@ export function isWebDevice(deviceId: string | undefined): boolean {
 	return !!(deviceId?.startsWith("web") || deviceId === "chrome" || deviceId === "edge");
 }
 
-export function disposeAll(disposables: IAmDisposable[]) {
+/**
+ * Calls dispose() on all of `disposables` which must all be synchronous disposables.
+ */
+export function disposeAll(disposables: IAmDisposable[], logger?: Logger): void {
 	const toDispose = disposables.slice();
 	disposables.length = 0;
 	for (const d of toDispose) {
 		try {
 			d.dispose();
-		} catch (e) {
+		} catch (e: any) {
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+			logger?.error({ message: e.toString() });
 			console.warn(e);
 		}
 	}
+}
+
+/**
+ * Calls dispose() on all of `disposables`, which can include async disposables.
+ *
+ * Will `await` all calls to `dispose()` but time out with printing a warning if they do not complete
+ * within 3s.
+ */
+export async function disposeAllAsync(disposables: IAmDisposableAsync[], logger?: Logger): Promise<void> {
+	const toDispose = disposables.slice();
+	disposables.length = 0;
+	try {
+		await withTimeout(
+			Promise.allSettled(toDispose.map(async (d) => {
+				try {
+					await d.dispose();
+				} catch (e: any) {
+					// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+					logger?.error({ message: e.toString() });
+					console.warn(e);
+				}
+			})),
+			"disposeAllAsync did not complete",
+			3,
+		);
+	} catch (e) {
+		console.warn(e);
+	}
+}
+
+export async function withTimeout<T>(promise: Thenable<T>, message: string | (() => string), seconds = 360): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		// Set a timeout to reject the promise after the timeout period.
+		const timeoutTimer = setTimeout(() => {
+			const msg = typeof message === "string" ? message : message();
+			reject(new Error(`${msg} within ${seconds}s`));
+		}, seconds * 1000);
+
+		// When the main promise completes (or rejects), cancel the timeout and return its result.
+		promise.then(
+			(result) => {
+				clearTimeout(timeoutTimer);
+				resolve(result);
+			},
+			(e) => {
+				clearTimeout(timeoutTimer);
+				reject(e);
+			},
+		);
+	});
 }

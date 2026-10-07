@@ -9,26 +9,13 @@ export class FlutterCapabilities {
 		this.version = flutterVersion;
 	}
 
-	get supportsCreateSkeleton() { return versionIsAtLeast(this.version, "2.5.0"); }
-	get supportsCreatingSamples() { return versionIsAtLeast(this.version, "1.0.0"); }
-	get hasLatestStructuredErrorsWork() { return versionIsAtLeast(this.version, "1.21.0-5.0"); }
-	get supportsFlutterCreateListSamples() { return versionIsAtLeast(this.version, "1.3.10"); }
-	get supportsWsVmService() { return versionIsAtLeast(this.version, "1.18.0-5"); }
-	get supportsWsDebugBackend() { return versionIsAtLeast(this.version, "1.21.0-0"); }
-	get supportsWsInjectedClient() { return versionIsAtLeast(this.version, "2.1.0-13.0"); }
-	get supportsExposeUrl() { return versionIsAtLeast(this.version, "1.18.0-5"); }
-	get supportsDartDefine() { return versionIsAtLeast(this.version, "1.17.0"); }
-	get supportsRestartDebounce() { return versionIsAtLeast(this.version, "1.21.0-0"); }
-	get supportsRunSkippedTests() { return versionIsAtLeast(this.version, "2.1.0-11"); }
-	get supportsShowWebServerDevice() { return versionIsAtLeast(this.version, "1.26.0-0"); }
-	get supportsWebRendererOption() { return versionIsAtLeast(this.version, "1.25.0-0"); }
-	get supportsDevToolsServerAddress() { return versionIsAtLeast(this.version, "1.26.0-12"); }
-	get supportsRunningIntegrationTests() { return versionIsAtLeast(this.version, "2.2.0-10"); }
-	get supportsSdkDap() { return versionIsAtLeast(this.version, "2.13.0-0"); }
-	// TODO: Update these (along with Dart) when supported.
-	get webSupportsEvaluation() { return false; }
-	get webSupportsDebugging() { return true; }
-	get webSupportsHotReload() { return false; }
+	get supportsIOSLanguage() { return !versionIsAtLeast(this.version, "3.23.0"); } // https://github.com/flutter/flutter/issues/148586#issuecomment-2137140743
+	get supportsAddPubRootDirectories() { return versionIsAtLeast(this.version, "3.19.0"); }
+	get requiresForcedDebugModeForNoDebug() { return versionIsAtLeast(this.version, "3.13.0-0"); } // TODO(dantup): Add upper bound when we don't need this.
+	get supportsSkeleton() { return !versionIsAtLeast(this.version, "3.29.0"); }
+	get supportsWidgetPreview() { return versionIsAtLeast(this.version, "3.36.0-1"); }
+	get supportsWidgetPreviewByDefault() { return versionIsAtLeast(this.version, "3.38.0-0"); }
+	get hasInspectorDeepLinkNotificationForwarding() { return versionIsAtLeast(this.version, "3.48.0-1"); }
 }
 
 export class DaemonCapabilities {

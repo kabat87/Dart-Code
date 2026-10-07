@@ -4,13 +4,13 @@ import { InternalExtensionApi } from "../shared/vscode/interfaces";
 
 function getLogger() {
 	// TODO: Make a logger that buffers then flushes when it gets the real one.
-	// eslint-disable-next-line @typescript-eslint/no-var-requires
-	const extApi: InternalExtensionApi = require("./helpers").extApi;
-	return extApi && extApi.logger;
+	// eslint-disable-next-line @typescript-eslint/no-require-imports
+	const privateApi: InternalExtensionApi | undefined = require("./helpers").privateApi;
+	return privateApi?.logger;
 }
 
 export class LoggingReporter extends reporters.Base {
-	constructor(runner: Runner, options: any) {
+	constructor(runner: Runner) {
 		super(runner);
 		runner.on("start", () => {
 
@@ -36,6 +36,7 @@ export class LoggingReporter extends reporters.Base {
 				const logger = getLogger();
 				if (logger) {
 					logger.error(`Test ${test.fullTitle()} failed after ${test.duration}ms`, LogCategory.CI);
+					// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 					const err = (test as any).err;
 					if (err) {
 						logger.error(err.message, LogCategory.CI);

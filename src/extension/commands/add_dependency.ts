@@ -1,14 +1,16 @@
 import * as fs from "fs";
 import * as path from "path";
+import { TextDecoder, TextEncoder } from "util";
 import * as vs from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
 import { DartWorkspaceContext, Logger } from "../../shared/interfaces";
-import { PubApi } from "../../shared/pub/api";
-import { PackageCacheData } from "../../shared/pub/pub_add";
+import { PackageNameCompletionData, PubApi } from "../../shared/pub/api";
+import { GitPubPackage, PackageCacheData, PackageInfo, PathPubPackage, PickablePackage } from "../../shared/pub/pub_add";
 import { fsPath } from "../../shared/utils/fs";
 import { Context } from "../../shared/vscode/workspace";
+import { Analytics, AnalyticsEvent } from "../analytics";
 import * as util from "../utils";
-import { getFolderToRunCommandIn } from "../utils/vscode/projects";
+import { getProjectSelection } from "../utils/vscode/projects";
 import { BaseSdkCommands } from "./sdk";
 
 const cacheFilename = "package_cache.json";
@@ -19,21 +21,22 @@ const knownFlutterSdkPackages = [
 	"flutter_localizations",
 	"integration_test",
 ];
+const devPrefix = "dev:";
 
 export class AddDependencyCommand extends BaseSdkCommands {
-	private readonly extensionStoragePath: string | undefined;
-	private cache: PackageCacheData | undefined;
+	private readonly extensionStorageUri: vs.Uri;
+	public cache: PackageCacheData | undefined;
 	private nextPackageNameFetchTimeout: NodeJS.Timeout | undefined;
 
-	constructor(logger: Logger, context: Context, workspace: DartWorkspaceContext, dartCapabilities: DartCapabilities, private readonly pubApi: PubApi) {
+	constructor(logger: Logger, context: Context, workspace: DartWorkspaceContext, dartCapabilities: DartCapabilities, private readonly pubApi: PubApi, private readonly analytics: Analytics) {
 		super(logger, context, workspace, dartCapabilities);
 
 		this.disposables.push(vs.commands.registerCommand("dart.addDependency", (uri: string | vs.Uri | undefined) => this.promptAndAddDependency(uri, false)));
 		this.disposables.push(vs.commands.registerCommand("dart.addDevDependency", (uri: string | vs.Uri | undefined) => this.promptAndAddDependency(uri, true)));
-		this.disposables.push(vs.commands.registerCommand("_dart.addDependency", this.addDependency, this));
-		this.disposables.push(vs.commands.registerCommand("_dart.removeDependency", this.removeDependency, this));
+		this.disposables.push(vs.commands.registerCommand("_dart.addDependency", this.addDependency.bind(this)));
+		this.disposables.push(vs.commands.registerCommand("_dart.removeDependency", this.removeDependency.bind(this)));
 
-		this.extensionStoragePath = context.extensionStoragePath;
+		this.extensionStorageUri = context.extensionStorageUri;
 		// Kick off async work to fetch then queue a new check.
 		this.loadAndFetch().catch((e) => this.logger.error(e));
 	}
@@ -47,61 +50,62 @@ export class AddDependencyCommand extends BaseSdkCommands {
 	}
 
 	private async loadPackageCache(): Promise<void> {
-		if (!this.extensionStoragePath)
-			return;
-
-		const cacheFile = path.join(this.extensionStoragePath, cacheFilename);
-		if (!fs.existsSync(cacheFile))
-			return;
 		try {
-			const contents = await fs.promises.readFile(cacheFile);
+			const bytes = await vs.workspace.fs.readFile(this.packageNameCacheUri);
+			const contents = new TextDecoder().decode(bytes);
 			this.cache = PackageCacheData.fromJson(contents.toString());
+			this.logger.info(`Loaded ${this.cache?.packageNames.length} package names from ${this.packageNameCacheUri}`);
 		} catch (e) {
-			this.logger.error(`Failed to read package cache file: ${e}`);
+			this.logger.info(`Failed to read package cache file: ${e}`);
 		}
 	}
 
-	private async savePackageCache(): Promise<void> {
-		if (!this.extensionStoragePath)
-			return;
+	private get packageNameCacheUri(): vs.Uri {
+		return vs.Uri.joinPath(this.extensionStorageUri, cacheFilename);
+	}
 
-		const cacheFile = path.join(this.extensionStoragePath, cacheFilename);
+	private async savePackageCache(): Promise<void> {
 		try {
 			const json = this.cache?.toJson();
-			if (json)
-				await fs.promises.writeFile(cacheFile, json);
+			if (json) {
+				const bytes = new TextEncoder().encode(json);
+				await vs.workspace.fs.writeFile(this.packageNameCacheUri, bytes);
+			}
+			this.logger.info(`Saved ${this.cache?.packageNames.length} in ${this.packageNameCacheUri}`);
 		} catch (e) {
-			this.logger.error(`Failed to read package cache file: ${e}`);
+			this.logger.error(`Failed to save package cache file: ${e}`);
 		}
 	}
 
 	private queueNextPackageNameFetch(ms: number) {
 		if (this.nextPackageNameFetchTimeout)
 			clearTimeout(this.nextPackageNameFetchTimeout);
-		this.nextPackageNameFetchTimeout = setTimeout(() => this.fetchPackageNames(), ms);
+		this.nextPackageNameFetchTimeout = setTimeout(() => this.fetchPackageNames(), ms).unref();
 	}
 
 	private async fetchPackageNames(): Promise<void> {
-		this.logger.info(`Caching Pub package names from pub.dev...`);
+		this.logger.info(`Caching Pub package names from ${this.pubApi.pubUrlBase}...`);
+		let results: PackageNameCompletionData | undefined;
 		try {
-			const results = await this.pubApi.getPackageNames();
-			this.cache = PackageCacheData.fromPackageNames(results.packages);
-			await this.savePackageCache();
+			results = await this.pubApi.getPackageNames();
 		} catch (e) {
-			this.logger.error(`Failed to fetch package cache: $e`);
+			this.logger.error(`Failed to fetch Pub package names: ${e}`);
+		}
+		if (results?.packages) {
+			try {
+				this.cache = PackageCacheData.fromPackageNames(results.packages);
+				await this.savePackageCache();
+			} catch (e) {
+				this.logger.error(`Failed to cache Pub package names: ${e}`);
+			}
+		} else {
+			this.logger.error(`Pub package name results were invalid`);
 		}
 		this.queueNextPackageNameFetch(PackageCacheData.maxCacheAgeMs);
 	}
 
 	private async promptAndAddDependency(uri: string | vs.Uri | undefined, isDevDependency: boolean) {
-		if (!uri || !(uri instanceof vs.Uri)) {
-			uri = await getFolderToRunCommandIn(this.logger, "Select which folder to add the dependency to");
-			// If the user cancelled, bail out (otherwise we'll prompt them again below).
-			if (!uri)
-				return;
-		}
-		if (typeof uri === "string")
-			uri = vs.Uri.file(uri);
+		this.analytics.log(AnalyticsEvent.Command_AddDependency);
 
 		let selectedOption = await this.promptForPackageInfo();
 		if (!selectedOption)
@@ -116,7 +120,7 @@ export class AddDependencyCommand extends BaseSdkCommands {
 			else if (selectedOption.includes("/") || selectedOption.includes("\\"))
 				packageInfo = await this.promptForPathPackageInfo(selectedOption);
 			else
-				packageInfo = { packageName: selectedOption, marker: undefined };
+				packageInfo = { packageNames: selectedOption, marker: undefined };
 		} else {
 			switch (selectedOption.marker) {
 				case "PATH":
@@ -126,7 +130,7 @@ export class AddDependencyCommand extends BaseSdkCommands {
 					packageInfo = await this.promptForGitPackageInfo();
 					break;
 				default:
-					packageInfo = selectedOption as PubPackage;
+					packageInfo = selectedOption;
 					break;
 			}
 		}
@@ -134,50 +138,77 @@ export class AddDependencyCommand extends BaseSdkCommands {
 		if (!packageInfo)
 			return;
 
-		return this.addDependency(uri, packageInfo, isDevDependency);
+		let uris: vs.Uri[];
+		if (!uri || !(uri instanceof vs.Uri)) {
+			const projectFolders = await getProjectSelection(this.logger, "Select which project(s) to add the dependency to");
+			// If the user cancelled, bail out (otherwise we'll prompt them again below).
+			if (!projectFolders)
+				return;
+			uris = projectFolders.map((folder) => vs.Uri.file(folder));
+		} else {
+			uris = [uri];
+		}
+
+		return this.addDependency(uris, packageInfo, isDevDependency);
 	}
 
 	/// Note: This is called by quick-fix as well as directly from the command palette.
-	private async addDependency(uri: string | vs.Uri, selectedPackage: PackageInfo, isDevDependency: boolean) {
-		if (typeof uri === "string")
-			uri = vs.Uri.file(uri);
+	private async addDependency(urisOrPaths: Array<string | vs.Uri>, selectedPackage: PackageInfo, isDevDependency: boolean) {
+		const uris = urisOrPaths.map((uriOrPath) => typeof uriOrPath === "string" ? vs.Uri.file(uriOrPath) : uriOrPath);
 
-		const args = ["add"];
-		let packageName: string;
+		const commandsArgs: string[][] = [];
+		let forceFlutter = false;
 		if (selectedPackage.marker === "GIT") {
-			packageName = selectedPackage.packageName;
-			args.push(packageName);
-			args.push(`--git-url=${selectedPackage.url}`);
+			const args = ["add", selectedPackage.packageName, `--git-url=${selectedPackage.url}`];
 			if (selectedPackage.ref) {
 				args.push(`--git-ref=${selectedPackage.ref}`);
 			}
 			if (selectedPackage.path) {
 				args.push(`--git-path=${selectedPackage.path}`);
 			}
+			commandsArgs.push(args);
 		} else if (selectedPackage.marker === "PATH") {
-			packageName = selectedPackage.packageName;
-			args.push(packageName);
-			args.push(`--path=${selectedPackage.path}`);
+			commandsArgs.push(["add", selectedPackage.packageName, `--path=${selectedPackage.path}`]);
 		} else {
-			packageName = selectedPackage.packageName;
-			args.push(packageName);
+			const packageNames = selectedPackage.packageNames.split(/[\s,]+/).map((p) => p.trim()).filter((p) => p);
+			const flutterSdkPackages = packageNames.filter((packageName) => this.isFlutterSdkPackage(packageName));
+			const nonFlutterSdkPackages = packageNames.filter((packageName) => !this.isFlutterSdkPackage(packageName));
+
+			if (nonFlutterSdkPackages.length) {
+				commandsArgs.push(["add", ...nonFlutterSdkPackages]);
+			}
+
+			if (flutterSdkPackages.length) {
+				forceFlutter = true;
+				// We can't do multiple SDK packages in one command:
+				// `--sdk cannot be used with multiple packages`
+				for (const flutterSdkPackage of flutterSdkPackages)
+					commandsArgs.push(["add", flutterSdkPackage, "--sdk", "flutter"]);
+			}
 		}
 
-		if (isDevDependency)
-			args.push("--dev");
-
-		// Handle some known Flutter dependencies.
-		const isFlutterSdkPackage = knownFlutterSdkPackages.includes(packageName);
-		if (isFlutterSdkPackage) {
-			args.push("--sdk");
-			args.push("flutter");
+		if (isDevDependency) {
+			for (const commandArgs of commandsArgs)
+				commandArgs.push("--dev");
 		}
 
-		if (this.sdks.flutter && (isFlutterSdkPackage || util.isInsideFlutterProject(uri))) {
-			return this.runFlutter(["pub", ...args], uri);
-		} else {
-			return this.runPub(args, uri);
+		for (const uri of uris) {
+			const useFlutter = this.sdks.flutter && (forceFlutter || util.isInsideFlutterProject(uri));
+			for (const commandArgs of commandsArgs) {
+				if (useFlutter) {
+					await this.runFlutter(["pub", ...commandArgs], uri);
+				} else {
+					await this.runPub(commandArgs, uri);
+				}
+			}
 		}
+	}
+
+	private isFlutterSdkPackage(packageName: string): boolean {
+		const normalizedPackageName = packageName.startsWith(devPrefix)
+			? packageName.substring(devPrefix.length)
+			: packageName;
+		return knownFlutterSdkPackages.includes(normalizedPackageName);
 	}
 
 	private async removeDependency(uri: string | vs.Uri, packageName: string) {
@@ -195,17 +226,17 @@ export class AddDependencyCommand extends BaseSdkCommands {
 
 	/// Prompts the user to select a package name, or the option to select a path or Git package (in
 	/// which case they must also provide package name etc).
-	private async promptForPackageInfo(): Promise<string | PickablePackage | undefined> {
+	public async promptForPackageInfo(): Promise<string | PickablePackage | undefined> {
 		const quickPick = vs.window.createQuickPick<PickablePackage>();
-		quickPick.placeholder = "package name, URL or path";
-		quickPick.title = "Enter a package name, URL or local path";
+		quickPick.placeholder = "package name(s), URL or path (use commas or spaces to separate multiple package names)";
+		quickPick.title = "Enter package name(s), URL or local path";
 		quickPick.items = this.getPackageEntries();
-		quickPick.onDidChangeValue((prefix) => {
-			quickPick.items = this.getPackageEntries(prefix);
+		quickPick.onDidChangeValue((userInput) => {
+			quickPick.items = this.getPackageEntries(userInput);
 		});
 
 		const selectedOption = await new Promise<string | PickablePackage | undefined>((resolve) => {
-			quickPick.onDidAccept(() => resolve(quickPick.selectedItems && quickPick.selectedItems[0] ? quickPick.selectedItems[0] : quickPick.value));
+			quickPick.onDidAccept(() => resolve(quickPick.selectedItems?.[0] ? quickPick.selectedItems[0] : quickPick.value));
 			quickPick.onDidHide(() => resolve(undefined));
 			quickPick.show();
 		});
@@ -215,7 +246,7 @@ export class AddDependencyCommand extends BaseSdkCommands {
 		return selectedOption;
 	}
 
-	private async promptForPathPackageInfo(packagePath?: string): Promise<PathPubPackage | undefined> {
+	public async promptForPathPackageInfo(packagePath?: string): Promise<PathPubPackage | undefined> {
 		if (!packagePath) {
 			const packagePaths = await vs.window.showOpenDialog({
 				canSelectFiles: false,
@@ -224,7 +255,7 @@ export class AddDependencyCommand extends BaseSdkCommands {
 				openLabel: "Select package folder",
 			});
 
-			if (!packagePaths || packagePaths.length !== 1)
+			if (packagePaths?.length !== 1)
 				return;
 
 			packagePath = fsPath(packagePaths[0]);
@@ -240,7 +271,7 @@ export class AddDependencyCommand extends BaseSdkCommands {
 				return { path: packagePath, packageName: packageNameResult[1], marker: "PATH" };
 		} catch (e) {
 			this.logger.error(e);
-			vs.window.showErrorMessage("The selected folder does not appear to be a valid Pub package");
+			void vs.window.showErrorMessage("The selected folder does not appear to be a valid Pub package");
 			return;
 		}
 	}
@@ -268,7 +299,7 @@ export class AddDependencyCommand extends BaseSdkCommands {
 		};
 	}
 
-	private promptForGitUrl(): string | PromiseLike<string | undefined> | undefined {
+	public promptForGitUrl(): PromiseLike<string | undefined> {
 		return vs.window.showInputBox({
 			ignoreFocusOut: true,
 			placeHolder: "git repo url",
@@ -276,7 +307,7 @@ export class AddDependencyCommand extends BaseSdkCommands {
 		});
 	}
 
-	private promptForGitPath() {
+	public promptForGitPath(): PromiseLike<string | undefined> {
 		return vs.window.showInputBox({
 			ignoreFocusOut: true,
 			placeHolder: "path to package",
@@ -284,7 +315,7 @@ export class AddDependencyCommand extends BaseSdkCommands {
 		});
 	}
 
-	private async promptForGitRef() {
+	public async promptForGitRef() {
 		return vs.window.showInputBox({
 			ignoreFocusOut: true,
 			placeHolder: "commit/branch",
@@ -292,42 +323,72 @@ export class AddDependencyCommand extends BaseSdkCommands {
 		});
 	}
 
-	private async promptForPackageName(name: string) {
+	public async promptForPackageName(name: string) {
 		return await vs.window.showInputBox({
 			ignoreFocusOut: true,
 			placeHolder: "package name",
-			title: "Enter the Packages name",
+			title: "Enter the packages name",
 			value: name,
 		});
 	}
 
-	private getPackageEntries(prefix?: string): PickablePackage[] {
+	public getPackageEntries(userInput?: string): PickablePackage[] {
+		let currentSearchString = userInput;
+		let completionItemPrefixes = "";
+		if (userInput) {
+			// If we support multiple, we need to split "foo, bar, ba" into "foo, bar, " and "ba". One is the search
+			// and the other is a prefix that needs adding to all package names in the completion list.
+			const startOfCurrentPackageName = Math.max(userInput.lastIndexOf(" "), userInput.lastIndexOf(","));
+			currentSearchString = userInput.substring(startOfCurrentPackageName + 1);
+			completionItemPrefixes = userInput.substring(0, startOfCurrentPackageName + 1);
+			if (currentSearchString === "" && completionItemPrefixes.endsWith(","))
+				completionItemPrefixes = `${completionItemPrefixes} `;
+
+			// If the current search term starts with "dev:", move it from the search to the prefix.
+			if (currentSearchString.startsWith(devPrefix)) {
+				currentSearchString = currentSearchString.substring(devPrefix.length);
+				completionItemPrefixes = `${completionItemPrefixes}${devPrefix}`;
+			}
+		}
+
 		const max = 50;
 		const packageNames = this.cache?.packageNames ?? [];
 		let matches = new Set<string>();
 		// This list can be quite large, so avoid using .filter() if we can bail out early.
-		if (prefix) {
-			prefix = prefix.trim();
+		if (currentSearchString) {
+			// There is a search term, filter the packages.
+			currentSearchString = currentSearchString.trim();
 			for (let i = 0; i < packageNames.length && matches.size < max; i++) {
 				const packageName = packageNames[i];
-				if (packageName.startsWith(prefix))
+				if (packageName.startsWith(currentSearchString))
 					matches.add(packageName);
 			}
 			// Also add on any Flutter-SDK packages that match.
 			for (const packageName of knownFlutterSdkPackages) {
-				if (packageName.startsWith(prefix))
+				if (packageName.startsWith(currentSearchString))
 					matches.add(packageName);
 			}
+		} else if (userInput && (userInput.endsWith(" ") || userInput.endsWith(","))) {
+			// The user is after a separator and we don't want to show the full list until they type a character.
+			// https://github.com/Dart-Code/Dart-Code/issues/5952
+			// Add a blank entry that will be prefixed with the current user input prefix below.
+			matches.add("");
 		} else {
+			// The current search may be empty or just a prefix like "dev:", so show
+			// the full list.
 			matches = new Set(packageNames.slice(0, Math.min(max, packageNames.length)));
 		}
 
-		const pickablePackageNames = Array.from(matches).map((packageName) => ({
-			label: packageName,
-			packageName,
-		} as PickablePackage));
+		const pickablePackageNames = Array.from(matches).map((packageName) => {
+			const fullString = `${completionItemPrefixes}${packageName}`;
+			return {
+				label: fullString,
+				marker: undefined,
+				packageNames: fullString,
+			} satisfies PickablePackage;
+		});
 
-		if (prefix) {
+		if (userInput) {
 			return pickablePackageNames;
 		} else {
 			return [
@@ -349,26 +410,3 @@ export class AddDependencyCommand extends BaseSdkCommands {
 	}
 }
 
-export type PickablePackage = vs.QuickPickItem & (PubPackage | LocalPubPackageMarker | GitPubPackageMarker);
-export type PackageInfo = PubPackage | PathPubPackage | GitPubPackage;
-
-
-export interface PubPackage {
-	marker: undefined;
-	packageName: string;
-}
-
-interface LocalPubPackageMarker { marker: "PATH"; }
-interface GitPubPackageMarker { marker: "GIT"; }
-
-interface PathPubPackage extends LocalPubPackageMarker {
-	path: string;
-	packageName: string;
-}
-
-interface GitPubPackage extends GitPubPackageMarker {
-	url: string;
-	packageName: string;
-	ref?: string;
-	path?: string;
-}

@@ -1,12 +1,13 @@
 [![Discord Chat](https://img.shields.io/badge/chat-discord-blue.svg)](https://discord.gg/xSTPEqm)
-[![Gitter Chat](https://img.shields.io/badge/chat-gitter-blue.svg)](https://gitter.im/dart-code/Dart-Code)
 [![Follow on Twitter](https://img.shields.io/badge/twitter-dartcode-blue.svg)](https://twitter.com/DartCode)
+[![Follow on Bluesky](https://img.shields.io/badge/bluesky-dartcode.org-blue.svg)](https://bsky.app/profile/dartcode.org)
 [![Contribute to Dart Code](https://img.shields.io/badge/help-contribute-551A8B.svg)](https://github.com/Dart-Code/Dart-Code/blob/master/CONTRIBUTING.md)
+[![Coverage](https://codecov.io/github/Dart-Code/Dart-Code/graph/badge.svg?token=EPDiJkMrZM)](https://codecov.io/github/Dart-Code/Dart-Code)
 
 ## Introduction
 
 Dart Code extends [VS Code](https://code.visualstudio.com/) with support for the
-[Dart](https://www.dartlang.org/) programming language, and provides tools for
+[Dart](https://dart.dev/) programming language, and provides tools for
 effectively editing, refactoring, running, and reloading [Flutter](https://flutter.dev/)
 mobile apps.
 
@@ -14,6 +15,8 @@ mobile apps.
 ## Installation
 
 Dart Code can be [installed from the Visual Studio Code Marketplace](https://marketplace.visualstudio.com/items?itemName=Dart-Code.dart-code) or by [searching within VS Code](https://code.visualstudio.com/docs/editor/extension-gallery#_search-for-an-extension).
+
+If you have any issues using Dart Code, please file issues on GitHub at [https://github.com/Dart-Code/Dart-Code/issues/new/choose](https://github.com/Dart-Code/Dart-Code).
 
 
 ## Features

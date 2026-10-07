@@ -6,26 +6,27 @@ import { Outline, OutlineParams } from "../../shared/analysis/lsp/custom_protoco
 import { IAmDisposable, Logger } from "../../shared/interfaces";
 import { SuiteNode, TestModel, TestSource } from "../../shared/test/test_model";
 import { disposeAll, uriToFilePath } from "../../shared/utils";
-import { forceWindowsDriveLetterToUppercase, fsPath, getRandomInt } from "../../shared/utils/fs";
-import { LspOutlineVisitor } from "../../shared/utils/outline_lsp";
+import { forceWindowsDriveLetterToUppercase, fsPath, getRandomInt, isWithinPathOrEqual } from "../../shared/utils/fs";
+import { OutlineVisitor } from "../../shared/utils/outline";
 import { extractTestNameFromOutline } from "../../shared/utils/test";
-import { getAllProjectFolders } from "../../shared/vscode/utils";
-import { LspFileTracker } from "../analysis/file_tracker_lsp";
+import { getAllProjectFoldersAndExclusions } from "../../shared/vscode/utils";
+import { FileTracker } from "../analysis/file_tracker";
 import { config } from "../config";
 import { getExcludedFolders, isTestFile } from "../utils";
 
 export class TestDiscoverer implements IAmDisposable {
 	private readonly disposables: IAmDisposable[] = [];
 
-	private readonly debounceTimers: { [key: string]: NodeJS.Timeout } = {};
+	private readonly debounceTimers: Record<string, NodeJS.Timeout> = {};
 	private readonly debounceDuration = 1500;
 
 	private hasSetupFileHandlers = false;
 
 	public testDiscoveryPerformed: Promise<void> | undefined;
+	public excludedFolders: Set<string> | undefined;
 
-	constructor(private readonly logger: Logger, private readonly fileTracker: LspFileTracker, private readonly model: TestModel) {
-		this.disposables.push(fileTracker.onOutline.listen((o) => this.handleOutline(o)));
+	constructor(private readonly logger: Logger, public readonly fileTracker: FileTracker, private readonly model: TestModel) {
+		this.disposables.push(fileTracker.onOutline((o) => this.handleOutline(o)));
 	}
 
 	/// Performs suite discovery if it has not already finished. If discovery
@@ -38,6 +39,12 @@ export class TestDiscoverer implements IAmDisposable {
 		await this.testDiscoveryPerformed;
 	}
 
+	private isExcludedPath(fileOrFolderPath: string) {
+		return this.excludedFolders
+			? [...this.excludedFolders].some((f) => isWithinPathOrEqual(fileOrFolderPath, f))
+			: false;
+	}
+
 	/// Immediately performs suite discovery. Use [ensureSuitesDiscovered] if you want
 	/// to just ensure discovery has run at least once.
 	///
@@ -48,24 +55,24 @@ export class TestDiscoverer implements IAmDisposable {
 		// once we have discovered them.
 		if (!this.hasSetupFileHandlers) {
 			this.hasSetupFileHandlers = true;
+			const watcher = vs.workspace.createFileSystemWatcher(
+				"**/*_test.dart",
+				false, // ignoreCreateEvents
+				true, // ignoreChangeEvents
+				false, // ignoreDeleteEvents
+			);
 			this.disposables.push(
-				vs.workspace.onDidCreateFiles((e) => {
-					e.files.forEach((file) => {
-						const filePath = fsPath(file);
-						if (isTestFile(filePath))
-							this.model.suiteDiscovered(undefined, filePath);
-					});
+				watcher,
+				watcher.onDidCreate(async (uri) => {
+					const filePath = fsPath(uri);
+					if (isTestFile(filePath) && !this.isExcludedPath(filePath))
+						this.model.suiteDiscovered(undefined, filePath);
 				}),
-				vs.workspace.onDidRenameFiles(async (e) => {
-					e.files.forEach(async (file) => {
-						this.model.clearSuiteOrDirectory(fsPath(file.oldUri));
-						this.discoverTestSuites(fsPath(file.newUri));
-					});
-				}),
-				vs.workspace.onDidDeleteFiles(async (e) => {
-					e.files.forEach(async (file) => {
-						this.model.clearSuiteOrDirectory(fsPath(file));
-					});
+				watcher.onDidDelete((uri) => {
+					const filePath = fsPath(uri);
+					// Don't use isTestFile() here because it calls isDartDocument() which checks
+					// for existence, but we've just been deleted.
+					this.model.clearSuiteOrDirectory(filePath);
 				}),
 			);
 		}
@@ -76,9 +83,10 @@ export class TestDiscoverer implements IAmDisposable {
 				title: "Discovering Tests…",
 			},
 			async () => {
-				await new Promise((resolve) => setTimeout(resolve, 1000));
 				try {
-					const projectFolders = await getAllProjectFolders(this.logger, getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
+					const projectFoldersAndExclusions = await getAllProjectFoldersAndExclusions(this.logger, getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
+					const projectFolders = projectFoldersAndExclusions.projectFolders;
+					this.excludedFolders = projectFoldersAndExclusions.excludedFolders;
 					await Promise.all(projectFolders.map((folder) => this.discoverTestSuites(folder)));
 				} catch (e) {
 					this.logger.error(`Failed to discover tests: ${e}`);
@@ -99,7 +107,9 @@ export class TestDiscoverer implements IAmDisposable {
 				const childPromises = children
 					.map((item) => ({ name: item[0], type: item[1] }))
 					.filter((item) => !item.name.startsWith("."))
-					.map((item) => this.discoverTestSuites(path.join(fileOrDirectory, item.name), item.type === vs.FileType.Directory, level + 1));
+					.map((item) => ({ name: item.name, type: item.type, path: path.join(fileOrDirectory, item.name) }))
+					.filter((item) => !(this.excludedFolders?.has(item.path) ?? false))
+					.map((item) => this.discoverTestSuites(item.path, item.type === vs.FileType.Directory, level + 1));
 
 				await Promise.all(childPromises);
 			} catch (e: any) {
@@ -111,6 +121,9 @@ export class TestDiscoverer implements IAmDisposable {
 
 	public async discoverTestsForSuite(node: SuiteNode): Promise<void> {
 		const doc = await vs.workspace.openTextDocument(node.suiteData.path);
+		// Opening a file that hasn't been opened before does not force analysis, so send a light request that will force
+		// analysis and for the outline to be sent.
+		await vs.commands.executeCommand("vscode.executeHoverProvider", doc.uri, new vs.Position(0, 0));
 		await this.fileTracker.waitForOutline(doc, undefined);
 	}
 
@@ -140,12 +153,12 @@ export class TestDiscoverer implements IAmDisposable {
 
 	private rebuildFromOutline(suitePath: string, outline: Outline) {
 		if (isTestFile(suitePath)) {
-			// Force creation of a node if it's not already there.
-			const [suite, _] = this.model.getOrCreateSuite(suitePath);
-
 			// Generate a unique ID for these IDs to be owned by so that they can be looked
 			// up independent of any other ongoing runs.
 			const dartCodeDebugSessionID = `discovery-${getRandomInt(0x1000, 0x10000).toString(16)}`;
+
+			// Force creation of a node if it's not already there.
+			const suite = this.model.suiteDiscoveredConditional(dartCodeDebugSessionID, suitePath);
 
 			// Mark everything in the suite as potentially-deleted so that we can detect anything
 			// that was not present in the new list to remove it afterwards.
@@ -155,17 +168,16 @@ export class TestDiscoverer implements IAmDisposable {
 			visitor.visit(outline);
 
 			this.model.removeAllPotentiallyDeletedNodes(suite);
-			this.model.rebuildSuiteNode(suite);
-			this.model.updateNode();
+			this.model.updateSuiteTestCountLabels(suite, true);
 		}
 	}
 
-	public dispose(): any {
+	public dispose(): void {
 		disposeAll(this.disposables);
 	}
 }
 
-class TestDiscoveryVisitor extends LspOutlineVisitor {
+class TestDiscoveryVisitor extends OutlineVisitor {
 	private readonly stack: Array<{ id: number, name: string }> = [];
 	private id = 1;
 
@@ -174,10 +186,10 @@ class TestDiscoveryVisitor extends LspOutlineVisitor {
 	}
 
 	protected visitUnitTestTest(outline: Outline) {
-		this.handleItem(outline, false, super.visitUnitTestTest);
+		this.handleItem(outline, false, super.visitUnitTestTest.bind(this));
 	}
 	protected visitUnitTestGroup(outline: Outline) {
-		this.handleItem(outline, true, super.visitUnitTestGroup);
+		this.handleItem(outline, true, super.visitUnitTestGroup.bind(this));
 	}
 
 	private handleItem(outline: Outline, isGroup: boolean, base: (outline: Outline) => void) {

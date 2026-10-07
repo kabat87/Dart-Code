@@ -2,18 +2,14 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vs from "vscode";
 import { fsPath } from "../../../shared/utils/fs";
-import { activate, closeAllOpenFiles, defer, delay, enableLint, ensureError, openFile, threeMinutesInMilliseconds, tryDelete, waitForResult, waitUntilAllTextDocumentsAreClosed } from "../../helpers";
-import { allowSlowSubscriptionTests } from "../file_tracking.test";
+import { activate, closeAllOpenFiles, defer, delay, enableLint, ensureError, forceDocumentCloseEvents, openFile, tryDelete, waitForResult } from "../../helpers";
 
-describe("renames", () => {
+// TODO(dantup): Determine why server isn't clearing this even when we renamed and re-opened with fixed casing.
+describe.skip("renames", () => {
 
 	beforeEach("activate", () => activate());
 
-	it("fixing lowercase_with_underscores removes diagnostic", async function () {
-		this.timeout(threeMinutesInMilliseconds + (1000 * 30));
-		if (!allowSlowSubscriptionTests)
-			this.skip();
-
+	it("fixing lowercase_with_underscores removes diagnostic", async () => {
 		const projectPath = fsPath(vs.workspace.workspaceFolders![0].uri);
 		const filename = "File11111.dart";
 		const originalFileUri = vs.Uri.file(path.join(projectPath, filename));
@@ -28,12 +24,14 @@ describe("renames", () => {
 		// Ensure error appears.
 		await waitForResult(() => vs.languages.getDiagnostics(originalFileUri).length !== 0, "Error should have appeared");
 		const errors = vs.languages.getDiagnostics(originalFileUri);
-		ensureError(errors, "Name source files using `lowercase_with_underscores`");
+		ensureError(errors, "isn't a lower_case_with_underscores identifier");
 
 		// Close the file, rename it and reopen.
 		await closeAllOpenFiles();
+		await forceDocumentCloseEvents();
+
 		fs.renameSync(fsPath(originalFileUri), fsPath(fixedFileUri));
-		await waitUntilAllTextDocumentsAreClosed();
+
 		await openFile(fixedFileUri);
 		await delay(500); // Allow time for the diagnostic to come back (if it will).
 
@@ -41,5 +39,4 @@ describe("renames", () => {
 		await waitForResult(() => vs.languages.getDiagnostics(originalFileUri).length === 0, "Error should have disappeared");
 		await waitForResult(() => vs.languages.getDiagnostics(fixedFileUri).length === 0, "Error should have disappeared");
 	});
-
 });

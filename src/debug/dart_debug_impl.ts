@@ -1,33 +1,29 @@
 /* eslint-disable no-underscore-dangle */
+import { DebugSession, Event, InitializedEvent, OutputEvent, Scope, Source, StackFrame, StoppedEvent, TerminatedEvent } from "@vscode/debugadapter";
+import { DebugProtocol } from "@vscode/debugprotocol";
 import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
-import { DebugSession, Event, InitializedEvent, OutputEvent, Scope, Source, StackFrame, StoppedEvent, TerminatedEvent } from "vscode-debugadapter";
-import { DebugProtocol } from "vscode-debugprotocol";
-import { DartCapabilities } from "../shared/capabilities/dart";
-import { VmServiceCapabilities } from "../shared/capabilities/vm_service";
-import { dartVMPath, debugLaunchProgressId, debugTerminatingProgressId, pleaseReportBug, vmServiceListeningBannerPattern } from "../shared/constants";
-import { DartLaunchArgs, FileLocation } from "../shared/debug/interfaces";
+import { debugLaunchProgressId, debugTerminatingProgressId, pleaseReportBug } from "../shared/constants";
+import { DartLaunchArgs } from "../shared/debugging/interfaces";
 import { LogCategory, LogSeverity } from "../shared/enums";
 import { LogMessage, SpawnedProcess } from "../shared/interfaces";
-import { ExecutionInfo, safeSpawn } from "../shared/processes";
 import { PackageMap } from "../shared/pub/package_map";
-import { errorString, notUndefined, PromiseCompleter, uniq, uriToFilePath, usingCustomScript } from "../shared/utils";
+import { PromiseCompleter, errorString, notUndefined, uniq, uriToFilePath } from "../shared/utils";
 import { sortBy } from "../shared/utils/array";
-import { applyColor, faint } from "../shared/utils/colors";
-import { getRandomInt, getSdkVersion } from "../shared/utils/fs";
-import { mayContainStackFrame, parseStackFrame } from "../shared/utils/stack_trace";
-import { DebuggerResult, Version, VM, VMClass, VMClassRef, VMErrorRef, VMEvent, VMFrame, VMInstance, VMInstanceRef, VMIsolate, VMIsolateRef, VMMapEntry, VMObj, VMScript, VMScriptRef, VMSentinel, VmServiceConnection, VMStack, VMTypeRef, VMWriteEvent } from "./dart_debug_protocol";
+import { applyColor, faint } from "./colors";
+import { vmServiceListeningBannerPattern } from "./constants";
+import { DebuggerResult, VM, VMClass, VMClassRef, VMErrorRef, VMEvent, VMFrame, VMInstance, VMInstanceRef, VMIsolate, VMIsolateRef, VMMapEntry, VMObj, VMScript, VMScriptRef, VMSentinel, VMStack, VMTypeRef, VMWriteEvent, Version, VmExceptionMode, VmServiceConnection } from "./dart_debug_protocol";
 import { DebugAdapterLogger } from "./logging";
+import { mayContainStackFrame, parseStackFrame } from "./stack_trace";
 import { ThreadInfo, ThreadManager } from "./threads";
 import { formatPathForVm } from "./utils";
+import { VmServiceCapabilities } from "./vm_service";
 
 const maxValuesToCallToString = 100;
 // Prefix that appears at the start of stack frame names that are unoptimized
 // which we'd prefer not to show to the user.
 const unoptimizedPrefix = "[Unoptimized] ";
 const trailingSemicolonPattern = new RegExp(`;\\s*$`, "m");
-const logDapTraffic = false;
 
 const threadExceptionExpression = "$_threadException";
 
@@ -37,7 +33,7 @@ const threadExceptionExpression = "$_threadException";
 // stepBackRequest(response: DebugProtocol.StepBackResponse, args: DebugProtocol.StepBackArguments): void;
 // restartFrameRequest(response: DebugProtocol.RestartFrameResponse, args: DebugProtocol.RestartFrameArguments): void;
 // completionsRequest(response: DebugProtocol.CompletionsResponse, args: DebugProtocol.CompletionsArguments): void;
-export class DartDebugSession extends DebugSession {
+export abstract class DartDebugSession extends DebugSession {
 	// TODO: Tidy all this up
 	protected childProcess?: SpawnedProcess | RemoteEditorTerminalProcess;
 
@@ -50,60 +46,33 @@ export class DartDebugSession extends DebugSession {
 
 	protected expectAdditionalPidToTerminate = false;
 	private additionalPidCompleter = new PromiseCompleter<void>();
-	// We normally track the pid from the VM service to terminate the VM afterwards, but for Flutter Run it's
-	// a remote PID and therefore doesn't make sense to try and terminate.
-	protected allowTerminatingVmServicePid = true;
-	// Normally we don't connect to the VM when running no noDebug mode, but for
-	// Flutter, this means we can't call service extensions (for ex. toggling
-	// debug modes) so we allow it to override this (and then we skip things
-	// like breakpoints). We can't do it always, because some functionality
-	// (such as running multiple test suites) will break by having multiple
-	// potential VM services come and go.
-	// https://github.com/Dart-Code/Dart-Code/issues/1673
-	protected connectVmEvenForNoDebug = false;
-	protected allowWriteServiceInfo = true;
 	protected processExited = false;
 	public vmService?: VmServiceConnection;
 	protected cwd?: string;
 	public noDebug?: boolean;
-	private logFile?: string;
 	private sendLogsToClient = false;
 	protected toolEnv?: any;
-	private logStream?: fs.WriteStream;
 	public debugSdkLibraries = false;
 	public debugExternalPackageLibraries = false;
 	public showDartDeveloperLogs = true;
 	protected subscribeToStdout = false;
-	public useInspectorNotificationsForWidgetErrors = false;
 	public evaluateGettersInDebugViews = false;
 	protected evaluateToStringInDebugViews = false;
-	protected readonly dartCapabilities = DartCapabilities.empty;
-	protected readonly vmServiceCapabilities = VmServiceCapabilities.empty;
-	private useWriteServiceInfo = false;
-	protected vmServiceInfoFile?: string;
-	private serviceInfoPollTimer?: NodeJS.Timer;
-	protected deleteServiceFileAfterRead = false;
-	private remoteEditorTerminalLaunched?: Promise<RemoteEditorTerminalProcess>;
-	private vmServiceInfoFileCompleter?: PromiseCompleter<string>;
+	public readonly vmServiceCapabilities = VmServiceCapabilities.empty;
 	protected threadManager: ThreadManager;
 	public packageMap?: PackageMap;
-	protected sendStdOutToConsole: boolean = true;
-	protected supportsObservatoryWebApp: boolean = true;
-	protected parseVmServiceUriFromStdOut: boolean = true;
-	protected requiresProgram: boolean = true;
-	protected pollforMemoryMs?: number; // If set, will poll for memory usage and send events back.
+	protected sendStdOutToConsole = true;
+	protected parseVmServiceUriFromStdOut = true;
+	protected requiresProgram = true;
 	protected processExit: Promise<{ code: number | null, signal: string | null }> = Promise.resolve({ code: 0, signal: null });
-	protected maxLogLineLength: number = 1000; // This should always be overriden in launch/attach requests but we have it here for narrower types.
-	protected shouldKillProcessOnTerminate = true;
+	protected maxLogLineLength = 1000; // This should always be overriden in launch/attach requests but we have it here for narrower types.
 	protected logCategory = LogCategory.General; // This isn't used as General, since both debuggers override it.
-	protected supportsRunInTerminalRequest = false;
-	protected supportsDebugInternalLibraries = false;
 	protected isTerminating = false;
 	protected readonly logger = new DebugAdapterLogger(this, LogCategory.VmService);
 	protected debuggerInit: Promise<void> | undefined;
 
 	protected get shouldConnectDebugger() {
-		return !this.noDebug || this.connectVmEvenForNoDebug;
+		return !this.noDebug;
 	}
 
 	public constructor() {
@@ -119,31 +88,10 @@ export class DartDebugSession extends DebugSession {
 		this.threadManager = new ThreadManager(this.logger, this);
 	}
 
-	private logDapRequest(name: string, args: unknown) {
-		if (!logDapTraffic)
-			return;
-		this.log(`DAP-REQ: ${name}: ${JSON.stringify(args)}`);
-	}
-
-	private logDapResponse(resp: DebugProtocol.Response) {
-		if (!logDapTraffic)
-			return;
-		this.log(`DAP-RESP: ${JSON.stringify(resp)}`);
-	}
-
-	private logDapEvent(evt: DebugProtocol.Event) {
-		if (!logDapTraffic)
-			return;
-		this.log(`DAP-EVT: ${JSON.stringify(evt)}`);
-	}
-
 	protected initializeRequest(
 		response: DebugProtocol.InitializeResponse,
 		args: DebugProtocol.InitializeRequestArguments,
 	): void {
-		this.logDapRequest("initializeRequest", args);
-		this.supportsRunInTerminalRequest = !!args.supportsRunInTerminalRequest;
-
 		response.body = response.body || {};
 		response.body.supportsConfigurationDoneRequest = true;
 		response.body.supportsEvaluateForHovers = true;
@@ -157,15 +105,12 @@ export class DartDebugSession extends DebugSession {
 			{ filter: "All", label: "All Exceptions", default: false },
 			{ filter: "Unhandled", label: "Uncaught Exceptions", default: true },
 		];
-		this.logDapResponse(response);
 		this.sendResponse(response);
 	}
 
 	protected async launchRequest(response: DebugProtocol.LaunchResponse, args: DartLaunchArgs & DebugProtocol.LaunchRequestArguments): Promise<void> {
-		this.logDapRequest("launchRequest", args);
 		if (!args || !args.dartSdkPath || (this.requiresProgram && !args.program)) {
 			this.logToUser("Unable to restart debugging. Please try ending the debug session and starting again.\n");
-			this.logDapEvent(new TerminatedEvent());
 			this.sendEvent(new TerminatedEvent());
 			return;
 		}
@@ -180,7 +125,6 @@ export class DartDebugSession extends DebugSession {
 
 		this.startProgress(debugLaunchProgressId, "Launching");
 
-		this.shouldKillProcessOnTerminate = true;
 		this.cwd = args.cwd;
 		this.noDebug = args.noDebug;
 		// Set default exception mode based on noDebug. This will be sent to threads
@@ -188,83 +132,48 @@ export class DartDebugSession extends DebugSession {
 		// the exception mode.
 		await this.threadManager.setExceptionPauseMode(this.noDebug ? "None" : "Unhandled");
 		this.packageMap = PackageMap.load(this.logger, PackageMap.findPackagesFile(args.program || args.cwd));
-		this.dartCapabilities.version = getSdkVersion(this.logger, { sdkRoot: args.dartSdkPath }) ?? this.dartCapabilities.version;
-		this.useWriteServiceInfo = this.allowWriteServiceInfo && this.dartCapabilities.supportsWriteServiceInfo;
-		this.deleteServiceFileAfterRead = !!args.deleteServiceInfoFile;
-		this.supportsDebugInternalLibraries = this.dartCapabilities.supportsDebugInternalLibraries;
 		this.readSharedArgs(args);
 
-		this.logDapResponse(response);
 		this.sendResponse(response);
 
-		if (this.useWriteServiceInfo) {
-			this.parseVmServiceUriFromStdOut = false;
-			this.vmServiceInfoFile = path.join(os.tmpdir(), `dart-vm-service-${getRandomInt(0x1000, 0x10000).toString(16)}.json`);
-		}
-
-		const terminalType = args.console === "terminal"
-			? "integrated"
-			: args.console === "externalTerminal"
-				? "external"
-				: undefined;
-
 		try {
-			// Terminal mode is only supported if we can use writeServiceInfo.
-			// TODO: Move useWriteServiceInfo check to the client, so other clients do not need to provide this.
-			if (terminalType && !this.supportsRunInTerminalRequest) {
-				this.log("Ignoring request to run in terminal because client does not support runInTerminalRequest", LogSeverity.Warn);
-			}
-			if (terminalType && this.useWriteServiceInfo && this.supportsRunInTerminalRequest) {
-				this.deleteServiceFileAfterRead = true;
-				this.childProcess = await this.spawnRemoteEditorProcess(args, terminalType);
-			} else {
-				const process = await this.spawnProcess(args);
+			const process = await this.spawnProcess(args);
 
-				this.childProcess = process;
-				this.processExited = false;
-				this.processExit = new Promise((resolve) => process.on("exit", (code, signal) => resolve({ code, signal })));
-				process.stdout.setEncoding("utf8");
-				process.stdout.on("data", async (data: Buffer | string) => {
-					let match: RegExpExecArray | null = null;
-					if (this.shouldConnectDebugger && this.parseVmServiceUriFromStdOut && !this.vmService) {
-						match = vmServiceListeningBannerPattern.exec(data.toString());
-					}
-					if (match)
-						await this.initDebugger(this.convertObservatoryUriToVmServiceUri(match[1]));
-					else if (this.sendStdOutToConsole)
-						this.logStdout(data.toString());
+			this.childProcess = process;
+			this.processExited = false;
+			this.processExit = new Promise((resolve) => process.on("exit", (code, signal) => resolve({ code, signal })));
+			process.stdout.setEncoding("utf8");
+			process.stdout.on("data", async (data: Buffer | string) => {
+				let match: RegExpExecArray | null = null;
+				if (this.shouldConnectDebugger && this.parseVmServiceUriFromStdOut && !this.vmService) {
+					match = vmServiceListeningBannerPattern.exec(data.toString());
+				}
+				if (match)
+					await this.initDebugger(this.convertObservatoryUriToVmServiceUri(match[1]));
+				else if (this.sendStdOutToConsole)
+					this.logStdout(data.toString());
+			});
+			process.stderr.setEncoding("utf8");
+			process.stderr.on("data", (data: Buffer | string) => {
+				this.logToUserBuffered(data.toString(), "stderr");
+			});
+			process.on("error", (error) => {
+				this.logToUser(`${error}\n`, "stderr");
+			});
+			void this.processExit.then(async ({ code, signal }) => {
+				this.processExited = true;
+				this.log(`Process exited (${signal ? `${signal}`.toLowerCase() : code})`);
+				if (!code && !signal)
+					this.logToUser("Exited\n");
+				else
+					this.logToUser(`Exited (${signal ? `${signal}`.toLowerCase() : code})\n`);
+				// To reduce the chances of losing async logs, wait a short period
+				// before terminating.
+				await this.raceIgnoringErrors(() => this.lastLoggingEvent, 500);
+				setImmediate(() => {
+					this.sendEvent(new TerminatedEvent());
 				});
-				process.stderr.setEncoding("utf8");
-				process.stderr.on("data", (data: Buffer | string) => {
-					this.logToUserBuffered(data.toString(), "stderr");
-				});
-				process.on("error", (error) => {
-					this.logToUser(`${error}\n`, "stderr");
-				});
-				// tslint:disable-next-line: no-floating-promises
-				this.processExit.then(async ({ code, signal }) => {
-					this.stopServiceFilePolling(this.deleteServiceFileAfterRead);
-					this.processExited = true;
-					this.log(`Process exited (${signal ? `${signal}`.toLowerCase() : code})`);
-					if (!code && !signal)
-						this.logToUser("Exited\n");
-					else
-						this.logToUser(`Exited (${signal ? `${signal}`.toLowerCase() : code})\n`);
-					// To reduce the chances of losing async logs, wait a short period
-					// before terminating.
-					await this.raceIgnoringErrors(() => this.lastLoggingEvent, 500);
-					setImmediate(() => {
-						this.logDapEvent(new TerminatedEvent());
-						this.sendEvent(new TerminatedEvent());
-					});
-				});
-			}
-
-			if (this.useWriteServiceInfo && this.shouldConnectDebugger) {
-
-				const url = await this.startServiceFilePolling();
-				await this.initDebugger(url.toString());
-			}
+			});
 		} catch (e) {
 			this.logToUser(`Unable to start debugging: ${e}`);
 			this.sendEvent(new TerminatedEvent());
@@ -273,7 +182,6 @@ export class DartDebugSession extends DebugSession {
 
 		if (!this.shouldConnectDebugger) {
 			this.endProgress(debugLaunchProgressId);
-			this.logDapEvent(new InitializedEvent());
 			this.sendEvent(new InitializedEvent());
 
 			// If we're not connecting a debugger and we spawned a remote process, we have
@@ -289,171 +197,19 @@ export class DartDebugSession extends DebugSession {
 		this.debugSdkLibraries = args.debugSdkLibraries;
 		this.evaluateGettersInDebugViews = args.evaluateGettersInDebugViews;
 		this.evaluateToStringInDebugViews = args.evaluateToStringInDebugViews;
-		this.logFile = args.vmServiceLogFile;
 		this.maxLogLineLength = args.maxLogLineLength;
 		this.sendLogsToClient = !!args.sendLogsToClient;
 		this.showDartDeveloperLogs = args.showDartDeveloperLogs;
 		this.toolEnv = args.toolEnv;
-		this.useInspectorNotificationsForWidgetErrors = !!args.useInspectorNotificationsForWidgetErrors;
 	}
 
-	protected async attachRequest(response: DebugProtocol.AttachResponse, args: DartLaunchArgs & DebugProtocol.AttachRequestArguments): Promise<void> {
-		this.logDapRequest("attachRequest", args);
-		const vmServiceUri = (args.vmServiceUri || args.observatoryUri);
-		if (!args || (!vmServiceUri && !args.vmServiceInfoFile)) {
-			return this.errorResponse(response, "Unable to attach; no VM service address or service info file provided.");
-		}
-
-		this.startProgress(debugLaunchProgressId, "Waiting for application");
-
-		this.shouldKillProcessOnTerminate = false;
-		this.cwd = args.cwd;
-		this.readSharedArgs(args);
-
-		this.log(`Attaching to process via ${vmServiceUri || args.vmServiceInfoFile}`);
-
-		// If we were given an explicity packages path, use it (otherwise we'll try
-		// to extract from the VM)
-		if (args.packages) {
-			// Support relative paths
-			if (args.packages && !path.isAbsolute(args.packages))
-				args.packages = args.cwd ? path.join(args.cwd, args.packages) : args.packages;
-
-			try {
-				this.packageMap = PackageMap.load(this.logger, PackageMap.findPackagesFile(args.packages));
-			} catch (e) {
-				this.errorResponse(response, `Unable to load packages file: ${e}`);
-			}
-		}
-
-		this.logDapResponse(response);
-		this.sendResponse(response);
-
-		let url: string | undefined;
-		try {
-			if (vmServiceUri) {
-				// TODO: Should we do this here? DDS won't have a /ws on the end so
-				// this may end up being incorrect.
-				url = this.convertObservatoryUriToVmServiceUri(vmServiceUri);
-			} else {
-				this.vmServiceInfoFile = args.vmServiceInfoFile;
-				this.updateProgress(debugLaunchProgressId, `Waiting for ${this.vmServiceInfoFile}`);
-				url = await this.startServiceFilePolling();
-				this.endProgress(debugLaunchProgressId);
-			}
-			this.subscribeToStdout = true;
-			await this.initDebugger(url);
-		} catch (e) {
-			const messageSuffix = args.vmServiceInfoFile ? `\n    VM info was read from ${args.vmServiceInfoFile}` : "";
-			this.logToUser(`Unable to connect to VM service at ${url || "??"}${messageSuffix}\n    ${e}`);
-			this.sendEvent(new TerminatedEvent());
-			return;
-		}
-	}
+	protected abstract attachRequest(response: DebugProtocol.AttachResponse, args: DartLaunchArgs & DebugProtocol.AttachRequestArguments): Promise<void>;
 
 	protected sourceFileForArgs(args: DartLaunchArgs): string {
 		return args.cwd ? path.relative(args.cwd, args.program!) : args.program!;
 	}
 
-	protected async spawnProcess(args: DartLaunchArgs): Promise<SpawnedProcess> {
-		let dartPath = path.join(args.dartSdkPath, dartVMPath);
-		const execution = this.buildExecutionInfo(dartPath, args);
-		dartPath = execution.executable;
-		const appArgs = execution.args;
-
-		this.log(`Spawning ${dartPath} with args ${JSON.stringify(appArgs)}`);
-		if (args.cwd)
-			this.log(`..  in ${args.cwd}`);
-		const env = Object.assign({}, args.toolEnv, args.env);
-		const process = safeSpawn(args.cwd, dartPath, appArgs, env);
-
-		this.log(`    PID: ${process.pid}`);
-
-		return process;
-	}
-
-	protected async spawnRemoteEditorProcess(args: DartLaunchArgs, terminalType: "integrated" | "external"): Promise<RemoteEditorTerminalProcess> {
-		const dartPath = path.join(args.dartSdkPath, dartVMPath);
-		const execution = this.buildExecutionInfo(dartPath, args);
-		const appArgs = execution.args;
-
-		this.log(`Spawning ${dartPath} remotely with args ${JSON.stringify(appArgs)}`);
-		if (args.cwd)
-			this.log(`..  in ${args.cwd}`);
-
-		this.remoteEditorTerminalLaunched = new Promise<RemoteEditorTerminalProcess>((resolve, reject) => {
-			this.sendRequest("runInTerminal", {
-				args: [dartPath].concat(appArgs),
-				cwd: args.cwd,
-				env: args.env,
-				kind: terminalType,
-				title: args.name,
-			} as DebugProtocol.RunInTerminalRequestArguments, 15000, (response: DebugProtocol.Response) => {
-				if (response.success) {
-					this.log(`    PID: ${process.pid}`);
-					const resp = response as DebugProtocol.RunInTerminalResponse;
-
-					// Do not fall back to `resp.body.shellProcessId` here, as terminating the shell
-					// during shutdown will result in an error on Windows being shown to the user.
-					// https://github.com/Dart-Code/Dart-Code/issues/2750
-					//
-					// When running in debug mode, we should have the real PID via the VM Service
-					// anyway, and when not running in debug mode we "terminate" immediately and
-					// would not be showing a debug toolbar for the user to terminate anyway (any
-					// disconnect event we get is because the process already finished).
-					resolve(new RemoteEditorTerminalProcess(resp.body.processId));
-				} else {
-					reject(response.message);
-				}
-			});
-		});
-
-		return this.remoteEditorTerminalLaunched;
-	}
-
-	private buildExecutionInfo(binPath: string, args: DartLaunchArgs): ExecutionInfo {
-		let allArgs: string[] = [];
-
-		if (args.vmAdditionalArgs)
-			allArgs = allArgs.concat(args.vmAdditionalArgs);
-
-		if (this.shouldConnectDebugger) {
-			this.expectAdditionalPidToTerminate = true;
-			allArgs.push(`--enable-vm-service=${args.vmServicePort}`);
-			allArgs.push("--pause_isolates_on_start=true");
-			if (this.dartCapabilities.supportsNoServeDevTools)
-				allArgs.push("--no-serve-devtools");
-		}
-		if (this.useWriteServiceInfo && this.vmServiceInfoFile) {
-			allArgs.push(`--write-service-info=${formatPathForVm(this.vmServiceInfoFile)}`);
-			allArgs.push("-DSILENT_OBSERVATORY=true");
-		}
-
-		// Replace in any custom tool.
-		const customTool = {
-			replacesArgs: args.customToolReplacesArgs,
-			script: args.customTool,
-		};
-		const execution = usingCustomScript(
-			binPath,
-			allArgs,
-			customTool,
-		);
-		allArgs = execution.args;
-
-		if (args.toolArgs)
-			allArgs = allArgs.concat(args.toolArgs);
-
-		allArgs.push(this.sourceFileForArgs(args));
-
-		if (args.args)
-			allArgs = allArgs.concat(args.args);
-
-		return {
-			args: allArgs,
-			executable: execution.executable,
-		};
-	}
+	protected abstract spawnProcess(args: DartLaunchArgs): Promise<SpawnedProcess>;
 
 	protected convertObservatoryUriToVmServiceUri(uri: string) {
 		const wsUri = uri.trim();
@@ -468,81 +224,8 @@ export class DartDebugSession extends DebugSession {
 	}
 
 	protected log(message: string, severity = LogSeverity.Info) {
-		if (this.logFile) {
-			if (!this.logStream) {
-				this.logStream = fs.createWriteStream(this.logFile);
-			}
-			this.logStream.write(`[${(new Date()).toLocaleTimeString()}]: `);
-			if (this.maxLogLineLength && message.length > this.maxLogLineLength)
-				this.logStream.write(message.substring(0, this.maxLogLineLength) + "…\r\n");
-			else
-				this.logStream.write(message.trim() + "\r\n");
-		}
-
 		if (this.sendLogsToClient)
 			this.sendEvent(new Event("dart.log", { message, severity, category: LogCategory.VmService } as LogMessage));
-	}
-
-	protected startServiceFilePolling(): Promise<string> {
-		this.logger.info(`Starting to poll for file ${this.vmServiceInfoFile}`);
-		// Ensure we stop if we were already running, to avoid leaving timers running
-		// if this is somehow called twice.
-		this.stopServiceFilePolling(false);
-		if (this.vmServiceInfoFileCompleter)
-			this.vmServiceInfoFileCompleter.reject("Cancelled");
-		this.vmServiceInfoFileCompleter = new PromiseCompleter<string>();
-		this.serviceInfoPollTimer = setInterval(() => this.tryReadServiceFile(), 50);
-		return this.vmServiceInfoFileCompleter.promise;
-	}
-
-	private stopServiceFilePolling(allowDelete: boolean) {
-		if (this.serviceInfoPollTimer) {
-			this.logger.info(`Stopping polling for file ${this.vmServiceInfoFile}`);
-			clearInterval(this.serviceInfoPollTimer);
-			this.serviceInfoPollTimer = undefined;
-		}
-		if (allowDelete
-			&& this.vmServiceInfoFile
-			&& fs.existsSync(this.vmServiceInfoFile)) {
-			try {
-				fs.unlinkSync(this.vmServiceInfoFile);
-				this.vmServiceInfoFile = undefined;
-			} catch (e) {
-				// Don't complain if we failed - the file may have been cleaned up
-				// in the meantime.
-			}
-		}
-	}
-
-	private async tryReadServiceFile(): Promise<void> {
-		if (!this.vmServiceInfoFile || !fs.existsSync(this.vmServiceInfoFile))
-			return;
-
-		try {
-			const serviceInfoJson = fs.readFileSync(this.vmServiceInfoFile, "utf8");
-
-			// It's possible we read the file before the VM had started writing it, so
-			// do some crude checks and bail to reduce the chances of logging half-written
-			// files as errors.
-			if (serviceInfoJson.length < 2 || !serviceInfoJson.trimRight().endsWith("}"))
-				return;
-
-			const serviceInfo: { uri: string } = JSON.parse(serviceInfoJson);
-
-			this.logger.info(`Successfully read JSON from ${this.vmServiceInfoFile} which indicates URI ${serviceInfo.uri}`);
-
-			this.stopServiceFilePolling(this.deleteServiceFileAfterRead);
-			// Ensure we don't try to start anything before we've finished
-			// setting up the process when running remotely.
-			if (this.remoteEditorTerminalLaunched) {
-				await this.remoteEditorTerminalLaunched;
-				await new Promise((resolve) => setTimeout(resolve, 5));
-			}
-			this.vmServiceInfoFileCompleter?.resolve(serviceInfo.uri);
-		} catch (e) {
-			this.logger.error(e);
-			this.vmServiceInfoFileCompleter?.reject(e);
-		}
 	}
 
 	protected async initDebugger(uri: string): Promise<void> {
@@ -551,21 +234,19 @@ export class DartDebugSession extends DebugSession {
 		uri = uri.replace("[::]", "localhost");
 		this.log(`Initialising debugger for ${uri}`);
 		// Send the uri back to the editor so it can be used to launch browsers etc.
-		let browserFriendlyUri: string;
-		if (uri.endsWith("/ws")) {
+		let browserFriendlyUri = uri;
+		if (browserFriendlyUri.endsWith("/ws"))
 			browserFriendlyUri = uri.substring(0, uri.length - 2);
-			if (browserFriendlyUri.startsWith("ws:"))
-				browserFriendlyUri = "http:" + browserFriendlyUri.substring(3);
-		} else {
-			browserFriendlyUri = uri;
-		}
+		if (browserFriendlyUri.startsWith("ws:"))
+			browserFriendlyUri = "http:" + browserFriendlyUri.substring(3);
+
+		let vmServiceUri = uri;
+		if (vmServiceUri.startsWith("http:"))
+			vmServiceUri = "ws:" + browserFriendlyUri.substring(5);
 
 		const evt = new Event("dart.debuggerUris", {
-			// If we don't support Observatory, don't send its URL back to the editor.
-			observatoryUri: this.supportsObservatoryWebApp ? browserFriendlyUri.toString() : undefined,
-			vmServiceUri: browserFriendlyUri.toString(),
+			vmServiceUri: vmServiceUri.toString(),
 		});
-		this.logDapEvent(evt);
 		this.sendEvent(evt);
 
 		if (!this.shouldConnectDebugger)
@@ -606,7 +287,7 @@ export class DartDebugSession extends DebugSession {
 						// we should keep a ref to this process to terminate when we quit. This avoids issues where our process is a shell
 						// (we use shell execute to fix issues on Windows) and the kill signal isn't passed on correctly.
 						// See: https://github.com/Dart-Code/Dart-Code/issues/907
-						if (this.allowTerminatingVmServicePid && this.childProcess) {
+						if (this.childProcess) {
 							this.recordAdditionalPid(vm.pid);
 						}
 
@@ -646,12 +327,7 @@ export class DartDebugSession extends DebugSession {
 							}
 						}));
 
-						// Set a timer for memory updates.
-						if (this.pollforMemoryMs)
-							setTimeout(() => this.pollForMemoryUsage(), this.pollforMemoryMs);
-
 						this.endProgress(debugLaunchProgressId);
-						this.logDapEvent(new InitializedEvent());
 						this.sendEvent(new InitializedEvent());
 					});
 				});
@@ -662,17 +338,9 @@ export class DartDebugSession extends DebugSession {
 			this.vmService.onClose((code: number, message: string) => {
 
 				this.log(`VM service connection closed: ${code} (${message})`);
-				if (this.logStream) {
-					this.logStream.end();
-					this.logStream = undefined;
-					// Wipe out the filename so if a message arrives late, it doesn't
-					// wipe out the logfile with just a "process exited" or similar message.
-					this.logFile = undefined;
-				}
 				// If we don't have a process (eg. we're attached) or we ran as a terminal, then this is our signal to quit,
 				// since we won't get a process exit event.
 				if (!this.childProcess || this.childProcess instanceof RemoteEditorTerminalProcess) {
-					this.logDapEvent(new TerminatedEvent());
 					this.sendEvent(new TerminatedEvent());
 				} else {
 					// In some cases the VM service closes but we never get the exit/close events from the process
@@ -684,7 +352,6 @@ export class DartDebugSession extends DebugSession {
 					// results in VS Code sending disconnectRequest() and we then try to more forefully kill.
 					setTimeout(() => {
 						if (!this.processExited) {
-							this.logDapEvent(new TerminatedEvent());
 							this.sendEvent(new TerminatedEvent());
 						}
 					}, 5000);
@@ -711,7 +378,6 @@ export class DartDebugSession extends DebugSession {
 		const serviceStreamName = this.vmServiceCapabilities.serviceStreamIsPublic ? "Service" : "_Service";
 		await Promise.all([
 			this.vmService.on("Isolate", (event: VMEvent) => this.handleIsolateEvent(event)),
-			this.vmService.on("Extension", (event: VMEvent) => this.handleExtensionEvent(event)),
 			this.vmService.on("Debug", (event: VMEvent) => this.handleDebugEvent(event)),
 			this.vmService.on(serviceStreamName, (event: VMEvent) => this.handleServiceEvent(event)),
 		]);
@@ -723,6 +389,13 @@ export class DartDebugSession extends DebugSession {
 				this.logger.info(errorString(e));
 			});
 		}
+
+		// We don't know for certain we have a connected DDS that supports custom streams, so wrap in try/catch
+		try {
+			await this.vmService.on("ToolEvent", (event: VMEvent) => this.handleToolEvent(event)).catch((e) => {
+				this.logger.info(errorString(e));
+			});
+		} catch (e) { }
 
 		if (this.subscribeToStdout) {
 			await this.vmService.on("Stdout", (event: VMWriteEvent) => this.handleStdoutEvent(event)).catch((e) => {
@@ -737,8 +410,7 @@ export class DartDebugSession extends DebugSession {
 		const signal = force ? "SIGKILL" : "SIGINT";
 		const request = force ? "DISC" : "TERM";
 		this.log(`${request}: Requested to terminate with ${signal}...`);
-		this.stopServiceFilePolling(this.deleteServiceFileAfterRead);
-		if (this.shouldKillProcessOnTerminate && this.childProcess && !this.processExited) {
+		if (this.childProcess && !this.processExited) {
 			this.log(`${request}: Terminating processes...`);
 			for (const pid of this.additionalPidsToTerminate) {
 				if (pid === this.childProcess.pid)
@@ -774,15 +446,6 @@ export class DartDebugSession extends DebugSession {
 			// test finish) so we may need to send again it we get another disconnectRequest.
 			// We also use !childProcess to mean we're attached.
 			// this.childProcess = undefined;
-		} else if (!this.shouldKillProcessOnTerminate && this.vmService) {
-			this.log(`${request}: Disconnecting from process...`);
-			await this.tryRemoveAllBreakpointsAndResumeAllThreads(request);
-			try {
-				this.log(`${request}: Closing VM service connection...`);
-				this.vmService.close();
-			} catch { } finally {
-				this.vmService = undefined;
-			}
 		} else {
 			this.log(`${request}: Did not need to terminate processes`);
 		}
@@ -814,7 +477,7 @@ export class DartDebugSession extends DebugSession {
 
 	// Run some code, but don't wait longer than a certain time period for the result
 	// as it may never come. Returns true if the operation completed.
-	private async raceIgnoringErrors(action: () => Promise<any>, timeoutMilliseconds: number = 250): Promise<boolean> {
+	private async raceIgnoringErrors(action: () => Promise<any>, timeoutMilliseconds = 250): Promise<boolean> {
 		try {
 			await this.withTimeout(action(), timeoutMilliseconds);
 			return true;
@@ -828,7 +491,6 @@ export class DartDebugSession extends DebugSession {
 		response: DebugProtocol.TerminateResponse,
 		args: DebugProtocol.TerminateArguments,
 	): Promise<void> {
-		this.logDapRequest("teminateRequest", args);
 		this.log(`Termination requested!`);
 		this.isTerminating = true;
 		this.startProgress(debugTerminatingProgressId, "Terminating debug session");
@@ -860,7 +522,6 @@ export class DartDebugSession extends DebugSession {
 		response: DebugProtocol.DisconnectResponse,
 		args: DebugProtocol.DisconnectArguments,
 	): Promise<void> {
-		this.logDapRequest("disconnectRequest", args);
 		this.log(`Disconnect requested!`);
 		this.isTerminating = true;
 		try {
@@ -883,10 +544,8 @@ export class DartDebugSession extends DebugSession {
 		response: DebugProtocol.SetBreakpointsResponse,
 		args: DebugProtocol.SetBreakpointsArguments,
 	): Promise<void> {
-		this.logDapRequest("setBreakPointsRequest", args);
 		if (this.noDebug) {
 			response.body = { breakpoints: (args.breakpoints || []).map((b) => ({ verified: false })) };
-			this.logDapResponse(response);
 			this.sendResponse(response);
 			return;
 		}
@@ -907,7 +566,6 @@ export class DartDebugSession extends DebugSession {
 			}
 
 			response.body = { breakpoints: bpResponse };
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		} catch (error) {
 			this.errorResponse(response, `${error}`);
@@ -918,22 +576,20 @@ export class DartDebugSession extends DebugSession {
 		response: DebugProtocol.SetExceptionBreakpointsResponse,
 		args: DebugProtocol.SetExceptionBreakpointsArguments,
 	): Promise<void> {
-		this.logDapRequest("setExceptionBreakPointsRequest", args);
 		const filters: string[] = args.filters;
 
 		let mode: VmExceptionMode = "None";
 
 		// If we're running in noDebug mode, we'll always set None.
 		if (!this.noDebug) {
-			if (filters.indexOf("Unhandled") !== -1)
+			if (filters.includes("Unhandled"))
 				mode = "Unhandled";
-			if (filters.indexOf("All") !== -1)
+			if (filters.includes("All"))
 				mode = "All";
 		}
 
 		await this.threadManager.setExceptionPauseMode(mode);
 
-		this.logDapResponse(response);
 		this.sendResponse(response);
 	}
 
@@ -941,15 +597,12 @@ export class DartDebugSession extends DebugSession {
 		response: DebugProtocol.ConfigurationDoneResponse,
 		args: DebugProtocol.ConfigurationDoneArguments,
 	): void {
-		this.logDapRequest("configurationDoneRequest", args);
-		this.logDapResponse(response);
 		this.sendResponse(response);
 
 		this.threadManager.receivedConfigurationDone();
 	}
 
 	protected pauseRequest(response: DebugProtocol.PauseResponse, args: DebugProtocol.PauseArguments): void {
-		this.logDapRequest("pauseRequest", args);
 		const thread = this.threadManager.getThreadInfoFromNumber(args.threadId);
 
 		if (!thread) {
@@ -964,14 +617,12 @@ export class DartDebugSession extends DebugSession {
 
 		this.vmService.pause(thread.ref.id)
 			.then(() => {
-				this.logDapResponse(response);
 				this.sendResponse(response);
 			})
 			.catch((error) => this.errorResponse(response, `${error}`));
 	}
 
 	protected sourceRequest(response: DebugProtocol.SourceResponse, args: DebugProtocol.SourceArguments): void {
-		this.logDapRequest("sourceRequest", args);
 		const sourceReference = args.sourceReference;
 		const data = this.threadManager.getStoredData(sourceReference);
 		const scriptRef: VMScriptRef = data.data as VMScriptRef;
@@ -983,20 +634,16 @@ export class DartDebugSession extends DebugSession {
 				response.success = false;
 				response.message = "<source not available>";
 			}
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		}).catch((error) => this.errorResponse(response, `${error}`));
 	}
 
 	protected threadsRequest(response: DebugProtocol.ThreadsResponse): void {
-		this.logDapRequest("threadsRequest", undefined);
 		response.body = { threads: this.threadManager.getThreads() };
-		this.logDapResponse(response);
 		this.sendResponse(response);
 	}
 
 	protected async stackTraceRequest(response: DebugProtocol.StackTraceResponse, args: DebugProtocol.StackTraceArguments): Promise<void> {
-		this.logDapRequest("stackTraceRequest", args);
 		const stackFrameBatch = 20;
 		const thread = this.threadManager.getThreadInfoFromNumber(args.threadId);
 		const startFrame = args.startFrame || 0;
@@ -1018,8 +665,8 @@ export class DartDebugSession extends DebugSession {
 		}
 
 		try {
-			let isTruncated = true;
-			let totalFrames = 1;
+			let isTruncated: boolean;
+			let totalFrames: number;
 			let stackFrames: DebugProtocol.StackFrame[] = [];
 
 			// Newer VM Service allows us to cap the frames to avoid fetching more than we need.
@@ -1041,7 +688,7 @@ export class DartDebugSession extends DebugSession {
 
 				const stack: VMStack = result.result as VMStack;
 				let vmFrames = stack.asyncCausalFrames || stack.frames;
-				const framesRecieved = vmFrames.length;
+				const framesReceived = vmFrames.length;
 				isTruncated = stack.truncated ?? false;
 
 				let firstAsyncMarkerIndex = vmFrames.findIndex((f) => f.kind === "AsyncSuspensionMarker");
@@ -1061,9 +708,9 @@ export class DartDebugSession extends DebugSession {
 
 				totalFrames = supportsGetStackLimit
 					// If the stack was truncated, we should say there are 20(stackFrameBatch) more frames, otherwise use the real count.
-					? isTruncated ? framesRecieved + stackFrameBatch : framesRecieved
-					// If we don't support limit, the number recieved is always correct.
-					: framesRecieved;
+					? isTruncated ? framesReceived + stackFrameBatch : framesReceived
+					// If we don't support limit, the number received is always correct.
+					: framesReceived;
 			}
 
 
@@ -1072,7 +719,6 @@ export class DartDebugSession extends DebugSession {
 				totalFrames,
 			};
 
-			this.logDapResponse(response);
 			this.sendResponse(response);
 
 		} catch (error) {
@@ -1145,23 +791,26 @@ export class DartDebugSession extends DebugSession {
 		stackFrame.canRestart = !isTopFrame && frame.index < firstAsyncMarkerIndex;
 
 		// Resolve the line and column information.
-		try {
-			const script = await thread.getScript(location.script);
-			const fileLocation = this.resolveFileLocation(script, location.tokenPos);
-			if (fileLocation) {
-				stackFrame.line = fileLocation.line;
-				stackFrame.column = fileLocation.column;
+		if (location.line && location.column) {
+			stackFrame.line = location.line;
+			stackFrame.column = location.column;
+		} else {
+			try {
+				const script = await thread.getScript(location.script);
+				const fileLocation = this.resolveFileLocation(script, location.tokenPos);
+				if (fileLocation) {
+					stackFrame.line = fileLocation.line;
+					stackFrame.column = fileLocation.column;
+				}
+			} catch (e) {
+				this.logger.error(e);
 			}
-		} catch (e) {
-			this.logger.error(e);
 		}
 
 		return stackFrame;
 	}
 
 	private isDebuggable(uri: string): boolean {
-		if (!this.isValidToDebug(uri))
-			return false;
 		if (this.isSdkLibrary(uri))
 			return this.debugSdkLibraries;
 		if (this.isExternalLibrary(uri))
@@ -1170,7 +819,6 @@ export class DartDebugSession extends DebugSession {
 	}
 
 	protected scopesRequest(response: DebugProtocol.ScopesResponse, args: DebugProtocol.ScopesArguments): void {
-		this.logDapRequest("scopesRequest", args);
 		const frameId = args.frameId;
 		const data = this.threadManager.getStoredData(frameId);
 		const frame: VMFrame = data.data as VMFrame;
@@ -1187,12 +835,10 @@ export class DartDebugSession extends DebugSession {
 		scopes.push(new Scope("Locals", variablesReference));
 
 		response.body = { scopes };
-		this.logDapResponse(response);
 		this.sendResponse(response);
 	}
 
 	protected async variablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): Promise<void> {
-		this.logDapRequest("variablesRequest", args);
 		if (!this.vmService) {
 			this.errorResponse(response, `No VM service connection`);
 			return;
@@ -1225,7 +871,6 @@ export class DartDebugSession extends DebugSession {
 			}
 			variables = sortBy(variables, (v) => v.name);
 			response.body = { variables };
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		} else if (data.data.type === "MapEntry") {
 			const mapRef = data.data as VMMapEntry;
@@ -1260,7 +905,6 @@ export class DartDebugSession extends DebugSession {
 			}
 
 			response.body = { variables };
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		} else if (data.data.type === InspectedVariable.type) {
 			const variable = data.data as InspectedVariable;
@@ -1329,12 +973,14 @@ export class DartDebugSession extends DebugSession {
 								});
 							}
 						} else if (instance.fields) {
+							const fieldAndGetterPromises: Array<Promise<DebugProtocol.Variable>> = [];
 
-							let fieldAndGetterPromises: Array<Promise<DebugProtocol.Variable>> = [];
-
-							const fields = sortBy(instance.fields, (f) => f.decl.name);
-							const fieldPromises = fields.map(async (field, i) => this.instanceRefToVariable(thread, canEvaluate, `${instanceRef.evaluateName}.${field.decl.name}`, field.decl.name, field.value, i <= maxValuesToCallToString));
-							fieldAndGetterPromises = fieldAndGetterPromises.concat(fieldPromises);
+							const fields = sortBy(instance.fields, (f) => f.decl?.name ?? f.name);
+							const fieldPromises = fields.map(async (field, i) => {
+								const name = field.decl?.name ?? (typeof field.name === "number" ? `\$${field.name}` : field.name);
+								return this.instanceRefToVariable(thread, canEvaluate, `${instanceRef.evaluateName}.${name}`, name, field.value, i <= maxValuesToCallToString);
+							});
+							fieldAndGetterPromises.push(...fieldPromises);
 
 							// Add getters
 							if (this.evaluateGettersInDebugViews && instance.class) {
@@ -1368,7 +1014,7 @@ export class DartDebugSession extends DebugSession {
 										return { name: getterName, value: this.errorAsDisplayValue(e), variablesReference: 0 };
 									}
 								});
-								fieldAndGetterPromises = fieldAndGetterPromises.concat(getterPromises);
+								fieldAndGetterPromises.push(...getterPromises);
 							}
 
 							const fieldAndGetterVariables = await Promise.all(fieldAndGetterPromises);
@@ -1382,7 +1028,6 @@ export class DartDebugSession extends DebugSession {
 				}
 
 				response.body = { variables };
-				this.logDapResponse(response);
 				this.sendResponse(response);
 			} catch (error) {
 				response.body = {
@@ -1390,7 +1035,6 @@ export class DartDebugSession extends DebugSession {
 						{ name: "<error>", value: this.errorAsDisplayValue(error), variablesReference: 0 },
 					],
 				};
-				this.logDapResponse(response);
 				this.sendResponse(response);
 			}
 		}
@@ -1428,7 +1072,7 @@ export class DartDebugSession extends DebugSession {
 		return kind === "String" || kind === "Bool" || kind === "Int" || kind === "Num" || kind === "Double" || kind === "Null" || kind === "Closure";
 	}
 
-	private async callToString(isolate: VMIsolateRef, instanceRef: VMInstanceRef, getFullString: boolean = false, suppressQuotesAroundStrings: boolean = false): Promise<string | undefined> {
+	private async callToString(isolate: VMIsolateRef, instanceRef: VMInstanceRef, getFullString = false, suppressQuotesAroundStrings = false): Promise<string | undefined> {
 		if (!this.vmService)
 			return;
 
@@ -1455,17 +1099,10 @@ export class DartDebugSession extends DebugSession {
 	}
 
 	protected setVariableRequest(response: DebugProtocol.SetVariableResponse, args: DebugProtocol.SetVariableArguments): void {
-		this.logDapRequest("setVariableRequest", args);
-		// const variablesReference: number = args.variablesReference;
-		// const name: string = args.name;
-		// const value: string = args.value;
-
-		// TODO: Use eval to implement this.
 		this.errorResponse(response, "not supported");
 	}
 
 	protected continueRequest(response: DebugProtocol.ContinueResponse, args: DebugProtocol.ContinueArguments): void {
-		this.logDapRequest("continueRequest", args);
 		const thread = this.threadManager.getThreadInfoFromNumber(args.threadId);
 		if (!thread) {
 			this.errorResponse(response, `No thread with id ${args.threadId}`);
@@ -1473,13 +1110,11 @@ export class DartDebugSession extends DebugSession {
 		}
 		thread.resume().then(() => {
 			response.body = { allThreadsContinued: false };
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		}).catch((error) => this.errorResponse(response, `${error}`));
 	}
 
 	protected nextRequest(response: DebugProtocol.NextResponse, args: DebugProtocol.NextArguments): void {
-		this.logDapRequest("nextRequest", args);
 		const thread = this.threadManager.getThreadInfoFromNumber(args.threadId);
 		if (!thread) {
 			this.errorResponse(response, `No thread with id ${args.threadId}`);
@@ -1487,41 +1122,34 @@ export class DartDebugSession extends DebugSession {
 		}
 		const type = thread.atAsyncSuspension ? "OverAsyncSuspension" : "Over";
 		thread.resume(type).then(() => {
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		}).catch((error) => this.errorResponse(response, `${error}`));
 	}
 
 	protected stepInRequest(response: DebugProtocol.StepInResponse, args: DebugProtocol.StepInArguments): void {
-		this.logDapRequest("stepInRequest", args);
 		const thread = this.threadManager.getThreadInfoFromNumber(args.threadId);
 		if (!thread) {
 			this.errorResponse(response, `No thread with id ${args.threadId}`);
 			return;
 		}
 		thread.resume("Into").then(() => {
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		}).catch((error) => this.errorResponse(response, `${error}`));
 	}
 
 	protected stepOutRequest(response: DebugProtocol.StepOutResponse, args: DebugProtocol.StepOutArguments): void {
-		this.logDapRequest("stepOutRequest", args);
 		const thread = this.threadManager.getThreadInfoFromNumber(args.threadId);
 		if (!thread) {
 			this.errorResponse(response, `No thread with id ${args.threadId}`);
 			return;
 		}
 		thread.resume("Out").then(() => {
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		}).catch((error) => this.errorResponse(response, `${error}`));
 	}
 
 	protected restartFrameRequest(response: DebugProtocol.RestartFrameResponse, args: DebugProtocol.RestartFrameArguments): void {
-		this.logDapRequest("restartFrameRequest", args);
 		const frameId = args.frameId;
-		// const context: string = args.context; // "watch", "repl", "hover"
 
 		if (!frameId) {
 			this.errorResponse(response, "unable to restart with no frame");
@@ -1533,25 +1161,27 @@ export class DartDebugSession extends DebugSession {
 		const frame: VMFrame = data.data as VMFrame;
 
 		thread.resume("Rewind", frame.index).then(() => {
-			this.logDapResponse(response);
 			this.sendResponse(response);
 		}).catch((error) => this.errorResponse(response, `${error}`));
 	}
 
 	protected reverseContinueRequest(response: DebugProtocol.ReverseContinueResponse, args: DebugProtocol.ReverseContinueArguments): void {
-		this.logDapRequest("reverseContinueRequest", args);
 		this.logToUser("Reverse continue is not supported\n");
 		this.errorResponse(response, `Reverse continue is not supported for the Dart debugger`);
 	}
 
 	protected async evaluateRequest(response: DebugProtocol.EvaluateResponse, args: DebugProtocol.EvaluateArguments): Promise<void> {
-		this.logDapRequest("evaluateRequest", args);
 		const isClipboardContext = args.context === "clipboard";
 		const isWatchContext = args.context === "watch";
 		const expression: string = args.expression.replace(trailingSemicolonPattern, "");
+
+		if (expression.endsWith(",nq") || expression.endsWith(",h") || expression.endsWith(",d")) {
+			this.errorResponse(response, "Format specifiers are only supported in the SDK debug adapters");
+			return;
+		}
+
 		// Stack frame scope; if not specified, the expression is evaluated in the global scope.
 		const frameId = args.frameId;
-		// const context: string = args.context; // "watch", "repl", "hover"
 
 		const data = frameId ? this.threadManager.getStoredData(frameId) : undefined;
 		const thread = data ? data.thread : this.threadManager.threads[0];
@@ -1589,7 +1219,6 @@ export class DartDebugSession extends DebugSession {
 							result: await this.fullValueAsString(thread.ref, exceptionInstanceRef) || "<unknown>",
 							variablesReference: thread.exceptionReference,
 						};
-						this.logDapResponse(response);
 						this.sendResponse(response);
 						return;
 					}
@@ -1626,7 +1255,6 @@ export class DartDebugSession extends DebugSession {
 					result: text || "<unknown>",
 					variablesReference: this.isSimpleKind(instanceRef.kind) ? 0 : thread.storeData(instanceRef),
 				};
-				this.logDapResponse(response);
 				this.sendResponse(response);
 			}
 		} catch (e: any) {
@@ -1643,21 +1271,24 @@ export class DartDebugSession extends DebugSession {
 		}
 	}
 
-	private withTimeout<T>(promise: Promise<T>, milliseconds: number = 100000): Promise<T> {
+	private withTimeout<T>(promise: Promise<T>, milliseconds = 100000): Promise<T> {
 		return new Promise<T>((resolve, reject) => {
 			// Set a timeout to reject the promise after the timeout period.
 			const timeoutTimer = setTimeout(() => {
 				reject(new Error(`<timed out>`));
 			}, milliseconds);
 
-			promise
-				// When the main promise completes, cancel the timeout and return its result.
-				.then((result) => {
+			// When the main promise completes (or rejects), cancel the timeout and return its result.
+			promise.then(
+				(result) => {
 					clearTimeout(timeoutTimer);
 					resolve(result);
-				})
-				// And if it errors, pass that up.
-				.catch(reject);
+				},
+				(e) => {
+					clearTimeout(timeoutTimer);
+					reject(e);
+				},
+			);
 		});
 	}
 
@@ -1674,7 +1305,7 @@ export class DartDebugSession extends DebugSession {
 		return completer.promise;
 	}
 
-	protected startProgress(progressID: string, message: string | undefined) {
+	protected startProgress(progressId: string, message: string | undefined) {
 		message = message || "Working";
 		message = message.endsWith("…") || message.endsWith("...") ? message : `${message}…`;
 		// TODO: It's not clear if passing an empty string for title is reasonable, but it works better in VS Code.
@@ -1682,35 +1313,33 @@ export class DartDebugSession extends DebugSession {
 
 		// TODO: Revert these changes if VS Code removes the delay.
 		// https://github.com/microsoft/vscode/issues/101405
-		// this.sendEvent(new ProgressStartEvent(progressID, "", e.message));
-		this.sendEvent(new Event("dart.progressStart", { progressID, message }));
+		// this.sendEvent(new ProgressStartEvent(progressId, "", e.message));
+		this.sendEvent(new Event("dart.progressStart", { progressId, message }));
 	}
 
-	protected updateProgress(progressID: string, message: string | undefined) {
+	protected updateProgress(progressId: string, message: string | undefined) {
 		if (!message)
 			return;
 		message = message.endsWith("…") || message.endsWith("...") ? message : `${message}…`;
 		// TODO: Revert these changes if VS Code removes the delay.
 		// https://github.com/microsoft/vscode/issues/101405
-		// this.sendEvent(new ProgressUpdateEvent(progressID, message));
-		this.sendEvent(new Event("dart.progressUpdate", { progressID, message }));
+		// this.sendEvent(new ProgressUpdateEvent(progressId, message));
+		this.sendEvent(new Event("dart.progressUpdate", { progressId, message }));
 	}
 
-	protected endProgress(progressID: string, message?: string | undefined) {
+	protected endProgress(progressId: string, message?: string | undefined) {
 		// TODO: Revert these changes if VS Code removes the delay.
 		// https://github.com/microsoft/vscode/issues/101405
-		// this.sendEvent(new ProgressEndEvent(progressID, e.message));
-		this.sendEvent(new Event("dart.progressEnd", { progressID, message }));
+		// this.sendEvent(new ProgressEndEvent(progressId, e.message));
+		this.sendEvent(new Event("dart.progressEnd", { progressId, message }));
 	}
 
 	protected async customRequest(request: string, response: DebugProtocol.Response, args: any): Promise<void> {
-		this.logDapRequest("customRequest", args);
 		try {
 			switch (request) {
 				case "callService":
 					const result = await this.callService(args.method as string, args.params);
 					response.body = result?.result;
-					this.logDapResponse(response);
 					this.sendResponse(response);
 					break;
 				case "exposeUrlResponse":
@@ -1722,12 +1351,10 @@ export class DartDebugSession extends DebugSession {
 					this.debugExternalPackageLibraries = !!args.debugExternalPackageLibraries;
 					this.debugSdkLibraries = !!args.debugSdkLibraries;
 					await this.threadManager.setLibrariesDuggableForAllIsolates();
-					this.logDapResponse(response);
 					this.sendResponse(response);
 					break;
 				case "hotReload":
 					await this.reloadSources();
-					this.logDapResponse(response);
 					this.sendResponse(response);
 					break;
 				// Flutter requests that may be sent during test runs or other places
@@ -1735,7 +1362,6 @@ export class DartDebugSession extends DebugSession {
 				case "hotRestart":
 					// TODO: Get rid of this!
 					this.log(`Ignoring Flutter customRequest ${request} for non-Flutter-run app`, LogSeverity.Warn);
-					this.logDapResponse(response);
 					this.sendResponse(response);
 					break;
 				default:
@@ -1764,11 +1390,6 @@ export class DartDebugSession extends DebugSession {
 		}
 	}
 
-	// Extension
-	public handleExtensionEvent(event: VMEvent) {
-		// Nothing Dart-specific, but Flutter overrides this
-	}
-
 	// Service
 	public async handleServiceEvent(event: VMEvent) {
 		// Don't process any events while the debugger is still running init code.
@@ -1786,6 +1407,15 @@ export class DartDebugSession extends DebugSession {
 		// and call stacks) so we must ensure each log is not processed until
 		// the previous one has been processed.
 		this.lastLoggingEvent = this.lastLoggingEvent.then(() => this.processLoggingEvent(event));
+	}
+
+	// ToolEvent
+	public async handleToolEvent(event: VMEvent) {
+		// Don't process any events while the debugger is still running init code.
+		await this.debuggerInit;
+
+		const data = event.extensionData;
+		this.sendEvent(new Event("dart.toolEvent", { kind: event.extensionKind, data }));
 	}
 
 	public handleStdoutEvent(event: VMWriteEvent): void {
@@ -1808,7 +1438,7 @@ export class DartDebugSession extends DebugSession {
 				const logPrefix = `[${name || "log"}] `;
 				let indent = " ".repeat(logPrefix.length);
 
-				const printLogRecord = async (event: VMEvent, instance: VMInstanceRef, logPrefix: string, indent: string, category: string = "console") => {
+				const printLogRecord = async (event: VMEvent, instance: VMInstanceRef, logPrefix: string, indent: string, category = "console") => {
 					const message = await this.fullValueAsString(event.isolate, instance, true);
 					if (message) {
 						const indentedMessage = `${faint(logPrefix)}${message.split("\n").join(`\n${indent}`)}`;
@@ -1904,7 +1534,7 @@ export class DartDebugSession extends DebugSession {
 				// dummy unconditional breakpoints.
 				// TODO: Ensure that VM breakpoint state is reconciled with debugger breakpoint state before
 				// handling thread state so that this doesn't happen, and remove this check.
-				const hasUnknownBreakpoints = potentialBreakpoints.indexOf(undefined) !== -1;
+				const hasUnknownBreakpoints = potentialBreakpoints.includes(undefined);
 
 				if (!hasUnknownBreakpoints) {
 					// There can't be any undefined here because of the above, but the types don't know that
@@ -1945,7 +1575,6 @@ export class DartDebugSession extends DebugSession {
 
 			thread.handlePaused(event);
 			if (shouldRemainedStoppedOnBreakpoint) {
-				this.logDapEvent(new StoppedEvent(reason, thread.num, exceptionText));
 				this.sendEvent(new StoppedEvent(reason, thread.num, exceptionText));
 			} else {
 				await thread.resume();
@@ -1958,8 +1587,6 @@ export class DartDebugSession extends DebugSession {
 		const instanceRef = (event as any).inspectee as VMInstanceRef;
 		const thread = isolateRef ? this.threadManager.getThreadInfoFromRef(isolateRef) : undefined;
 		if (isolateRef && instanceRef && thread) {
-			const text = await this.fullValueAsString(isolateRef, instanceRef, false);
-
 			this.sendVariable(thread.storeData(new InspectedVariable(thread.storeData(instanceRef))));
 		}
 	}
@@ -2041,20 +1668,17 @@ export class DartDebugSession extends DebugSession {
 
 	protected notifyServiceExtensionAvailable(extensionRPC: string, isolateId: string | undefined) {
 		const evt = new Event("dart.serviceExtensionAdded", { extensionRPC, isolateId });
-		this.logDapEvent(evt);
 		this.sendEvent(evt);
 	}
 
 	protected notifyServiceRegistered(service: string, method: string | undefined) {
 		const evt = new Event("dart.serviceRegistered", { service, method });
-		this.logDapEvent(evt);
 		this.sendEvent(evt);
 	}
 
 	public errorResponse(response: DebugProtocol.Response, message: string) {
 		response.success = false;
 		response.message = message;
-		this.logDapResponse(response);
 		this.sendResponse(response);
 	}
 
@@ -2066,7 +1690,7 @@ export class DartDebugSession extends DebugSession {
 		}
 
 		// Split on the separators and return only the first and last two parts.
-		const sep = uri.indexOf("/") === -1 && uri.indexOf("\\") !== -1 ? "\\" : "/";
+		const sep = !uri.includes("/") && uri.includes("\\") ? "\\" : "/";
 		const parts = uri.split(sep);
 		if (parts.length > 3) {
 			return parts[0] === "org-dartlang-app"
@@ -2149,10 +1773,6 @@ export class DartDebugSession extends DebugSession {
 		}
 	}
 
-	public isValidToDebug(uri: string) {
-		return this.supportsDebugInternalLibraries || !uri.startsWith("dart:_");
-	}
-
 	public isSdkLibrary(uri: string) {
 		return uri.startsWith("dart:");
 	}
@@ -2174,13 +1794,13 @@ export class DartDebugSession extends DebugSession {
 			return false;
 
 		// HACK: Take a guess at whether it's inside the pubcache (in which case we're considering it external).
-		return path.indexOf("/hosted/pub.dartlang.org/") !== -1
-			|| path.indexOf("\\hosted\\pub.dartlang.org\\") !== -1
-			|| path.indexOf("/third_party/") !== -1
-			|| path.indexOf("\\third_party\\") !== -1;
+		return path.includes("/hosted/pub.")
+			|| path.includes("\\hosted\\pub.")
+			|| path.includes("/third_party/")
+			|| path.includes("\\third_party\\");
 	}
 
-	private resolveFileLocation(script: VMScript, tokenPos: number): FileLocation | undefined {
+	private resolveFileLocation(script: VMScript, tokenPos: number): { line: number; column: number; } | undefined {
 		const table: number[][] = script.tokenPosTable;
 		for (const entry of table) {
 			// [lineNumber, (tokenPos, columnNumber)*]
@@ -2193,36 +1813,6 @@ export class DartDebugSession extends DebugSession {
 		}
 
 		return undefined;
-	}
-
-	private async pollForMemoryUsage(): Promise<void> {
-		if (!this.childProcess || this.childProcess.killed || !this.vmService)
-			return;
-
-		const result = await this.vmService.getVM();
-		const vm = result.result as VM;
-
-		const isolatePromises = vm.isolates.map((isolateRef) => this.vmService!.getIsolate(isolateRef.id));
-		const isolatesResponses = await Promise.all(isolatePromises);
-		const isolates = isolatesResponses.map((response) => response.result as VMIsolate);
-
-		let current = 0;
-		let total = 0;
-
-		for (const isolate of isolates) {
-			if (!isolate._heaps)
-				continue;
-			for (const heap of [isolate._heaps.old, isolate._heaps.new]) {
-				current += heap.used + heap.external;
-				total += heap.capacity + heap.external;
-			}
-		}
-
-		this.logDapEvent(new Event("dart.debugMetrics", { memory: { current, total } }));
-		this.sendEvent(new Event("dart.debugMetrics", { memory: { current, total } }));
-
-		if (this.pollforMemoryMs)
-			setTimeout(() => this.pollForMemoryUsage(), this.pollforMemoryMs).unref();
 	}
 
 	private async reloadSources(): Promise<void> {
@@ -2239,7 +1829,7 @@ export class DartDebugSession extends DebugSession {
 		this.logToUserBuffered(message, "stdout");
 	}
 
-	/// Buffers text and sends to the user when a newline is recieved. This is to handle stderr/stdout which
+	/// Buffers text and sends to the user when a newline is received. This is to handle stderr/stdout which
 	/// might arrive in chunks but we need to process in lines.
 	///    [5:01:50 PM] [General] [Info] [stderr] tion: Oop
 	///    [5:01:50 PM] [General] [Info] [stderr] s
@@ -2248,9 +1838,11 @@ export class DartDebugSession extends DebugSession {
 	///    [5:01:50 PM] [General] [Info] [stderr] 0
 	///    [5:01:50 PM] [General] [Info] [stderr]
 	///    [5:01:50 PM] [General] [Info] [stderr]
-	///    [5:01:50 PM] [General] [Info] [stderr]     main (file:///D:/a/
-	///    [5:01:50 PM] [General] [Info] [stderr] Dart-Code/Dart-Code/src/test/test_projects/hello_world/bin/broken.dart:2:3)
+	///    [5:01:50 PM] [General] [Info] [stderr]     main (fil
+	///    [5:01:50 PM] [General] [Info] [stderr] e:///D:/a/
+	///    [5:01:50 PM] [General] [Info] [stderr] Dart Code/Dart-Code/src/test/test_projects/hello_world/bin/broken.dart:2:3)
 	protected logToUserBuffered(message: string, category: string) {
+		this.logBufferFlushes[category]?.close();
 		this.logBuffer[category] = this.logBuffer[category] || "";
 		this.logBuffer[category] += message;
 
@@ -2259,9 +1851,23 @@ export class DartDebugSession extends DebugSession {
 			const processString = this.logBuffer[category].substr(0, lastNewLine + 1);
 			this.logBuffer[category] = this.logBuffer[category].substr(lastNewLine + 1);
 			this.logToUser(processString, category);
+		} else {
+			// If we don't get another message we need to ensure the buffer is flushed after some
+			// small period.
+			const timeout = setTimeout(() => this.flushLogBuffer(category), 50);
+			timeout.unref();
+			this.logBufferFlushes[category] = timeout;
 		}
 	}
 	private logBuffer: { [key: string]: string } = {};
+	private logBufferFlushes: { [key: string]: NodeJS.Timeout } = {};
+
+	private flushLogBuffer(category: string) {
+		const processString = this.logBuffer[category];
+		delete this.logBuffer[category];
+		if (processString)
+			this.logToUser(processString, category);
+	}
 
 	// Logs a message back to the editor. Does not add its own newlines, you must
 	// provide them!
@@ -2269,7 +1875,7 @@ export class DartDebugSession extends DebugSession {
 
 		// If we get a multi-line message that contains an error/stack trace, process each
 		// line individually, so we can attach location metadata to individual lines.
-		const isMultiLine = message.trimRight().indexOf("\n") !== -1;
+		const isMultiLine = message.trimRight().includes("\n");
 		if (isMultiLine && mayContainStackFrame(message)) {
 			message.split("\n").forEach((line) => this.logToUser(`${line}\n`, category));
 			return;
@@ -2311,7 +1917,6 @@ export class DartDebugSession extends DebugSession {
 			output.body.output = `${applyColor(output.body.output.trimRight(), faint)}\n`;
 		}
 
-		this.logDapEvent(output);
 		this.sendEvent(output);
 	}
 }
@@ -2320,8 +1925,6 @@ export interface InstanceWithEvaluateName extends VMInstanceRef {
 	// Undefined means we cannot evaluate
 	evaluateName: string | undefined;
 }
-
-export type VmExceptionMode = "None" | "Unhandled" | "All";
 
 class RemoteEditorTerminalProcess {
 	public killed = false;

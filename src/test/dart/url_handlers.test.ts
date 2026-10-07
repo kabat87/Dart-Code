@@ -9,15 +9,15 @@ import { dartCodeExtensionIdentifier, FLUTTER_CREATE_PROJECT_TRIGGER_FILE } from
 import { FlutterCreateTriggerData } from "../../shared/interfaces";
 import { getChildFolders } from "../../shared/utils/fs";
 import { DartUriHandler } from "../../shared/vscode/uri_handlers/uri_handler";
-import { activate, deleteDirectoryRecursive, extApi, sb } from "../helpers";
+import { activate, privateApi, sb, tryDelete } from "../helpers";
 
 describe("URL handler", async () => {
 	const urlHandler = new DartUriHandler(new FlutterCapabilities("1.0.0"));
 	const tempPath = path.join(os.tmpdir(), dartCodeExtensionIdentifier, "flutter", "sample", "my.sample.id");
 
 	before(() => activate(null));
-	beforeEach("clear out sample folder", () => deleteDirectoryRecursive(tempPath));
-	afterEach("clear out sample folder", () => deleteDirectoryRecursive(tempPath));
+	beforeEach("clear out sample folder", () => tryDelete(tempPath));
+	afterEach("clear out sample folder", () => tryDelete(tempPath));
 
 	it("URL handler creates trigger file with sample ID in it", async () => {
 		// Intercept executeCommand for openFolder so we don't spawn a new instance of Code!
@@ -27,7 +27,7 @@ describe("URL handler", async () => {
 		await urlHandler.handleUri(vs.Uri.parse(`vscode://Dart-Code.dart-code/flutter/sample/my.sample.id`));
 
 		// Expect a single folder, which is out sample app.
-		const childFolders = await getChildFolders(extApi.logger, tempPath);
+		const childFolders = await getChildFolders(privateApi.logger, tempPath);
 		assert.equal(childFolders.length, 1);
 
 		const projectFolder = childFolders[0];

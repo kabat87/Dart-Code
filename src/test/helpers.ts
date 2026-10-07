@@ -1,26 +1,34 @@
 import { strict as assert } from "assert";
 import * as fs from "fs";
+import * as os from "os";
 import { tmpdir } from "os";
 import * as path from "path";
 import * as sinon from "sinon";
 import * as vs from "vscode";
+import { URI } from "vscode-uri";
 import { dartCodeExtensionIdentifier, isDartCodeTestRun, isWin } from "../shared/constants";
-import { DartLaunchArgs } from "../shared/debug/interfaces";
+import { DartLaunchArgs } from "../shared/debugging/interfaces";
 import { LogCategory, TestStatus } from "../shared/enums";
 import { IAmDisposable, Logger } from "../shared/interfaces";
 import { captureLogs } from "../shared/logging";
 import { internalApiSymbol } from "../shared/symbols";
-import { TestNode, TreeNode } from "../shared/test/test_model";
-import { BufferedLogger, filenameSafe, flatMap } from "../shared/utils";
+import { TestDoneNotification } from "../shared/test_protocol";
+import { BufferedLogger, filenameSafe, flatMap, withTimeout } from "../shared/utils";
 import { arrayContainsArray, sortBy } from "../shared/utils/array";
-import { fsPath, tryDeleteFile } from "../shared/utils/fs";
+import { createFolderForFile, fsPath, getRandomInt } from "../shared/utils/fs";
 import { resolvedPromise, waitFor } from "../shared/utils/promises";
+import { getProgramString } from "../shared/utils/test";
 import { InternalExtensionApi } from "../shared/vscode/interfaces";
 import { SourceSortMembersCodeActionKind, treeLabel } from "../shared/vscode/utils";
 import { Context } from "../shared/vscode/workspace";
+// eslint-disable-next-line no-restricted-imports
+import { PublicDartExtensionApi } from "../extension/api/interfaces";
+import { extensionVersion } from "../shared/vscode/extension_utils";
+import { locateBestProjectRoot } from "../shared/vscode/project";
 
 export const ext = vs.extensions.getExtension(dartCodeExtensionIdentifier)!;
-export let extApi: InternalExtensionApi;
+export let privateApi: InternalExtensionApi;
+export let extApi: PublicDartExtensionApi;
 export let logger: Logger = new BufferedLogger();
 export const threeMinutesInMilliseconds = 1000 * 60 * 3;
 export const fakeCancellationToken: vs.CancellationToken = {
@@ -35,10 +43,16 @@ if (!ext) {
 }
 
 const testFolder = path.join(ext.extensionPath, "src/test");
+export const testProjectsFolder = path.join(testFolder, "test_projects");
+
+const packageConfigPath = ".dart_tool/package_config.json";
 
 // Dart
-export const helloWorldFolder = vs.Uri.file(path.join(testFolder, "test_projects/hello_world"));
+export const helloWorldFolder = vs.Uri.file(path.join(testProjectsFolder, "hello_world"));
+export const helloWorldPackageConfigFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), packageConfigPath));
 export const helloWorldMainFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/main.dart"));
+export const helloWorldDotDartCodeFolder = vs.Uri.file(path.join(fsPath(helloWorldFolder), ".dart_code"));
+export const helloWorldAutoLaunchFile = vs.Uri.file(path.join(fsPath(helloWorldDotDartCodeFolder), "autolaunch.json"));
 export const helloWorldInspectionFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/inspect.dart"));
 export const helloWorldLongRunningFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/long_running.dart"));
 export const helloWorldMainLibFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/basic.dart"));
@@ -48,6 +62,7 @@ export const helloWorldPubspec = vs.Uri.file(path.join(fsPath(helloWorldFolder),
 export const helloWorldStack60File = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/stack60.dart"));
 export const helloWorldGettersFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/getters.dart"));
 export const helloWorldBrokenFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/broken.dart"));
+export const helloWorldAssertFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/assert.dart"));
 export const helloWorldThrowInSdkFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/throw_in_sdk_code.dart"));
 export const helloWorldThrowInExternalPackageFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/throw_in_external_package.dart"));
 export const helloWorldThrowInLocalPackageFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/throw_in_local_package.dart"));
@@ -56,43 +71,62 @@ export const helloWorldHttpFile = vs.Uri.file(path.join(fsPath(helloWorldFolder)
 export const helloWorldLocalPackageFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "bin/local_package.dart"));
 export const helloWorldCreateMethodClassAFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/create_method/class_a.dart"));
 export const helloWorldCreateMethodClassBFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/create_method/class_b.dart"));
-export const helloWorldExampleSubFolder = vs.Uri.file(path.join(fsPath(helloWorldFolder), "example"));
-export const helloWorldExampleSubFolderMainFile = vs.Uri.file(path.join(fsPath(helloWorldExampleSubFolder), "bin/main.dart"));
 export const emptyFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/empty.dart"));
 export const missingFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/missing.dart"));
-export const emptyFileInExcludedFolder = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/excluded/empty.dart"));
-export const emptyExcludedFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/excluded_empty.dart"));
+export const emptyFileInExcludedBySettingFolder = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/excluded_by_setting/empty.dart"));
 export const helloWorldCompletionFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/completion.dart"));
 export const helloWorldDeferredScriptFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/deferred_script.dart"));
 export const helloWorldPartWrapperFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/part_wrapper.dart"));
 export const helloWorldPartFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/part.dart"));
+export const helloWorldPrinterFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/printer.dart"));
 export const everythingFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/everything.dart"));
+export const helloWorldExampleSubFolder = vs.Uri.file(path.join(fsPath(helloWorldFolder), "example"));
+export const helloWorldExampleSubFolderMainFile = vs.Uri.file(path.join(fsPath(helloWorldExampleSubFolder), "bin/main.dart"));
+export const helloWorldExampleSubFolderPubspecFile = vs.Uri.file(path.join(fsPath(helloWorldExampleSubFolder), "pubspec.yaml"));
+export const helloWorldExampleSubFolderPrinterFile = vs.Uri.file(path.join(fsPath(helloWorldExampleSubFolder), "lib/printer.dart"));
 // Package
-export const myPackageFolder = vs.Uri.file(path.join(testFolder, "test_projects/my_package"));
+export const myPackageFolder = vs.Uri.file(path.join(testProjectsFolder, "my_package"));
 export const myPackageThingFile = vs.Uri.file(path.join(fsPath(myPackageFolder), "lib/my_thing.dart"));
 // Dart tests
 export const helloWorldTestFolder = vs.Uri.file(path.join(fsPath(helloWorldFolder), "test"));
 export const helloWorldTestMainFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "basic_test.dart"));
 export const helloWorldTestEmptyFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "empty_test.dart"));
+export const helloWorldRenameTestFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "rename_test.dart"));
 export const helloWorldTestTreeFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "tree_test.dart"));
 export const helloWorldTestEnvironmentFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "environment_test.dart"));
 export const helloWorldTestShortFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "short_test.dart"));
-export const helloWorldTestShort2File = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "short2_test.dart"));
+export const helloWorldTestSelective1File = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "selective1_test.dart"));
+export const helloWorldTestSelective2File = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "selective2_test.dart"));
 export const helloWorldTestDiscoveryFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "discovery_test.dart"));
+export const helloWorldTestDiscoveryLargeFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "discovery_large_test.dart"));
 export const helloWorldTestDupeNameFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "dupe_name_test.dart"));
 export const helloWorldTestBrokenFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "broken_test.dart"));
-export const helloWorldTestSkipFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "skip_test.dart"));
-export const helloWorldTestNestedFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "folder", "folder_test.dart"));
+export const helloWorldTestDynamicFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "dynamic_test.dart"));
 export const helloWorldProjectTestFile = vs.Uri.file(path.join(fsPath(helloWorldTestFolder), "project_test.dart"));
 export const helloWorldExampleSubFolderProjectTestFile = vs.Uri.file(path.join(fsPath(helloWorldExampleSubFolder), "test", "project_test.dart"));
+// Go To Tests
+export const helloWorldGoToLibFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/goto/foo.dart"));
+export const helloWorldGoToLibSrcFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "lib/src/goto/foo.dart"));
+export const helloWorldGoToTestFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "test/goto/foo_test.dart"));
+export const helloWorldGoToTestSrcFile = vs.Uri.file(path.join(fsPath(helloWorldFolder), "test/src/goto/foo_test.dart"));
+// Nested
+export const dartNestedFolder = vs.Uri.file(path.join(testProjectsFolder, "dart_nested"));
+export const dartNested1Folder = vs.Uri.file(path.join(fsPath(dartNestedFolder), "nested1"));
+export const dartNested1PubspecFile = vs.Uri.file(path.join(fsPath(dartNested1Folder), "pubspec.yaml"));
+export const dartNested2Folder = vs.Uri.file(path.join(fsPath(dartNested1Folder), "nested2"));
 // Flutter
-export const flutterHelloWorldFolder = vs.Uri.file(path.join(testFolder, "test_projects/flutter_hello_world"));
+export const flutterHelloWorldFolder = vs.Uri.file(path.join(testProjectsFolder, "flutter_hello_world"));
 export const flutterEmptyFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/empty.dart"));
+export const flutterHelloWorldPackageConfigFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), packageConfigPath));
 export const flutterHelloWorldMainFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/main.dart"));
+export const flutterHelloWorldReadmeFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "README.md"));
+export const flutterHelloWorldNavigateFromFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/navigate_from.dart"));
+export const flutterHelloWorldNavigateToFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/navigate_to.dart"));
 export const flutterHelloWorldPubspec = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "pubspec.yaml"));
 export const flutterHelloWorldCounterAppFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/counter.dart"));
 export const flutterHelloWorldOutlineFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/outline.dart"));
 export const flutterHelloWorldBrokenFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/broken.dart"));
+export const flutterHelloWorldOverflowFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/overflow.dart"));
 export const flutterHelloWorldHttpFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/http.dart"));
 export const flutterHelloWorldGettersFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/getters.dart"));
 export const flutterHelloWorldLocalPackageFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/local_package.dart"));
@@ -100,13 +134,20 @@ export const flutterHelloWorldThrowInSdkFile = vs.Uri.file(path.join(fsPath(flut
 export const flutterHelloWorldThrowInExternalPackageFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/throw_in_external_package.dart"));
 export const flutterHelloWorldThrowInLocalPackageFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/throw_in_local_package.dart"));
 export const flutterHelloWorldStack60File = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/stack60.dart"));
+export const flutterHelloWorldPrinterFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "lib/printer.dart"));
+// Flutter example
+export const flutterHelloWorldExampleFolder = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "example"));
+export const flutterHelloWorldExamplePrinterFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldExampleFolder), "lib/printer.dart"));
+export const flutterHelloWorldExampleTestFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldExampleFolder), "test/printer_test.dart"));
 // Flutter Bazel
-export const flutterBazelRoot = vs.Uri.file(path.join(testFolder, "test_projects/bazel_workspace"));
+export const flutterBazelRoot = vs.Uri.file(path.join(testProjectsFolder, "bazel_workspace"));
 export const flutterBazelHelloWorldFolder = vs.Uri.file(path.join(fsPath(flutterBazelRoot), "flutter_hello_world_bazel"));
 export const flutterBazelHelloWorldMainFile = vs.Uri.file(path.join(fsPath(flutterBazelHelloWorldFolder), "lib/main.dart"));
 export const flutterBazelTestMainFile = vs.Uri.file(path.join(fsPath(flutterBazelHelloWorldFolder), "test/widget_test.dart"));
 // Flutter tests
 export const flutterTestMainFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "test/widget_test.dart"));
+export const flutterTestSelective1File = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "test/selective1_test.dart"));
+export const flutterTestSelective2File = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "test/selective2_test.dart"));
 export const flutterTestOtherFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "test/other_test.dart"));
 export const flutterTestAnotherFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "test/another_test.dart"));
 export const flutterTestBrokenFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "test/broken_test.dart"));
@@ -114,19 +155,15 @@ export const flutterTestDriverAppFile = vs.Uri.file(path.join(fsPath(flutterHell
 export const flutterTestDriverTestFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "test_driver/app_test.dart"));
 export const flutterIntegrationTestFile = vs.Uri.file(path.join(fsPath(flutterHelloWorldFolder), "integration_test/app_test.dart"));
 // Web
-export const webProjectContainerFolder = vs.Uri.file(path.join(testFolder, "test_projects/web"));
+export const webProjectContainerFolder = vs.Uri.file(path.join(testProjectsFolder, "web"));
 export const webHelloWorldFolder = vs.Uri.file(path.join(fsPath(webProjectContainerFolder), "hello_world"));
 export const webHelloWorldMainFile = vs.Uri.file(path.join(fsPath(webHelloWorldFolder), "web/main.dart"));
 export const webHelloWorldIndexFile = vs.Uri.file(path.join(fsPath(webHelloWorldFolder), "web/index.html"));
 export const webHelloWorldExampleSubFolder = vs.Uri.file(path.join(fsPath(webHelloWorldFolder), "example"));
 export const webHelloWorldExampleSubFolderIndexFile = vs.Uri.file(path.join(fsPath(webHelloWorldExampleSubFolder), "web/index.html"));
-export const webBrokenFolder = vs.Uri.file(path.join(fsPath(webProjectContainerFolder), "broken"));
+const webBrokenFolder = vs.Uri.file(path.join(fsPath(webProjectContainerFolder), "broken"));
 export const webBrokenIndexFile = vs.Uri.file(path.join(fsPath(webBrokenFolder), "web/index.html"));
 export const webBrokenMainFile = vs.Uri.file(path.join(fsPath(webBrokenFolder), "web/main.dart"));
-// Web tests
-export const webTestMainFile = vs.Uri.file(path.join(fsPath(webHelloWorldFolder), "test/basic_test.dart"));
-export const webTestBrokenFile = vs.Uri.file(path.join(fsPath(webHelloWorldFolder), "test/broken_test.dart"));
-export const webTestOtherFile = vs.Uri.file(path.join(fsPath(webHelloWorldFolder), "test/other_test.dart"));
 
 export const flutterTestSurveyID = "flutterVsCodeTestSurvey";
 
@@ -134,7 +171,7 @@ const startOfDocument = new vs.Range(new vs.Position(0, 0), new vs.Position(0, 0
 
 export function currentEditor(): vs.TextEditor {
 	let editor = vs.window.activeTextEditor;
-	if (!editor || editor.document.uri.scheme !== "file") {
+	if (editor?.document.uri.scheme !== "file") {
 		const firstEditor = vs.window.visibleTextEditors.find((e) => e.document.uri.scheme === "file");
 		if (firstEditor)
 			logger.info(`Current active editor is not a file (${editor ? editor.document.uri : "none"}) so using first visible editor (${firstEditor.document.uri})`);
@@ -154,20 +191,39 @@ export let documentEol: string;
 
 function getDefaultFile(): vs.Uri {
 	// TODO: Web?
-	if (extApi.workspaceContext.hasAnyFlutterProjects)
+	if (privateApi.workspaceContext.hasAnyFlutterProjects)
 		return flutterEmptyFile;
 	else
 		return emptyFile;
 }
 
-export async function activateWithoutAnalysis(): Promise<void> {
-	// TODO: Should we do this, or should we just check that it has been activated?
-	await ext.activate();
+export async function activateWithoutAnalysis(file?: vs.Uri | null): Promise<void> {
+	if (!ext.isActive)
+		await ext.activate();
 	if (ext.exports) {
-		extApi = ext.exports[internalApiSymbol];
+		privateApi = ext.exports[internalApiSymbol] as InternalExtensionApi;
+		extApi = ext.exports as PublicDartExtensionApi;
 		setupTestLogging();
-	} else
+	} else {
 		console.warn("Extension has no exports, it probably has not activated correctly! Check the extension startup logs.");
+	}
+
+	if (file === undefined) // undefined means use default, but explicit null will result in no file open.
+		file = getDefaultFile();
+
+	const hasOtherOpenFiles = !!vs.window.visibleTextEditors
+		// Only care about files, because other kinds of open files are not going to cause us any issues
+		// (and it might include things like output windows we really don't care about).
+		.filter((editor) => editor.document.uri.scheme === "file")
+		.filter((editor) => !file || fsPath(editor.document.uri) !== fsPath(file))
+		.length;
+	if (hasOtherOpenFiles)
+		await closeAllOpenFiles();
+	if (file) {
+		await openFile(file);
+	} else {
+		logger.info(`Not opening any file`);
+	}
 }
 
 export function attachLoggingWhenExtensionAvailable(attempt = 1) {
@@ -193,8 +249,9 @@ function setupTestLogging(): boolean {
 	if (!ext.isActive || !ext.exports)
 		return false;
 
-	extApi = ext.exports[internalApiSymbol];
-	const emittingLogger = extApi.logger;
+	privateApi = ext.exports[internalApiSymbol] as InternalExtensionApi;
+	extApi = ext.exports as PublicDartExtensionApi;
+	const emittingLogger = privateApi.logger;
 
 	if (fileSafeCurrentTestName) {
 		const logFolder = process.env.DC_TEST_LOGS || path.join(ext.extensionPath, ".dart_code_test_logs");
@@ -204,21 +261,21 @@ function setupTestLogging(): boolean {
 		const logPath = path.join(logFolder, logFile);
 
 		// For debugger tests, the analyzer log is just noise, so we filter it out.
-		const excludeLogCategories = process.env.BOT && process.env.BOT.indexOf("debug") !== -1
+		const excludeLogCategories = process.env.BOT?.includes("debug")
 			? [LogCategory.Analyzer]
 			: [];
-		const testLogger = captureLogs(emittingLogger, logPath, extApi.getLogHeader(), 20000, excludeLogCategories, true);
+		const testLogger = captureLogs(emittingLogger, logPath, privateApi.getLogHeader(), 20000, excludeLogCategories, true);
 
-		deferUntilLast("Remove log file if test passed", async (testResult?: "passed" | "failed") => {
+		deferUntilLast("Remove log file if test passed", async (testResult?: "passed" | "failed" | "pending") => {
 			// Put a new buffered logger back to capture any logging output happening
 			// after we closed our log file to be included in the next.
 			logger = new BufferedLogger();
 
 			// Wait a little before closing, to ensure we capture anything in-progress.
-			await delay(1000);
+			await delay(100);
 			await testLogger.dispose();
-			// On CI, we delete logs for passing tests to save money on S3 :-)
-			if (process.env.CI && testResult === "passed") {
+			// On CI, we delete logs for passing/skipped tests to save space.
+			if (process.env.CI && testResult !== "failed") {
 				try {
 					fs.unlinkSync(logPath);
 				} catch { }
@@ -233,45 +290,42 @@ function setupTestLogging(): boolean {
 	return true;
 }
 
-export async function activate(file?: vs.Uri | null | undefined): Promise<void> {
-	await activateWithoutAnalysis();
-	if (file === undefined) // undefined means use default, but explicit null will result in no file open.
-		file = getDefaultFile();
+export async function activate(file?: vs.Uri | null): Promise<void> {
+	await activateWithoutAnalysis(file);
 
-	await closeAllOpenFiles();
-	if (file) {
-		await openFile(file);
-	} else {
-		logger.info(`Not opening any file`);
-	}
 	logger.info(`Waiting for initial analysis`);
-	await extApi.initialAnalysis;
+	await privateApi.initialAnalysis;
 	// Opening a file above may start analysis after a short period so give it time to start
 	// before we continue.
-	await delay(200);
+	await delay(50);
 	logger.info(`Waiting for in-progress analysis`);
-	await extApi.currentAnalysis();
-
-	logger.info(`Cancelling any in-progress requests`);
-	extApi.cancelAllAnalysisRequests();
+	await privateApi.currentAnalysis();
 
 	logger.info(`Ready to start test`);
+	const cpuLoad = os.loadavg();
+	const totalMem = os.totalmem();
+	const freeMem = os.freemem();
+	logger.info(`  cpuLoad: ${cpuLoad}`);
+	logger.info(`  totalMem: ${totalMem}`);
+	logger.info(`  freeMem: ${freeMem}`);
+	logger.info(`  ${Math.round((freeMem / totalMem) * 100)}% memory is available`);
 }
 
 export async function getPackages(uri?: vs.Uri) {
-	await activateWithoutAnalysis();
-	if (!(uri || (vs.workspace.workspaceFolders && vs.workspace.workspaceFolders.length))) {
+	await activateWithoutAnalysis(null);
+	if (!(uri || (vs.workspace.workspaceFolders?.length))) {
 		logger.error("Cannot getPackages because there is no workspace folder and no URI was supplied");
 		return;
 	}
-	await waitForNextAnalysis(async () => {
-		await vs.commands.executeCommand("dart.getPackages", uri || vs.workspace.workspaceFolders![0].uri);
-	}, 60);
+	// It's not guaranteed that this will trigger new analysis, because we might already have all packages
+	// up-to-date, so just wait a bit.
+	await vs.commands.executeCommand("dart.getPackages", uri || vs.workspace.workspaceFolders![0].uri);
+	await delay(100);
 }
 
 function logOpenEditors() {
 	logger.info(`Current open editors are:`);
-	if (vs.window.visibleTextEditors && vs.window.visibleTextEditors.length) {
+	if (vs.window.visibleTextEditors?.length) {
 		for (const editor of vs.window.visibleTextEditors) {
 			logger.info(`  - ${editor.document.uri}`);
 		}
@@ -283,7 +337,7 @@ function logOpenEditors() {
 export function captureOutput(name: string) {
 	// Create a channel that buffers its output.
 	const buffer: string[] = [];
-	const channel = extApi.getOutputChannel(name);
+	const channel = privateApi.getOutputChannel(name);
 
 	sb.stub(channel, "append").callsFake((s: string) => buffer.push(s));
 	sb.stub(channel, "appendLine").callsFake((s: string) => buffer.push(`${s}\n`));
@@ -298,11 +352,11 @@ export function stubCreateInputBox(valueToReturn: string) {
 	const createInputBox = sb.stub(vs.window, "createInputBox");
 	createInputBox.callsFake(function (this: any, ...args) {
 		// Call the underlying VS Code method to create the input box.
-		const input = (createInputBox as any).wrappedMethod.apply(this, args);
+		const input = (createInputBox as any).wrappedMethod.apply(this, args) as vs.InputBox;
 
 		// Capture the onDidAccept method to capture the callback.
 		let acceptCallback: () => void;
-		sb.stub(input, "onDidAccept").callsFake((func) => acceptCallback = func);
+		sb.stub(input, "onDidAccept").callsFake((func: () => void) => acceptCallback = func);
 
 		// Capture the show method to then call that callback with our fake answer.
 		// Also stash the original value so we can check it was pre-populated correctly.
@@ -316,7 +370,88 @@ export function stubCreateInputBox(valueToReturn: string) {
 	return result;
 }
 
+/**
+ * Scripted actions for the quick picks shown by the Flutter settings "dialog".
+ */
+type QuickPickAction =
+	| { kind: "cancel" }
+	// Select a top-level setting.
+	| { kind: "top-level-setting"; label: string }
+	// Select a single value.
+	| { kind: "enum"; label: string }
+	// Selecting multiple values.
+	| { kind: "multi"; labels: string[] }
+	// Accept the selection with whatever was already selected.
+	| { kind: "accept-selected" };
+
+/**
+ * Replaces createQuickPick() with a scripted quick pick sequence.
+ *
+ * The next action will be chosen for each call to createQuickPick().
+ */
+export function stubCreateQuickPickActions(actions: QuickPickAction[]): void {
+	const createQuickPick = sb.stub(vs.window, "createQuickPick");
+	createQuickPick.callsFake(() => {
+		let acceptHandler: () => void;
+		let hideHandler: () => void;
+		const quickPick = {
+			activeItems: [] as vs.QuickPickItem[],
+			canSelectMany: false,
+			dispose: sb.stub(),
+			items: [] as vs.QuickPickItem[],
+			onDidAccept: (handler: () => void) => {
+				acceptHandler = handler;
+				return { dispose: () => undefined };
+			},
+			onDidHide: (handler: () => void) => {
+				hideHandler = handler;
+				return { dispose: () => undefined };
+			},
+			placeholder: undefined as string | undefined,
+			selectedItems: [] as vs.QuickPickItem[],
+			show: () => {
+				const action = actions.shift();
+				if (!action)
+					throw new Error("No more quick pick actions were available");
+
+				// Defer callbacks until after the implementation code has finished wiring up
+				// all event handlers.
+				setImmediate(() => {
+					switch (action.kind) {
+						case "cancel":
+							hideHandler?.();
+							break;
+						case "top-level-setting":
+							quickPick.selectedItems = quickPick.items.filter((item) => item.label === action.label);
+							acceptHandler?.();
+							break;
+						case "enum":
+							quickPick.activeItems = quickPick.items.filter((item) => item.label === action.label);
+							acceptHandler?.();
+							break;
+						case "multi":
+							quickPick.selectedItems = quickPick.items.filter((item) => action.labels.includes(item.label));
+							acceptHandler?.();
+							break;
+						case "accept-selected":
+							acceptHandler?.();
+							break;
+					}
+				});
+			},
+			title: undefined as string | undefined,
+		};
+
+		return quickPick;
+	});
+}
+
 export async function closeAllOpenFiles(): Promise<void> {
+	if (!vs.window.visibleTextEditors?.filter((editor) => editor.document.uri.scheme === "file").length) {
+		logger.info(`No open files to close`);
+		return;
+	}
+
 	logger.info(`Reverting current editor...`);
 	await vs.commands.executeCommand("workbench.action.files.revert");
 	logger.info(`Closing all open editors...`);
@@ -330,84 +465,119 @@ export async function closeAllOpenFiles(): Promise<void> {
 	} catch (e) {
 		logger.warn(e);
 	}
-	await delay(100);
+	await delay(50);
 	logger.info(`Done closing editors!`);
 	logOpenEditors();
 }
 
 export async function clearTestTree(): Promise<void> {
 	logger.info(`Clearing test tree...`);
-	for (const key of Object.keys(extApi.testModel.suites))
-		delete extApi.testModel.suites[key];
-	extApi.testModel.updateNode();
+	privateApi.testModel.clearAll();
 	await delay(50); // Allow tree to be updated.
-	extApi.testDiscoverer.testDiscoveryPerformed = undefined;
+	if (privateApi.testDiscoverer)
+		privateApi.testDiscoverer.testDiscoveryPerformed = undefined;
 	logger.info(`Done clearing test tree!`);
 }
 
-export async function waitUntilAllTextDocumentsAreClosed(): Promise<void> {
-	logger.info(`Waiting for VS Code to mark all documents as closed...`);
-	const getAllOpenDocs = () => vs.workspace.textDocuments.filter((td) => !td.isUntitled && td.uri.scheme === "file");
-	await waitForResult(() => getAllOpenDocs().length === 0, "Some TextDocuments did not close", threeMinutesInMilliseconds, false);
-	const openDocs = getAllOpenDocs();
-	if (openDocs.length) {
-		throw new Error(`All open files were not closed (for ex: ${fsPath(openDocs[0].uri)})`);
-	}
-}
+/**
+ * Closes all editor tabs with the provided URIs.
+ */
+function closeTabs(uris: vs.Uri[]): void {
+	const uriSet = new Set<string>();
+	uris.forEach((uri) => uriSet.add(uri.toString()));
 
-export async function closeFile(file: vs.Uri): Promise<void> {
-	for (const editor of vs.window.visibleTextEditors) {
-		if (fsPath(editor.document.uri) === fsPath(file)) {
-			console.log(`Closing visible editor ${editor.document.uri}...`);
-			await vs.window.showTextDocument(editor.document);
-			await vs.commands.executeCommand("workbench.action.closeActiveEditor");
+	const allTextTabs = vs.window.tabGroups.all.flatMap((tg) => tg.tabs);
+	for (const tab of allTextTabs) {
+		const tabInput = tab.input as { uri?: vs.Uri } | undefined;
+		const tabUriString = tabInput?.uri?.toString();
+		if (tabUriString && uriSet.has(tabUriString)) {
+			void vs.window.tabGroups.close(tab);
 		}
 	}
 }
 
-export async function openFile(file: vs.Uri): Promise<vs.TextEditor> {
+export async function forceDocumentCloseEvents(fileUri?: vs.Uri) {
+	// To ensure that onDidCloseTextDocument fires for it, we need to fill
+	// VS Code's text model buffer with dummy files. This is a horrible hack, but
+	// otherwise, we'd have to wait 3 mins for the event to fire (which isn't practical)
+	// or have tests behave differently (for example even if we mock the close/open,
+	// we'd still see onDidChangeTextDocument events that might interfere with things
+	// like the position trackers).
+	const openedDummyUris: vs.Uri[] = [];
+	const MAX_DUMMY_FILES = 65; // In testing, it seems to require around 58 files to trigger the cleanup. Round up a little to give some margin.
+	for (let i = 0; i < MAX_DUMMY_FILES; i++) {
+		// If we had a file uri, we only care about that one and can stop creating dummies when we see it's gone.
+		if (fileUri && !vs.workspace.textDocuments.find((d) => d.uri.toString() === fileUri.toString())) {
+			// File is already gone so we don't need to open any more dummies.
+			break;
+		}
+
+		// Otherwise, open a dummy.
+		// Unfortunately we have to also open the editor here, because otherwise
+		// tabgroups will not contain it (at least not immediately), despite the editor
+		// becoming visible. However this shouldn't interfere with anything because it's
+		// a non-Dart file that we don't do anything with.
+		const dummyUri = vs.Uri.parse(`untitled:dummy-${i}`);
+		await vs.window.showTextDocument(dummyUri);
+		openedDummyUris.push(dummyUri);
+	}
+
+	closeTabs(openedDummyUris);
+}
+
+/**
+ * Closes a file, and ensures VS Code's onDidCloseTextDocument event fires.
+ */
+export async function closeFile(fileUri: vs.Uri): Promise<void> {
+	closeTabs([fileUri]);
+	await forceDocumentCloseEvents(fileUri);
+}
+
+export async function openFile(file: vs.Uri, column?: vs.ViewColumn): Promise<vs.TextEditor> {
 	logger.info(`Opening ${fsPath(file)}`);
 	const doc = await vs.workspace.openTextDocument(file);
 	documentEol = doc.eol === vs.EndOfLine.CRLF ? "\r\n" : "\n";
 	logger.info(`Showing ${fsPath(file)}`);
 	try {
-		return await vs.window.showTextDocument(doc);
+		return await vs.window.showTextDocument(doc, { viewColumn: column, preview: false });
 	} catch (e) {
 		logger.warn(`Failed to show ${fsPath(file)} on first attempt, trying again...`, LogCategory.CI);
 		logger.warn(e, LogCategory.CI);
-		return await vs.window.showTextDocument(doc);
+		return await vs.window.showTextDocument(doc, { viewColumn: column, preview: false });
 	} finally {
-		await delay(100);
+		await delay(50);
 	}
 }
 
-export function tryDelete(file: vs.Uri) {
-	tryDeleteFile(fsPath(file));
-}
-
-export function deleteDirectoryRecursive(folder: string) {
-	if (!fs.existsSync(folder))
-		return;
-	if (!fs.statSync(folder).isDirectory()) {
-		logger.error(`deleteDirectoryRecursive was passed a file: ${folder}`);
+export function tryDelete(item: string | vs.Uri) {
+	if (typeof item !== "string") {
+		if (item.scheme !== "file")
+			return;
+		else
+			item = fsPath(item);
 	}
-	fs.readdirSync(folder)
-		.map((item) => path.join(folder, item))
-		.forEach((item) => {
-			if (fs.statSync(item).isDirectory()) {
-				deleteDirectoryRecursive(item);
-			} else
-				fs.unlinkSync(item);
-		});
-	fs.rmdirSync(folder);
+	try {
+		fs.rmSync(item,
+			{
+				force: true,
+				recursive: true,
+				// Sometimes Windows can take a while to let us delete.
+				maxRetries: 10,
+				retryDelay: 500
+			});
+	} catch (e) {
+		console.warn(`Failed to clean up folder ${item}: ${e}`);
+	}
 }
 
 export let currentTestName = "unknown";
-export let fileSafeCurrentTestName: string = "unknown";
-// eslint-disable-next-line prefer-arrow-callback
+export let fileSafeCurrentTestName = "unknown";
 beforeEach("stash current test name", function () {
 	currentTestName = this.currentTest ? this.currentTest.fullTitle() : "unknown";
 	fileSafeCurrentTestName = filenameSafe(currentTestName);
+	if (fileSafeCurrentTestName.length >= 100) {
+		fileSafeCurrentTestName = fileSafeCurrentTestName.substring(0, 100) + getRandomInt(1000, 10000);
+	}
 
 	deferUntilLast("Reset current test name", () => fileSafeCurrentTestName = "unknown");
 });
@@ -431,7 +601,7 @@ afterEach("wait for any debug sessions to end", async () => {
 });
 
 interface DeferredFunction {
-	callback: (result?: "failed" | "passed") => Promise<any> | any;
+	callback: (result?: "failed" | "passed" | "pending") => Promise<any> | any;
 	description: string;
 }
 
@@ -439,7 +609,7 @@ const deferredItems: DeferredFunction[] = [];
 const deferredToLastItems: DeferredFunction[] = [];
 afterEach("run deferred functions", async function () {
 	logger.info(`Running deferred functions!`);
-	let firstError: any;
+	let firstError: Error | undefined;
 	for (const deferredFunction of [...deferredItems.reverse(), ...deferredToLastItems.reverse()]) {
 		const description = deferredFunction.description;
 		const callback = deferredFunction.callback;
@@ -448,7 +618,8 @@ afterEach("run deferred functions", async function () {
 			await watchPromise(`afterEach->deferred->${description}`, callback(this.currentTest ? this.currentTest.state : undefined));
 		} catch (e) {
 			logger.error(`Error running deferred function ${description}: ${e}`);
-			firstError = firstError || e;
+			if (!firstError)
+				firstError = e instanceof Error ? e : new Error(`${e}`);
 		}
 		logger.info(`    done!`);
 	}
@@ -459,10 +630,10 @@ afterEach("run deferred functions", async function () {
 		throw firstError;
 	logger.info(`Done running deferred functions!`);
 });
-export function defer(description: string, callback: (result?: "failed" | "passed") => Promise<any> | any): void {
+export function defer(description: string, callback: (result?: "failed" | "passed" | "pending") => Promise<any> | any): void {
 	deferredItems.push({ description: `${description} (${currentTestName})`, callback });
 }
-export function deferUntilLast(description: string, callback: (result?: "failed" | "passed") => Promise<any> | any): void {
+export function deferUntilLast(description: string, callback: (result?: "failed" | "passed" | "pending") => Promise<any> | any): void {
 	deferredToLastItems.push({ description: `${description} (${currentTestName})`, callback });
 }
 
@@ -488,20 +659,20 @@ export async function setTestContent(content: string): Promise<void> {
 
 	// HACK: Add a small delay to try and reduce the chance of a "Requested result
 	// might be inconsistent with previously returned results" error.
-	await delay(300);
-	await extApi.currentAnalysis();
+	await delay(50);
+	await privateApi.currentAnalysis();
 }
 
 export function enableLint(project: string, lintName: string): void {
 	const analysisOptions = path.join(project, "analysis_options.yaml");
 	let contents = "";
 	if (fs.existsSync(analysisOptions)) {
-		contents = fs.readFileSync(analysisOptions).toString();
+		contents = fs.readFileSync(analysisOptions).toString().replace(/\r\n/g, "\n");
 		// Restore after test.
 		defer("Restore original analysis_options", () => fs.writeFileSync(analysisOptions, contents));
 	} else {
 		// Delete after test.
-		defer("Remove created analysis_options", () => tryDeleteFile(analysisOptions));
+		defer("Remove created analysis_options", () => tryDelete(analysisOptions));
 	}
 	if (!contents.includes("linter:\n  rules:\n"))
 		contents += "\nlinter:\n  rules:\n";
@@ -537,13 +708,18 @@ export async function executeSortMembersCodeAction() {
 	return executeCodeAction({ kind: SourceSortMembersCodeActionKind }, startOfDocument);
 }
 
-export async function getCodeActions({ kind, title, requireExactlyOne = false }: { kind?: vs.CodeActionKind, title?: string, requireExactlyOne?: boolean }, range: vs.Range) {
-	const codeActions = await vs.commands.executeCommand<vs.CodeAction[]>("vscode.executeCodeActionProvider", currentDoc().uri, range);
-	const matchingActions = codeActions.filter((ca) => (!kind || kind.contains(ca.kind!))
-		&& (!title || ca.title === title));
+export async function getCodeActions({ kind, title, requireExactlyOne = false, waitForMatch = true }: { kind?: vs.CodeActionKind, title?: string, requireExactlyOne?: boolean, waitForMatch?: boolean }, range: vs.Range) {
+	let codeActions: vs.CodeAction[] = [];
+	let matchingActions = await waitFor(async () => {
+		codeActions = await vs.commands.executeCommand<vs.CodeAction[]>("vscode.executeCodeActionProvider", currentDoc().uri, range);
+		const matchingActions = codeActions.filter((ca) => (!kind || kind.contains(ca.kind!)) && (!title || ca.title === title));
+		return (!waitForMatch || matchingActions.length) ? matchingActions : undefined;
+	});
+
+	matchingActions ??= [];
 
 	if (requireExactlyOne && matchingActions.length !== 1)
-		throw new Error(`Expected to find "${kind}/${title}", but found ${codeActions.map((ca) => `"${ca.kind}/${ca.title}"`).join(", ")}`);
+		throw new Error(`Expected to find "${kind?.value}/${title}", but found ${codeActions.map((ca) => `"${ca.kind?.value}/${ca.title}"`).join(", ")}`);
 
 	return matchingActions;
 }
@@ -570,11 +746,9 @@ export function positionOf(searchText: string, doc?: vs.TextDocument): vs.Positi
 	return doc.positionAt(matchedTextIndex + caretOffset);
 }
 
-export function rangeOf(searchText: string, inside: vs.Range | undefined, allowMissing: true): vs.Range | undefined;
-export function rangeOf(searchText: string, inside?: vs.Range): vs.Range;
-export function rangeOf(searchText: string, inside?: vs.Range, allowMissing = false): vs.Range | undefined {
+export function rangeOf(searchText: string, doc?: vs.TextDocument, inside?: vs.Range): vs.Range {
 	searchText = searchText.replace(/\r/g, "").replace(/\n/g, documentEol);
-	const doc = currentDoc();
+	doc ??= currentDoc();
 	const startOffset = searchText.indexOf("|");
 	assert.notEqual(startOffset, -1, `Couldn't find a | in search text (${searchText})`);
 	const endOffset = searchText.lastIndexOf("|");
@@ -586,8 +760,6 @@ export function rangeOf(searchText: string, inside?: vs.Range, allowMissing = fa
 	let matchedTextIndex = docText.indexOf(searchText.replace(/\|/g, ""), startSearchAt);
 	if (endSearchAt > -1 && matchedTextIndex > endSearchAt)
 		matchedTextIndex = -1;
-	if (matchedTextIndex === -1 && allowMissing)
-		return undefined;
 	assert.notEqual(matchedTextIndex, -1, `Couldn't find string ${searchText.replace(/\|/g, "")} in the document to get range of. Document contained:\n${docText}`);
 
 	return new vs.Range(
@@ -596,24 +768,11 @@ export function rangeOf(searchText: string, inside?: vs.Range, allowMissing = fa
 	);
 }
 
-export function rangesOf(searchText: string): vs.Range[] {
-	const doc = currentDoc();
-	const results = [];
-	let searchRange: vs.Range | undefined;
-	let range: vs.Range | undefined;
-	// eslint-disable-next-line no-cond-assign
-	while (range = rangeOf(searchText, searchRange, true)) {
-		results.push(range);
-		// Next time, search starting from after this range.
-		searchRange = new vs.Range(range.end, doc.positionAt(doc.getText().length));
-	}
-	return results;
-}
 
-export async function getDocumentSymbols(): Promise<Array<vs.DocumentSymbol & { parent: vs.DocumentSymbol | undefined }>> {
+export async function getDocumentSymbols(): Promise<Array<vs.DocumentSymbol & { parent: vs.DocumentSymbol | undefined }> | undefined> {
 	const documentSymbolResult = await vs.commands.executeCommand<vs.DocumentSymbol[]>("vscode.executeDocumentSymbolProvider", currentDoc().uri);
-	if (!documentSymbolResult)
-		return [];
+	if (!documentSymbolResult?.length)
+		return undefined;
 
 	// Return a flattened list with references to parent for simplified testing.
 	const resultWithEmptyParents = documentSymbolResult.map((c) => Object.assign(c, { parent: undefined as vs.DocumentSymbol | undefined }));
@@ -623,7 +782,7 @@ export async function getDocumentSymbols(): Promise<Array<vs.DocumentSymbol & { 
 	));
 }
 
-export async function getDefinitions(position: vs.Position): Promise<Array<vs.Location | vs.DefinitionLink>> {
+async function getDefinitions(position: vs.Position): Promise<Array<vs.Location | vs.DefinitionLink>> {
 	const definitionResult = await vs.commands.executeCommand<Array<vs.Location | vs.DefinitionLink>>("vscode.executeDefinitionProvider", currentDoc().uri, position);
 	return definitionResult || [];
 }
@@ -635,15 +794,8 @@ export async function getCodeLens(document: vs.TextDocument): Promise<vs.CodeLen
 
 export async function getDefinition(position: vs.Position): Promise<vs.Location | vs.DefinitionLink> {
 	const defs = await getDefinitions(position);
-	assert.ok(defs && defs.length);
+	assert.ok(defs?.length);
 	return defs[0];
-}
-
-export function breakpointFor(def: vs.Location | vs.DefinitionLink) {
-	return {
-		line: rangeFor(def).start.line + 1,
-		path: fsPath(uriFor(def)),
-	};
 }
 
 export function uriFor(def: vs.Location | vs.DefinitionLink) {
@@ -660,7 +812,7 @@ export async function getWorkspaceSymbols(query: string): Promise<vs.SymbolInfor
 }
 
 export function waitForDiagnosticChange(resource?: vs.Uri): Promise<void> {
-	return new Promise((resolve, reject) => {
+	return new Promise((resolve) => {
 		const disposable = vs.languages.onDidChangeDiagnostics((e) => {
 			if (!resource || e.uris.find((r) => fsPath(r) === fsPath(resource))) {
 				resolve();
@@ -671,26 +823,40 @@ export function waitForDiagnosticChange(resource?: vs.Uri): Promise<void> {
 }
 
 export async function acceptFirstSuggestion(): Promise<void> {
+	// Ensure we are getting some results. This fixes a race where the server might've been
+	// starting up as the test got here.
+	const editor = currentEditor();
+	const doc = editor.document;
+	const pos = editor.selection.end;
+	let results: vs.CompletionList | undefined;
+	let remainingTries = 10;
+	while (!results || results.isIncomplete || results.items.length === 0) {
+		await delay(50);
+		results = await vs.commands.executeCommand<vs.CompletionList>("vscode.executeCompletionItemProvider", doc.uri, pos, undefined, 1 /* resolveCount, forces resolve for the item */);
+		if (--remainingTries <= 0)
+			break;
+	}
+
 	// TODO: Can we make this better (we're essentially waiting to ensure resolve completed
 	// before we accept, so that we don't insert the standard label without the extra
 	// edits which are added in in resolve).
 	await vs.commands.executeCommand("editor.action.triggerSuggest");
-	await delay(6000);
+	await delay(100);
 	await waitForEditorChange(() => vs.commands.executeCommand("acceptSelectedSuggestion"));
-	await delay(1000);
+	await delay(100);
 }
 
 export function ensureInsertReplaceRanges(range: undefined | vs.Range | { inserting: vs.Range, replacing: vs.Range }, insertRangeMatch: string, replaceRangeMatch: string) {
-	if (range && ("inserting" in range || "replacing" in range)) {
-		assert.equal((range && "inserting" in range ? range.inserting : undefined)!.isEqual(rangeOf(insertRangeMatch)), true);
-		assert.equal((range && "replacing" in range ? range.replacing : undefined)!.isEqual(rangeOf(replaceRangeMatch)), true);
+	if (range && "inserting" in range && "replacing" in range) {
+		assert.equal(range.inserting.isEqual(rangeOf(insertRangeMatch)), true);
+		assert.equal(range.replacing.isEqual(rangeOf(replaceRangeMatch)), true);
 	} else {
 		assert.equal(range!.isEqual(rangeOf(replaceRangeMatch)), true);
 	}
 }
 
 export function ensureError(errors: vs.Diagnostic[], text: string) {
-	const error = errors.find((e) => e.message.indexOf(text) !== -1);
+	const error = errors.find((e) => e.message.includes(text));
 	assert.ok(
 		error,
 		`Couldn't find error for ${text} in\n`
@@ -705,7 +871,7 @@ export function ensureArrayContainsArray<T>(haystack: T[], needle: T[]) {
 	);
 }
 
-export function ensureWorkspaceSymbol(symbols: vs.SymbolInformation[], name: string, kind: vs.SymbolKind, containerName: string | undefined, uriOrMatch: vs.Uri | { endsWith?: string }): void {
+export function ensureWorkspaceSymbol(symbols: vs.SymbolInformation[], name: string, kind: vs.SymbolKind, containerName: string | undefined, uriOrMatch: vs.Uri | { endsWith: string }): void {
 	const symbol = symbols.find((f) =>
 		f.name === name
 		&& f.kind === kind
@@ -717,16 +883,18 @@ export function ensureWorkspaceSymbol(symbols: vs.SymbolInformation[], name: str
 		+ symbols.map((s) => `        ${s.name}/${vs.SymbolKind[s.kind]}/${s.containerName}`).join("\n"),
 	);
 	if (uriOrMatch instanceof vs.Uri)
-		assert.equal(fsPath(symbol.location.uri), fsPath(uriOrMatch));
-	else if (uriOrMatch.endsWith)
-		assert.ok(fsPath(symbol.location.uri).endsWith(uriOrMatch.endsWith));
+		assert.equal(
+			fsPath(symbol.location.uri),
+			fsPath(uriOrMatch),
+			`${fsPath(symbol.location.uri)} should equal ${fsPath(uriOrMatch)}`
+		);
 	else
-		assert.equal(symbol.location.uri, uriOrMatch);
+		assert.ok(
+			fsPath(symbol.location.uri).endsWith(uriOrMatch.endsWith),
+			`${fsPath(symbol.location.uri)} should end with ${uriOrMatch.endsWith})`,
+		);
 	assert.ok(symbol.location);
-	if (extApi.isLsp)
-		assert.ok(symbol.location.range);
-	else // For non-LSP, we use resolve. This can be dropped when we're full LSP.
-		assert.ok(!symbol.location.range);
+	assert.ok(symbol.location.range);
 }
 
 export function ensureDocumentSymbol(symbols: Array<vs.DocumentSymbol & { parent: vs.DocumentSymbol | undefined }>, name: string, kind: vs.SymbolKind, parentName?: string): void {
@@ -748,7 +916,7 @@ export function ensureDocumentSymbol(symbols: Array<vs.DocumentSymbol & { parent
 	assert.ok(range.end.line);
 }
 
-export function rangeString(range: vs.Range) {
+function rangeString(range: vs.Range) {
 	return `${range.start.line}:${range.start.character}-${range.end.line}:${range.end.character}`;
 }
 
@@ -777,44 +945,104 @@ export function ensureNoLocation(locations: vs.Location[], uri: vs.Uri, range: v
 	);
 }
 
-export function ensureIsRange(actual: vs.Range, expected: vs.Range) {
-	assert.ok(actual);
-	assert.equal(actual.start.line, expected.start.line, "Start lines did not match");
-	assert.equal(actual.start.character, expected.start.character, "Start characters did not match");
-	assert.equal(actual.end.line, expected.end.line, "End lines did not match");
-	assert.equal(actual.end.character, expected.end.character, "End characters did not match");
+export async function checkCurrentEditorSelectionIsPosition(expectedUri: vs.Uri, expectedPosition: vs.Position): Promise<boolean> {
+	const editor = currentEditor();
+	return fsPath(editor.document.uri) === fsPath(expectedUri)
+		&& editor.selection.start.line === expectedPosition.line
+		&& editor.selection.start.character === expectedPosition.character
+		&& editor.selection.end.line === expectedPosition.line
+		&& editor.selection.end.character === expectedPosition.character;
 }
 
 export function snippetValue(text: string | vs.SnippetString | undefined) {
 	return !text || typeof text === "string" ? text : text.value;
 }
 
-export async function getCompletionsAt(searchText: string, triggerCharacter?: string, resolveCount = 1): Promise<vs.CompletionItem[]> {
+export async function getCompletionsAt(
+	searchText: string,
+	{ triggerCharacter, resolveCount = 1, requireComplete = false }: { triggerCharacter?: string, resolveCount?: number, requireComplete?: boolean } = {},
+): Promise<vs.CompletionItem[]> {
 	const position = positionOf(searchText);
-	const results = await vs.commands.executeCommand<vs.CompletionList>("vscode.executeCompletionItemProvider", currentDoc().uri, position, triggerCharacter, resolveCount);
+	let results: vs.CompletionList | undefined;
+	// If we require complete, keep going until isIncomplete=false *and* there are some results (because VS code drops isIncomplete for empty results).
+	let remainingTries = 10;
+	while (!results || (requireComplete && (results.isIncomplete || results.items.length === 0))) {
+		if (results) {
+			// When we're calling a subsequent time, add a delay.
+			await delay(100);
+		}
+		results = await vs.commands.executeCommand<vs.CompletionList>("vscode.executeCompletionItemProvider", currentDoc().uri, position, triggerCharacter, resolveCount);
+		if (--remainingTries <= 0)
+			break;
+	}
 	return results.items;
 }
 
-export async function getSnippetCompletionsAt(searchText: string, triggerCharacter?: string): Promise<vs.CompletionItem[]> {
-	const completions = await getCompletionsAt(searchText, triggerCharacter);
+export async function getSnippetCompletionsAt(
+	searchText: string,
+	{ triggerCharacter, resolveCount = 1, requireComplete = false }: { triggerCharacter?: string, resolveCount?: number, requireComplete?: boolean } = {},
+): Promise<vs.CompletionItem[]> {
+	const completions = await getCompletionsAt(searchText, { triggerCharacter, resolveCount, requireComplete });
 	return completions.filter((c) => c.kind === vs.CompletionItemKind.Snippet);
 }
 
-export function ensureCompletion(items: vs.CompletionItem[], kind: vs.CompletionItemKind | vs.CompletionItemKind[], label: string, filterText?: string, documentation?: string): vs.CompletionItem {
+export function ensureCompletion(items: vs.CompletionItem[], kind: vs.CompletionItemKind, expectedLabel: string, expectedFilterText?: string, documentation?: string): vs.CompletionItem {
 	const kinds = Array.isArray(kind) ? kind : [kind];
-	const completion = items.find((item) =>
-		item.label === label
-		&& (item.filterText === filterText || (item.filterText === undefined && filterText === label))
-		&& kinds.includes(item.kind!),
-	);
-	assert.ok(
-		completion,
-		`Couldn't find completion for ${label}/${filterText} in\n`
-		+ items.map((item) => `        ${item.kind && vs.CompletionItemKind[item.kind]}/${item.label}/${item.filterText}`).join("\n"),
-	);
+	// Sometimes our mismatch is just the details afterwards, so we'll try to match on labels with/without and then verify
+	// afterwards so we can get better errors ("expected `exit(...)` but got `exit`" instead of "can't find `exit(...)` in [big list]").
+	const expectedShortLabel = expectedLabel.split("(")[0].trim();
+	const completionCandidates = items.filter((item) => {
+		const actualLabel = completionLabel(item);
+		const actualShortLabel = actualLabel.split("(")[0].trim();
+		return expectedShortLabel === actualShortLabel && kinds.includes(item.kind!);
+	});
+	if (completionCandidates.length === 0) {
+		assert.fail(
+			`Couldn't find completion for ${expectedLabel} in\n`
+			+ items.map((item) => `        ${item.kind && vs.CompletionItemKind[item.kind]}/${completionLabel(item)}`).join("\n"),
+		);
+	}
+	if (completionCandidates.length > 1) {
+		assert.fail(
+			`Found multiple completions for ${expectedLabel} in\n`
+			+ completionCandidates.map((item) => `        ${item.kind && vs.CompletionItemKind[item.kind]}/${completionLabel(item)}`).join("\n"),
+		);
+	}
+	const completion = completionCandidates[0];
+	const actualLabel = completionLabel(completion);
+	const actualLabelLong = completionLabelWithDetails(completion);
+
+	// Either we should have a single string label that matches expectedLabel, or we should be a non-string label
+	// where actualLabelLong starts with label.
+	if (typeof completion.label === "string")
+		assert.equal(actualLabel.trim(), expectedLabel.trim()); // For labels, trailing whitespace is not important.
+	else
+		// We use startsWith because the new long labels may have return values that
+		// the tests do not (`exit(…) → Never`).
+		// TODO(dantup): Once stable is using label details, change these tests to verify the whole new object.
+		assert.ok(actualLabelLong.startsWith(expectedLabel), `Expected label to start with "${expectedLabel}" but was "${actualLabelLong}"`);
+
+	const expectedResolvedFilterText = expectedFilterText ?? expectedLabel;
+	const actualResolvedFilterText = completion.filterText ?? actualLabel;
+	assert.equal(actualResolvedFilterText.trim(), expectedResolvedFilterText.trim());
+
 	if (documentation)
 		assert.equal((completion.documentation as any).value.trim(), documentation);
 	return completion;
+}
+
+export function completionLabel(completion: vs.CompletionItem): string {
+	const label = completion.label;
+	return typeof label === "string"
+		? label
+		: label.label;
+}
+
+function completionLabelWithDetails(completion: vs.CompletionItem): string {
+	const label = completion.label;
+	return typeof label === "string"
+		? label
+		: label.label + (label.detail ?? "");
 }
 
 export function ensureSnippet(items: vs.CompletionItem[], label: string, filterText: string, documentation?: string): void {
@@ -838,7 +1066,11 @@ export function ensureNoSnippet(items: vs.CompletionItem[], label: string): void
 }
 
 export async function ensureTestContent(expected: string, allowNewMismatches = false): Promise<void> {
-	const doc = currentDoc();
+	return ensureFileContent(currentDoc().uri, expected, allowNewMismatches);
+}
+
+export async function ensureFileContent(uri: vs.Uri, expected: string, allowNewMismatches = false): Promise<void> {
+	const doc = await vs.workspace.openTextDocument(uri);
 	function normalise(text: string) {
 		text = text.replace(/\r/g, "").trim();
 		if (allowNewMismatches)
@@ -855,16 +1087,11 @@ export async function ensureTestContent(expected: string, allowNewMismatches = f
 	assert.equal(normalise(doc.getText()), normalise(expected));
 }
 
-export function ensureTestSelection(expected: vs.Range): void {
+function ensureTestSelection(expected: vs.Range): void {
 	const editor = currentEditor();
 	assert.equal(editor.selection.isEqual(expected), true, `actual: ${rangeString(editor.selection)} (${editor.document.getText(editor.selection)}) vs expected: ${rangeString(expected)} (${editor.document.getText(expected)})`);
 }
 
-export async function ensureTestContentWithCursorPos(expected: string): Promise<void> {
-	await ensureTestContent(expected.replace(/\^/g, ""));
-	const pos = positionOf(expected);
-	ensureTestSelection(new vs.Range(pos, pos));
-}
 
 export async function ensureTestContentWithSelection(expected: string): Promise<void> {
 	await ensureTestContent(expected.replace(/\|/g, ""));
@@ -878,7 +1105,7 @@ export function checkTreeNodeResults(actual: string, expected: string, descripti
 	const segments = expected.split(".dart");
 	segments[0] = segments[0].replace(/\//g, path.sep);
 	expected = segments.join(".dart");
-	assert.equal(actual, expected, description);
+	assert.equal(actual.trim(), expected.trim(), description);
 }
 
 export function delay(milliseconds: number): Promise<void> {
@@ -896,27 +1123,23 @@ export function getRandomTempFolder(): string {
 	return tmpPath;
 }
 
-export async function waitForResult(action: () => boolean | Promise<boolean>, message?: string, milliseconds: number = 6000, throwOnFailure = true): Promise<void> {
+export function createTempPubPackage(packageName: string, folderName = "temp_package"): string {
+	const tempFolder = getRandomTempFolder();
+	const packageFolder = path.join(tempFolder, folderName);
+	defer(`delete temp package in ${tempFolder}`, () => tryDelete(tempFolder));
+
+	fs.mkdirSync(packageFolder, { recursive: true });
+	fs.writeFileSync(path.join(packageFolder, "pubspec.yaml"), `name: ${packageName}\n`);
+
+	return packageFolder;
+}
+
+export async function waitForResult(action: () => boolean | Promise<boolean>, message?: string, milliseconds = 6000, throwOnFailure = true): Promise<void> {
 	const res = await waitFor(action, undefined, milliseconds);
 	if (throwOnFailure && !res)
 		throw new Error(`Action didn't return true within ${milliseconds}ms (${message})`);
 }
 
-export async function tryFor(action: () => Promise<void> | void, milliseconds: number = 3000): Promise<void> {
-	let timeRemaining = milliseconds;
-	while (timeRemaining > 0) {
-		try {
-			await action();
-			return; // We succeeded, so return successfully.
-		} catch {
-			// Swallow the error so we can try again.
-		}
-		await new Promise((resolve) => setTimeout(resolve, 20));
-		timeRemaining -= 20;
-	}
-	// Run normally, so we get a good error message.
-	await action();
-}
 
 export async function waitForEditorChange(action: () => Thenable<void>): Promise<void> {
 	const doc = currentDoc();
@@ -928,65 +1151,49 @@ export async function waitForEditorChange(action: () => Thenable<void>): Promise
 
 export async function waitForNextAnalysis(action: () => void | Thenable<void>, timeoutSeconds?: number): Promise<void> {
 	logger.info("Waiting for any in-progress analysis to complete");
-	await extApi.currentAnalysis();
+	await privateApi.currentAnalysis();
 	// Get a new completer for the next analysis.
-	const nextAnalysis = extApi.nextAnalysis();
+	const nextAnalysis = privateApi.nextAnalysis();
 	logger.info("Running requested action");
 	await action();
 	logger.info(`Waiting for analysis to complete`);
 	await withTimeout(nextAnalysis, "Analysis did not complete within specified timeout", timeoutSeconds);
 }
 
-export async function withTimeout<T>(promise: Thenable<T>, message: string | (() => string), seconds: number = 360): Promise<T> {
-	return new Promise<T>((resolve, reject) => {
-		// Set a timeout to reject the promise after the timeout period.
-		const timeoutTimer = setTimeout(() => {
-			const msg = typeof message === "string" ? message : message();
-			reject(new Error(`${msg} within ${seconds}s`));
-		}, seconds * 1000);
-
-		// When the main promise completes, cancel the timeout and return its result.
-		// eslint-disable-next-line @typescript-eslint/no-floating-promises
-		promise.then((result) => {
-			clearTimeout(timeoutTimer);
-			resolve(result);
-		});
-	});
-}
-
-export async function getResolvedDebugConfiguration(extraConfiguration?: { [key: string]: any }): Promise<(vs.DebugConfiguration & DartLaunchArgs)> {
+export async function getResolvedDebugConfiguration(extraConfiguration?: { program: string | undefined, [key: string]: any }): Promise<(vs.DebugConfiguration & DartLaunchArgs)> {
 	const debugConfig: vs.DebugConfiguration = Object.assign({}, {
 		name: `Dart & Flutter (${currentTestName})`,
 		request: "launch",
 		type: "dart",
 	}, extraConfiguration);
-	return await extApi.debugProvider.resolveDebugConfigurationWithSubstitutedVariables!(vs.workspace.workspaceFolders![0], debugConfig) as vs.DebugConfiguration & DartLaunchArgs;
+	return await privateApi.debugProvider.resolveDebugConfigurationWithSubstitutedVariables!(vs.workspace.workspaceFolders![0], debugConfig) as vs.DebugConfiguration & DartLaunchArgs;
 }
 
-export async function getLaunchConfiguration(script?: vs.Uri | string, extraConfiguration?: { [key: string]: any }): Promise<vs.DebugConfiguration & DartLaunchArgs | undefined | null> {
-	if (script instanceof vs.Uri)
-		script = fsPath(script);
+export async function getLaunchConfiguration(script?: URI | string, extraConfiguration?: Record<string, any>): Promise<vs.DebugConfiguration & DartLaunchArgs | undefined | null> {
+	if (script && typeof script !== "string")
+		script = getProgramString(script);
 	const launchConfig = Object.assign({}, {
 		program: script,
 	}, extraConfiguration);
 	return await getResolvedDebugConfiguration(launchConfig);
 }
 
-export async function getAttachConfiguration(extraConfiguration?: { [key: string]: any }): Promise<vs.DebugConfiguration & DartLaunchArgs | undefined | null> {
+export async function getAttachConfiguration(extraConfiguration?: Record<string, any>): Promise<vs.DebugConfiguration & DartLaunchArgs | undefined | null> {
 	const attachConfig = Object.assign({}, {
+		program: undefined,
 		request: "attach",
 	}, extraConfiguration);
 	return await getResolvedDebugConfiguration(attachConfig);
 }
 
 export async function writeBrokenDartCodeIntoFileForTest(file: vs.Uri): Promise<void> {
-	const nextAnalysis = extApi.nextAnalysis();
+	const nextAnalysis = privateApi.nextAnalysis();
 	fs.writeFileSync(fsPath(file), "this is broken dart code");
 	await nextAnalysis;
 	// HACK: Sometimes we see analysis the analysis flag toggle quickly and we get an empty error list
 	// so we need to add a small delay here and then wait for any in progress analysis.
-	await delay(500);
-	await extApi.currentAnalysis();
+	await delay(50);
+	await privateApi.currentAnalysis();
 	defer("Remove broken Dart file", () => tryDelete(file));
 }
 
@@ -996,28 +1203,39 @@ export function deleteFileIfExists(filePath: string) {
 	}
 }
 
-export async function captureDebugSessionCustomEvents(startDebug: () => void): Promise<vs.DebugSessionCustomEvent[]> {
-	let session: vs.DebugSession;
-	let startSub: IAmDisposable;
-	let endSub: IAmDisposable;
+export async function captureDebugSessionCustomEvents(startDebug: () => void, expectMultipleSessions = false): Promise<vs.DebugSessionCustomEvent[]> {
+	let totalSessionsStarted = 0;
+	const sessions = new Set<vs.DebugSession>();
+	let startSub: IAmDisposable | undefined;
+	let endSub: IAmDisposable | undefined;
 	const events: vs.DebugSessionCustomEvent[] = [];
 
 	const startPromise = new Promise<void>((resolve) => {
 		startSub = vs.debug.onDidStartDebugSession((s) => {
-			session = s;
+			sessions.add(s);
+			totalSessionsStarted++;
 			resolve();
 		});
-	}).finally(() => startSub.dispose());
-	const eventSub = vs.debug.onDidReceiveDebugSessionCustomEvent((e) => events.push(e));
+	});
+	const eventSub = vs.debug.onDidReceiveDebugSessionCustomEvent((e) => {
+		if (sessions.has(e.session))
+			events.push(e);
+	});
 	const endPromise = new Promise<void>((resolve) => {
-		endSub = vs.debug.onDidTerminateDebugSession((s) => {
-			if (s === session)
+		endSub = vs.debug.onDidTerminateDebugSession(async (s) => {
+			sessions.delete(s);
+			// Allow some time for another session to start in case of multi-session test runs.
+			if (expectMultipleSessions)
+				await waitFor(() => totalSessionsStarted > 1);
+			if (sessions.size === 0)
 				resolve();
 		});
-	}).finally(() => endSub.dispose());
+	});
 
 	startDebug();
 	await Promise.all([startPromise, endPromise]);
+	startSub?.dispose();
+	endSub?.dispose();
 	eventSub.dispose();
 
 	return events;
@@ -1049,8 +1267,9 @@ export function ensureHasRunWithArgsStarting(root: string, name: string, expecte
 		// On Windows we get all the quotes from the args, but they're not
 		// important for the test so strip them so we can use the same
 		// expectation across platforms.
-		.replace(/"/g, "");
-	assert.ok(contents.trim().startsWith(expectedArgs.trim()), `Contents:\n${contents}\nExpected start:\n${expectedArgs}`);
+		.replace(/"/g, "").trim();
+	if (!contents.startsWith(expectedArgs.trim()))
+		throw new Error(`Contents:\n${contents}\nExpected start:\n${expectedArgs}`);
 }
 
 export async function saveTrivialChangeToFile(uri: vs.Uri) {
@@ -1076,20 +1295,16 @@ export function makeTrivialChangeToFileDirectly(uri: vs.Uri): Promise<void> {
 // Watches a promise and reports every 10s while it's unresolved. This is to aid tracking
 // down hangs in test runs where multiple promises can be spawned together and generate
 // lots of log output, making it hard to keep track of which did not complete.
-export function watchPromise<T>(name: string, promise: Promise<T> | T): Promise<T> {
-	const activeTestName = currentTestName;
+export function watchPromise<T>(name: string, maybePromise: Promise<T> | T): Promise<T> {
 	// For convenience, this method might get wrapped around things that are not
 	// promises.
-	const promiseAny = promise as any;
-	if (!promise || !promiseAny.then || !promiseAny.catch)
-		return Promise.resolve(promise);
-	promise = promise as Promise<T>;
+	const promise: Promise<T> = Promise.resolve(maybePromise);
+	const activeTestName = currentTestName;
 	let didComplete = false;
 	// We'll log completion of the promise only if we'd logged that it was still in
 	// progress at some point.
 	let logCompletion = false;
-	// tslint:disable-next-line: no-floating-promises
-	promise.then(() => {
+	void promise.then(() => {
 		didComplete = true;
 		if (logCompletion)
 			logger.info(`Promise ${name} resolved!`, LogCategory.CI);
@@ -1122,7 +1337,7 @@ export function watchPromise<T>(name: string, promise: Promise<T> | T): Promise<
 export async function setConfigForTest(section: string, key: string, value: any): Promise<void> {
 	const conf = vs.workspace.getConfiguration(section);
 	const values = conf.inspect(key);
-	const oldValue = values && values.globalValue;
+	const oldValue = values?.globalValue;
 	await conf.update(key, value, vs.ConfigurationTarget.Global);
 	defer("Restore test config", () => conf.update(key, oldValue, vs.ConfigurationTarget.Global));
 }
@@ -1141,15 +1356,8 @@ export async function addLaunchConfigsForTest(workspaceUri: vs.Uri, configs: any
 	});
 }
 
-export function clearAllContext(context: Context): Promise<void> {
-	context.devToolsNotificationLastShown = undefined;
-	context.devToolsNotificationDoNotShow = undefined;
-	context.setFlutterSurveyNotificationLastShown(flutterTestSurveyID, undefined);
-	context.setFlutterSurveyNotificationDoNotShow(flutterTestSurveyID, undefined);
-
-	// HACK: Updating context is async, but since we use setters we can't easily wait
-	// and this is only test code...
-	return new Promise((resolve) => setTimeout(resolve, 50));
+export async function clearAllContext(context: Context): Promise<void> {
+	await context.clear();
 }
 
 export function ensurePackageTreeNode(items: vs.TreeItem[] | undefined | null, nodeContext: string, label: string, description?: string): vs.TreeItem {
@@ -1157,11 +1365,11 @@ export function ensurePackageTreeNode(items: vs.TreeItem[] | undefined | null, n
 		throw new Error("No tree nodes found to check");
 
 	const item = items.find((item) =>
-		item.contextValue === nodeContext
+		item.contextValue?.includes(nodeContext)
 		&& renderedItemLabel(item) === label,
 	);
 	if (!item)
-		throw new Error(`Did not find item matching ${label} in:\n${items.map((item) => `    ${renderedItemLabel(item)} (${item.label}, ${item.contextValue})`).join("\n")}`);
+		throw new Error(`Did not find item matching ${label} in:\n${items.map((item) => `    ${renderedItemLabel(item)} (${typeof item.label === "string" ? item.label : item.label?.label ?? "<unnamed>"}, ${item.contextValue})`).join("\n")}`);
 
 	if (description)
 		assert.equal(item.description, description);
@@ -1196,26 +1404,71 @@ function getSourceLine(item: vs.TestItem): number {
 	return Math.min(99999999, ...lines);
 }
 
-export function makeTestTextTree(items: vs.TestItemCollection | vs.Uri | undefined, { buffer = [], indent = 0, onlyFailures, onlyActive }: { buffer?: string[]; indent?: number, onlyFailures?: boolean, onlyActive?: boolean } = {}): string[] {
+export function isTestDoneSuccessNotification(e: vs.DebugSessionCustomEvent) {
+	if (e.event !== "dart.testNotification")
+		return false;
+	const notification = e.body as TestDoneNotification;
+	return notification.type === "testDone" && notification.result !== "error" && !notification.hidden;
+}
+
+export function findSuiteNode(suitePath: string): vs.TestItem {
+	const suiteID = `SUITE:${suitePath}`;
+	const projectPath = locateBestProjectRoot(suitePath);
+	const projectID = projectPath ? `PROJECT:${projectPath}` : undefined;
+	const workspaceFolder = projectPath ? vs.workspace.getWorkspaceFolder(vs.Uri.file(projectPath)) : undefined;
+	const workspaceFolderPath = workspaceFolder ? fsPath(workspaceFolder.uri) : undefined;
+	const workspaceFolderID = workspaceFolderPath ? `WF:${workspaceFolderPath}` : undefined;
+
+	const controller = privateApi.testController!;
+	const node = controller.controller.items.get(suiteID)
+		?? (projectID ? controller.controller.items.get(projectID)?.children.get(suiteID) : undefined)
+		?? (workspaceFolderID && projectID ? controller.controller.items.get(workspaceFolderID)?.children.get(projectID)?.children.get(suiteID) : undefined);
+
+	if (!node)
+		throw new Error(`Could not find suite node for ${suitePath}:\n  ${workspaceFolderID}\n    ${projectID}\n      ${suiteID}`);
+
+	return node;
+}
+
+export function findProjectNode(projectPath: string): vs.TestItem {
+	const projectID = `PROJECT:${projectPath}`;
+	const workspaceFolder = vs.workspace.getWorkspaceFolder(vs.Uri.file(projectPath));
+	const workspaceFolderPath = workspaceFolder ? fsPath(workspaceFolder.uri) : undefined;
+	const workspaceFolderID = workspaceFolderPath ? `WF:${workspaceFolderPath}` : undefined;
+
+	const controller = privateApi.testController!;
+	const node = controller.controller.items.get(projectID)
+		?? (workspaceFolderID ? controller.controller.items.get(workspaceFolderID)?.children.get(projectID) : undefined);
+
+	if (!node)
+		throw new Error(`Could not find project node for ${projectPath}:\n  ${workspaceFolderID}\n    ${projectID}`);
+
+	return node;
+}
+
+export function makeTestTextTree({ items, uriFilter, buffer = [], indent = 0, onlyFailures, onlyActive, sortByLabel }: { items?: vs.TestItemCollection, uriFilter?: vs.Uri, buffer?: string[]; indent?: number, onlyFailures?: boolean, onlyActive?: boolean, sortByLabel?: boolean } = {}): string[] {
+	const controller = privateApi.testController!;
 	const collection = items instanceof vs.Uri
-		? extApi.testController.controller.items
-		: items ?? extApi.testController.controller.items;
-	const parentResourceUri = items instanceof vs.Uri ? items : undefined;
+		? controller.controller.items
+		: items ?? controller.controller.items;
 
 	const testItems: vs.TestItem[] = [];
-	collection.forEach((item) => {
-		if (!parentResourceUri || item.uri?.toString() === parentResourceUri.toString())
-			testItems.push(item);
-	});
+	collection.forEach((item) => testItems.push(item));
 
-	// Sort the items by their locations so we get stable results. Otherwise the order that items
+	// Sort the items by their locations by default so we get stable results. Otherwise the order that items
 	// are created would be used, which is usually source-order, but could be different if the user
 	// selectively runs tests starting at the end of the file.
-	sortBy(testItems, getSourceLine);
+	// Allow overriding to sort by name for tests that are modifying files and running subsets of tests
+	// and don't care about source order.
+	sortBy(testItems, sortByLabel ? (item) => item.label : getSourceLine);
 
 	for (const item of testItems) {
-		const lastResult = extApi.testController.getLatestData(item);
-		const lastResultTestNode = lastResult as TestNode;
+		const lastResult = controller.getLatestData(item);
+
+		// Only include statuses on WF/Project nodes if we aren't filtering, otherwise
+		// the status may look wrong (because it might be skewed by filtered out nodes).
+		const isWorkspaceFolderOrProject = item.id.startsWith("WF:") || item.id.startsWith("PROJECT:");
+		const includeStatus = !isWorkspaceFolderOrProject || !uriFilter;
 
 		let nodeString = item.label;
 		if (item.description)
@@ -1223,28 +1476,47 @@ export function makeTestTextTree(items: vs.TestItemCollection | vs.Uri | undefin
 
 		let includeNode = true;
 		if (lastResult) {
-			if (lastResultTestNode.status)
-				nodeString += ` ${TestStatus[lastResultTestNode.status]}`;
-			else if (lastResult.children.length && lastResult.statuses?.size)
-				nodeString += ` ${TestStatus[lastResult.getHighestStatus(true)]}`;
+			const status = "status" in lastResult ? lastResult?.status as TestStatus : undefined;
+			if (includeStatus) {
+				if (status)
+					nodeString += ` ${TestStatus[status]}`;
+				else if (lastResult.children.length)
+					nodeString += ` ${TestStatus[lastResult.getHighestChildStatus(true)]}`;
+			}
+
+			// If this node has a different file to the parent, include that in the output.
+			// Don't include it if it's already in the label though.
+			if (lastResult.path && lastResult.parent?.path && lastResult.path !== lastResult.parent?.path && !item.label.endsWith(path.basename(lastResult.path)))
+				nodeString += ` (${path.basename(lastResult.path)})`;
+
 			const isStale = lastResult.isStale;
-			const isFailure = lastResultTestNode.status === TestStatus.Failed;
+			const isFailure = status === TestStatus.Failed;
 			if ((isStale && onlyActive) || (!isFailure && onlyFailures))
 				includeNode = false;
-		} else {
+		} else if (!isWorkspaceFolderOrProject) {
 			nodeString += " (not found in model)";
 		}
 
-		if (includeNode)
-			buffer.push(`${" ".repeat(indent * 4)}${nodeString}`);
+		// Stop filtering children at the point that we match the filter (eg. we match the suite, include all children).
+		const nodeMatches = uriFilter && item.uri?.toString() === uriFilter.toString();
+		const filterChildren = !nodeMatches;
 
-		makeTestTextTree(item.children, { buffer, indent: indent + 1, onlyFailures, onlyActive });
+		const childBuffer: string[] = [];
+		makeTestTextTree({ items: item.children, uriFilter: filterChildren ? uriFilter : undefined, buffer: childBuffer, indent: indent + 1, onlyFailures, onlyActive, sortByLabel });
+
+		// Only include this node if:
+		// - there are children
+		// - it matches our URI filter
+		if (includeNode && (childBuffer.length || !uriFilter || nodeMatches)) {
+			buffer.push(`${" ".repeat(indent * 4)}${nodeString}`);
+			buffer.push(...childBuffer);
+		}
 	}
 
 	return buffer;
 }
 
-export async function makeTextTreeUsingCustomTree(parent: TreeNode | vs.Uri | undefined, provider: vs.TreeDataProvider<TreeNode>, { buffer = [], indent = 0 }: { buffer?: string[]; indent?: number } = {}): Promise<string[]> {
+export async function makeTextTreeUsingCustomTree(parent: vs.TreeItem | vs.Uri | undefined, provider: vs.TreeDataProvider<vs.TreeItem>, { buffer = [], indent = 0 }: { buffer?: string[]; indent?: number } = {}): Promise<string[]> {
 	const parentNode = parent instanceof vs.Uri ? undefined : parent;
 	const parentResourceUri = parent instanceof vs.Uri ? parent : undefined;
 
@@ -1257,15 +1529,40 @@ export async function makeTextTreeUsingCustomTree(parent: TreeNode | vs.Uri | un
 			continue;
 
 		const label = treeItem.label;
+		const labelString = typeof label === "string" ? label : label?.label ?? "<unnamed>";
 		const description = treeItem.description ? ` [${treeItem.description}]` : "";
-		const iconUri = treeItem.iconPath instanceof vs.Uri
+		const iconUri = treeItem.iconPath ? treeItem.iconPath instanceof vs.Uri
 			? treeItem.iconPath
 			: "dark" in (treeItem.iconPath as any)
-				? (treeItem.iconPath as any).dark
-				: undefined;
-		const iconFile = iconUri instanceof vs.Uri ? path.basename(fsPath(iconUri)).replace("-dark", "") : "<unknown icon>";
-		buffer.push(`${" ".repeat(indent * 4)}${label}${description} (${iconFile})`);
+				? (treeItem.iconPath as any).dark as string | vs.Uri
+				: undefined
+			: undefined;
+		const iconFile = iconUri instanceof vs.Uri ? path.basename(fsPath(iconUri)).replace("-dark", "") : undefined;
+		const iconSuffix = iconFile ? ` (${iconFile})` : "";
+		buffer.push(`${" ".repeat(indent * 4)}${labelString}${description}${iconSuffix}`);
 		await makeTextTreeUsingCustomTree(item, provider, { buffer, indent: indent + 1 });
 	}
 	return buffer;
+}
+
+export function createTempTestFile(absolutePath: string, content?: string) {
+	createFolderForFile(absolutePath);
+	fs.writeFileSync(absolutePath, content ?? "");
+	defer("delete temp file", () => tryDelete(absolutePath));
+}
+
+export function validateExpectedEnv(e: Record<string, string | number | null>) {
+	assert.equal(e.DASH__IDE_NAME, vs.env.appName);
+	assert.equal(e.DASH__IDE_VERSION, vs.version);
+	assert.equal(e.DASH__PLUGIN_NAME, "Dart-Code");
+	assert.equal(e.DASH__PLUGIN_VERSION, extensionVersion);
+	assert.equal(e.DASH__IDE_ENVIRONMENT, "desktop");
+	assert.equal(e.DASH__TOOL, "vscode-plugins");
+	assert.equal(e.DASH__SUPPRESS_ANALYTICS, "true"); // This is always set in test runs.
+
+	// Sanity check some values that are variable.
+	assert.match(String(e.DASH__IDE_NAME), /Visual Studio Code|Antigravity/);
+	// Don't anchor to the end, allow suffixes for pre-releases.
+	assert.match(String(e.DASH__IDE_VERSION), /^\d+\.\d+\.\d/);
+	assert.match(String(e.DASH__PLUGIN_VERSION), /^3\.\d+\.\d/);
 }

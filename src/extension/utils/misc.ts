@@ -1,20 +1,26 @@
 import * as path from "path";
-import { flutterPath } from "../../shared/constants";
+import { ExtensionRestartReason, flutterPath } from "../../shared/constants";
 import { Logger } from "../../shared/interfaces";
+import { config } from "../config";
 import { promptToReloadExtension } from "../utils";
 import { runToolProcess } from "./processes";
 
 let isShowingAnalyzerError = false;
 
-export function reportAnalyzerTerminatedWithError(duringStartup: boolean = false) {
+export function reportAnalyzerTerminatedWithError(logger: Logger, duringStartup = false) {
 	if (isShowingAnalyzerError)
 		return;
 	isShowingAnalyzerError = true;
-	const message = duringStartup
+	const prompt = duringStartup
 		? "The Dart Analyzer could not be started."
-		: "The Dart Analyzer has terminated.";
-	// tslint:disable-next-line: no-floating-promises
-	promptToReloadExtension(message, undefined, true).then(() => isShowingAnalyzerError = false);
+		: "The Dart Analyzer has terminated. Please [file an issue on GitHub](https://github.com/dart-lang/sdk/issues/new/choose) with any error from the end of the log.";
+	void promptToReloadExtension(logger, {
+		prompt,
+		offerLog: true,
+		severity: "ERROR",
+		specificLog: config.analyzerLogFile,
+		restartReason: ExtensionRestartReason.AnalyzerTerminated,
+	}).then(() => isShowingAnalyzerError = false);
 }
 
 export async function getFlutterConfigValue<T>(logger: Logger, flutterSdkPath: string | undefined, folder: string, flutterConfigKey: string): Promise<T> {
@@ -27,7 +33,13 @@ export async function getFlutterConfigValue<T>(logger: Logger, flutterSdkPath: s
 	try {
 		const proc = await runToolProcess(logger, folder, binPath, args);
 		if (proc.exitCode === 0) {
-			const json = JSON.parse(proc.stdout);
+			// It's possible there is Flutter output before the JSON so trim everything before then.
+			let jsonString = proc.stdout.trim();
+			const firstBrace = jsonString.indexOf("{");
+			if (firstBrace > 0) {
+				jsonString = jsonString.substring(firstBrace);
+			}
+			const json = JSON.parse(jsonString);
 			return json[flutterConfigKey] as T;
 		}
 		throw Error(`Failed to run "flutter config --machine" (${proc.exitCode}): ${proc.stderr}`);

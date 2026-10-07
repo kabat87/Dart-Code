@@ -1,3 +1,4 @@
+import "package:hello_world/basic.dart" as basic;
 import "package:test/test.dart";
 
 void main() {
@@ -26,5 +27,23 @@ void main() {
     test(".toRadixString() returns a hex string", () {
       expect(11.toRadixString(16), equals("b"));
     });
+  });
+
+  group("greater than", () {
+    test("without quotes List<String>", () {
+      expect(1, 1);
+    });
+
+    test('with quotes ">= foo"', () {
+      expect(1, 1);
+    });
+  });
+
+  test('`with backticks`', () {
+    expect(1, 1);
+  });
+
+  test('ensure coverage data', () {
+    basic.main();
   });
 }

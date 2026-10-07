@@ -1,45 +1,31 @@
-/* eslint-disable camelcase */
 export interface Notification {
 	type: string;
 	time: number;
-}
-
-export interface StartNotification extends Notification {
-	protocolVersion: string;
-	runnerVersion?: string;
-}
-
-export interface AllSuitesNotification extends Notification {
-	count: number;
 }
 
 export interface SuiteNotification extends Notification {
 	suite: Suite;
 }
 
-export interface Suite {
+interface Suite {
 	id: number;
 	platform: string;
 	path: string;
 }
 
-export interface TestNotification extends Notification {
-	test: Test;
-}
-
-export interface Item {
+export interface TestItem {
 	id: number;
 	name?: string;
 	suiteID: number;
-	line?: number;
-	column?: number;
-	url?: string;
-	root_line?: number;
-	root_column?: number;
-	root_url?: string;
+	line: number | undefined | null;
+	column: number | undefined | null;
+	url: string | undefined | null;
+	root_line: number | undefined | null;
+	root_column: number | undefined | null;
+	root_url: string | undefined | null;
 }
 
-export interface Test extends Item {
+export interface Test extends TestItem {
 	groupIDs: number[];
 }
 
@@ -47,7 +33,7 @@ export interface GroupNotification extends Notification {
 	group: Group;
 }
 
-export interface Group extends Item {
+interface Group extends TestItem {
 	parentID?: number;
 	testCount: number;
 }
@@ -63,9 +49,6 @@ export interface TestDoneNotification extends Notification {
 	hidden: boolean;
 }
 
-export interface DoneNotification extends Notification {
-	success: boolean;
-}
 
 export interface PrintNotification extends Notification {
 	testID: number;

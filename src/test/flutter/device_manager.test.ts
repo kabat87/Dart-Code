@@ -1,28 +1,40 @@
 import { strict as assert } from "assert";
-import { commands, window } from "vscode";
+import { commands } from "vscode";
 import { DaemonCapabilities } from "../../shared/capabilities/flutter";
-import { runFlutterCreatePrompt, yesAction } from "../../shared/constants";
 import * as f from "../../shared/flutter/daemon_interfaces";
 import { CustomEmulatorDefinition, IAmDisposable, IFlutterDaemon } from "../../shared/interfaces";
 import { UnknownResponse } from "../../shared/services/interfaces";
 import { FlutterDeviceManager, PickableDevice } from "../../shared/vscode/device_manager";
-import { logger, sb } from "../helpers";
-import { FakeProcessStdIOService } from "../services/fake_stdio_service";
-import sinon = require("sinon");
+import { activateWithoutAnalysis, delay, logger, privateApi, sb } from "../helpers";
+import { FakeProcessStdIOService } from "../mocks/fake_stdio_service";
 
 describe("device_manager", () => {
 	let dm: FlutterDeviceManager;
 	let daemon: FakeFlutterDaemon;
 
+	beforeEach(() => activateWithoutAnalysis());
 	beforeEach(() => {
+		privateApi.context.workspaceLastFlutterDeviceId = undefined;
 		daemon = new FakeFlutterDaemon();
 		// TODO: Tests for custom emulators.
-		dm = new FlutterDeviceManager(logger, daemon, { flutterCustomEmulators: customEmulators, flutterSelectDeviceWhenConnected: true, flutterShowEmulators: "local", projectSearchDepth: 3 });
+		dm = new FlutterDeviceManager(
+			logger,
+			daemon,
+			{
+				flutterCustomEmulators: customEmulators,
+				flutterRememberSelectedDevice: true,
+				flutterSelectDeviceWhenConnected: true,
+				flutterShowEmulators: "local",
+				projectSearchDepth: 3,
+			},
+			privateApi.workspaceContext,
+			privateApi.context,
+		);
 	});
 
-	afterEach(() => {
+	afterEach(async () => {
 		dm.dispose();
-		daemon.dispose();
+		await daemon.dispose();
 	});
 
 	it("auto-selects valid devices", async () => {
@@ -65,6 +77,22 @@ describe("device_manager", () => {
 		assert.deepStrictEqual(dm.currentDevice, emulatedAndroidMobile);
 		assert.deepStrictEqual(dm.labelForDevice(dm.currentDevice), androidEmulator.name);
 		assert.deepStrictEqual(dm.labelForDevice(dm.currentDevice, { withIcon: true }), "$(device-mobile) " + androidEmulator.name);
+	});
+
+	it("does not include bogus emulators", async () => {
+		const rawEmulatorLabels = (await daemon.getEmulators()).map((e) => e.name);
+		const emulatorLabels = (await dm.getPickableEmulators(false)).map((e) => e.label);
+		assert.deepStrictEqual(rawEmulatorLabels, [
+			androidEmulator.name,
+			androidBogusEmulatorId.name,
+			androidBogusEmulatorName.name,
+			androidEmulatorToOverride.name,
+		]);
+		assert.deepStrictEqual(emulatorLabels, [
+			androidEmulator.name,
+			customEmulator2.name,
+			customEmulator1.name,
+		]);
 	});
 
 	it("uses the standard device name for iOS simulator devices", async () => {
@@ -195,9 +223,20 @@ describe("device_manager", () => {
 		assert.deepStrictEqual(dm.currentDevice, physicalAndroidMobile);
 	});
 
-	it("shows unsupported platforms and prompts to run flutter create if selected", async () => {
+	it("will auto-select a non-ephemeral device if it is preferred", async () => {
+		await daemon.enablePlatform(desktop.platformType); // Ensure Desktop is valid before anything is cached.
+		await daemon.connect(physicalAndroidMobile, true);
+		assert.deepStrictEqual(dm.currentDevice, physicalAndroidMobile);
+
+		// Connecting desktop does change the selected device.
+		privateApi.context.workspaceLastFlutterDeviceId = desktop.id;
+		await daemon.connect(desktop, true);
+		assert.deepStrictEqual(dm.currentDevice, desktop);
+	});
+
+	it("shows unsupported platforms, runs flutter create, and selects", async () => {
 		await daemon.connect(desktop, false);
-		const devices = dm.getPickableDevices(["android"]);
+		const devices = dm.getPickableDevices(["android"], undefined, undefined);
 		const d = devices.find((e) => "device" in e && e.device.type === "platform-enabler" && e.device.platformType === "macos") as PickableDevice | undefined;
 
 		if (!d)
@@ -205,38 +244,132 @@ describe("device_manager", () => {
 
 		assert.equal(d.label, `Enable macos for this project`);
 
-		const runCreatePrompt = sb.stub(window, "showInformationMessage")
-			.withArgs(runFlutterCreatePrompt(desktop.platformType, false), sinon.match.any)
-			.resolves(yesAction);
-
 		const flutterCreateCommand = sb.stub(commands, "executeCommand")
 			.callThrough()
 			.withArgs("_flutter.create").resolves();
 
 		await dm.selectDevice(d);
 
-		// Check we prompted, and when we said yes, we called the command.
-		assert.equal(runCreatePrompt.called, true);
+		// Check we called the command.
 		assert.equal(flutterCreateCommand.called, true);
 
+		// Also ensure we selected this device afterwards.
+		assert.deepStrictEqual(dm.currentDevice, desktop);
+	});
+
+	it("tryGetSupportedPlatformTypes returns platformTypes", async () => {
+		daemon.supportedPlatforms = ["a", "b"];
+		const platforms = await dm.tryGetSupportedPlatformTypes("fake");
+		assert.deepStrictEqual(platforms, ["a", "b"]);
+	});
+
+	it("handles errors in tryGetSupportedPlatformTypes", async () => {
+		daemon.supportedPlatforms = ["a", "b"];
+		const platforms = await dm.tryGetSupportedPlatformTypes(""); // throws because falsy path
+		assert.equal(platforms, undefined);
+	});
+
+	it("handles unresponsive tryGetSupportedPlatformTypes", async () => {
+		daemon.supportedPlatforms = ["a", "b"];
+		daemon.supportedPlatformsDelaySeconds = 10;
+		const platforms = await dm.tryGetSupportedPlatformTypes("fake");
+		assert.equal(platforms, undefined);
+	});
+
+	it("fuzzy matches devices by ID", async () => {
+		const matchExactId = { id: "exact-id-match", name: "bad name", type: "device" } as f.Device;
+		const matchExactName = { id: "bad-id-1", name: "exact-name-match", type: "device" } as f.Device;
+		const matchIdStartsWith = { id: "starts-with-id-match", name: "bad name", type: "device" } as f.Device;
+		const matchNameStartsWith = { id: "bad-id-2", name: "starts-with-name-match", type: "device" } as f.Device;
+		const matchIdContains = { id: "bad-contains-id-match-bad", name: "bad name", type: "device" } as f.Device;
+		const matchNameContains = { id: "bad-id-3", name: "bad-contains-name-match-bad", type: "device" } as f.Device;
+
+		await daemon.connect(matchExactId, false);
+		await daemon.connect(matchExactName, false);
+		await daemon.connect(matchIdStartsWith, false);
+		await daemon.connect(matchNameStartsWith, false);
+		await daemon.connect(matchIdContains, false);
+		await daemon.connect(matchNameContains, false);
+
+		assert.equal(dm.findBestDevice("EXACT-ID-MATCH")?.id, matchExactId.id);
+		assert.equal(dm.findBestDevice("Exact-Name-Match")?.id, matchExactName.id);
+		assert.equal(dm.findBestDevice("STARTS-WITH")?.id, matchIdStartsWith.id);
+		assert.equal(dm.findBestDevice("Starts-With-Name")?.id, matchNameStartsWith.id);
+		assert.equal(dm.findBestDevice("CONTAINS-ID")?.id, matchIdContains.id);
+		assert.equal(dm.findBestDevice("Contains-Name")?.id, matchNameContains.id);
+	});
+
+	it("fuzzy matching prefers ID over name", async () => {
+		const matchIdContains2 = { id: "xx-fuzzy-match", name: "bad name", type: "device" } as f.Device;
+		const matchNameContains2 = { id: "bad-id-4", name: "xx-fuzzy-match", type: "device" } as f.Device;
+
+		await daemon.connect(matchIdContains2, false);
+		await daemon.connect(matchNameContains2, false);
+
+		assert.equal(dm.findBestDevice("FUZZY-MATCH")?.id, matchIdContains2.id);
+	});
+
+	it("fuzzy matches devices by Emulator ID", async () => {
+		const matchExactId = { id: "d1", emulatorId: "exact-id-match", name: "bad name", type: "device" } as f.Device;
+		const matchIdStartsWith = { id: "d3", emulatorId: "starts-with-id-match", name: "bad name", type: "device" } as f.Device;
+		const matchIdContains = { id: "d5", emulatorId: "xx-contains-id-match", name: "bad name", type: "device" } as f.Device;
+
+		await daemon.connect(matchExactId, false);
+		await daemon.connect(matchIdStartsWith, false);
+		await daemon.connect(matchIdContains, false);
+
+		assert.equal(dm.findBestEmulatorDevice("EXACT-ID-MATCH")?.id, matchExactId.id);
+		assert.equal(dm.findBestEmulatorDevice("STARTS-WITH")?.id, matchIdStartsWith.id);
+		assert.equal(dm.findBestEmulatorDevice("CONTAINS-ID")?.id, matchIdContains.id);
+	});
+
+	it("fuzzy matches emulators by ID and Name", async () => {
+		const matchExactId = { id: "exact-match", name: "bad name", category: "mobile", platformType: "android" } as f.FlutterEmulator;
+		const matchExactName = { id: "bad-id-1", name: "exact-match", category: "mobile", platformType: "android" } as f.FlutterEmulator;
+		const matchIdStartsWith = { id: "exact-match-starts-with", name: "bad name", category: "mobile", platformType: "android" } as f.FlutterEmulator;
+		const matchNameStartsWith = { id: "bad-id-2", name: "exact-match-starts-with", category: "mobile", platformType: "android" } as f.FlutterEmulator;
+		const matchIdContains = { id: "contains-exact-match-contains", name: "bad name", category: "mobile", platformType: "android" } as f.FlutterEmulator;
+		const matchNameContains = { id: "bad-id-3", name: "contains-exact-match-contains", category: "mobile", platformType: "android" } as f.FlutterEmulator;
+
+		daemon.emulators = [matchExactId, matchExactName, matchIdStartsWith, matchNameStartsWith, matchIdContains, matchNameContains];
+		assert.equal((await dm.findBestEmulator("EXACT-MATCH"))?.id, matchExactId.id);
+
+		daemon.emulators = [matchExactName, matchIdStartsWith, matchNameStartsWith, matchIdContains, matchNameContains];
+		assert.equal((await dm.findBestEmulator("Exact-Match"))?.id, matchExactName.id);
+
+		daemon.emulators = [matchIdStartsWith, matchNameStartsWith, matchIdContains, matchNameContains];
+		assert.equal((await dm.findBestEmulator("EXACT-MATCH"))?.id, matchIdStartsWith.id);
+
+		daemon.emulators = [matchNameStartsWith, matchIdContains, matchNameContains];
+		assert.equal((await dm.findBestEmulator("Exact-Match"))?.id, matchNameStartsWith.id);
+
+		daemon.emulators = [matchIdContains, matchNameContains];
+		assert.equal((await dm.findBestEmulator("EXACT-MATCH"))?.id, matchIdContains.id);
+
+		daemon.emulators = [matchNameContains];
+		assert.equal((await dm.findBestEmulator("Exact-Match"))?.id, matchNameContains.id);
 	});
 });
 
 class FakeFlutterDaemon extends FakeProcessStdIOService<unknown> implements IFlutterDaemon {
 	public capabilities = DaemonCapabilities.empty;
 	public supportedPlatforms: f.PlatformType[] | undefined;
+	public supportedPlatformsDelaySeconds: number | undefined;
 
-	public async enablePlatformGlobally(platformType: string): Promise<void> { }
+	public async enablePlatformGlobally(_platformType: string): Promise<void> { }
 
-	public async checkIfPlatformGloballyDisabled(platformType: string): Promise<boolean> {
+	public async enablePlatform(platformType: string): Promise<void> {
+		this.supportedPlatforms = this.supportedPlatforms ?? [];
+		this.supportedPlatforms.push(platformType);
+	}
+
+	public async checkIfPlatformGloballyDisabled(_platformType: string): Promise<boolean> {
 		return false;
 	}
 
 	public async connect(d: f.Device, markTypeAsValid: boolean): Promise<void> {
-		if (markTypeAsValid && d.platformType) {
-			this.supportedPlatforms = this.supportedPlatforms ?? [];
-			this.supportedPlatforms.push(d.platformType);
-		}
+		if (markTypeAsValid && d.platformType)
+			await this.enablePlatform(d.platformType);
 
 		await this.notify(this.deviceAddedSubscriptions, d);
 	}
@@ -259,20 +392,32 @@ class FakeFlutterDaemon extends FakeProcessStdIOService<unknown> implements IFlu
 	public deviceEnable(): Thenable<UnknownResponse> {
 		throw new Error("Method not implemented.");
 	}
+	public emulators: f.FlutterEmulator[] = [androidEmulator, androidBogusEmulatorId, androidBogusEmulatorName, androidEmulatorToOverride];
+
 	public async getEmulators(): Promise<f.FlutterEmulator[]> {
-		return [androidEmulator, androidEmulatorToOverride];
+		return this.emulators;
 	}
-	public launchEmulator(emulatorId: string): Thenable<void> {
+	public launchEmulator(_emulatorId: string): Thenable<void> {
 		throw new Error("Method not implemented.");
 	}
-	public createEmulator(name?: string): Thenable<{ success: boolean; emulatorName: string; error: string; }> {
+	public createEmulator(_name?: string): Thenable<{ success: boolean; emulatorName: string; error: string; }> {
 		throw new Error("Method not implemented.");
 	}
 	public async getSupportedPlatforms(projectRoot: string): Promise<f.SupportedPlatformsResponse> {
 		if (!projectRoot)
 			throw new Error("projectRoot must be specified!");
 
-		return { platforms: this.supportedPlatforms ?? ["android", "ios"] };
+		if (this.supportedPlatformsDelaySeconds)
+			await delay(this.supportedPlatformsDelaySeconds * 1000);
+
+		const platformTypes = Object.fromEntries(
+			[
+				...(this.supportedPlatforms ?? ["android", "ios"]).map((p) => [p, { isSupported: true }]),
+				// Include a dumym platform that is not enabled, to ensure we handled isSupported !== true correctly.
+				["dummy-platform", { isSupported: false }]
+			]
+		);
+		return { platformTypes };
 	}
 
 	public async serveDevTools(): Promise<f.ServeDevToolsResponse> {
@@ -372,16 +517,18 @@ const androidEmulatorToOverride: f.FlutterEmulator = {
 	platformType: "android",
 };
 
-const physicaliOSMobile: f.Device = {
+const androidBogusEmulatorName: f.FlutterEmulator = {
 	category: "mobile",
-	emulator: false,
-	emulatorId: undefined,
-	ephemeral: true,
-	id: "my-iphone",
-	name: "My iPhone",
-	platform: "ios-x64",
-	platformType: "ios",
-	type: "device",
+	id: "my_bogus_emulator",
+	name: "INFO     | my error message https://github.com/Dart-Code/Dart-Code/issues/5052",
+	platformType: "android",
+};
+
+const androidBogusEmulatorId: f.FlutterEmulator = {
+	category: "mobile",
+	id: "INFO     | my_bogus_emulator",
+	name: "My bogus emulator",
+	platformType: "android",
 };
 
 const emulatediOSMobile: f.Device = {
@@ -394,13 +541,6 @@ const emulatediOSMobile: f.Device = {
 	platform: "ios-something",
 	platformType: "ios",
 	type: "device",
-};
-
-const iOSEmulator: f.FlutterEmulator = {
-	category: "mobile",
-	id: "my_emulator_id",
-	name: "My Cool iOS Emulator!",
-	platformType: "ios",
 };
 
 const customEmulator1: CustomEmulatorDefinition = {

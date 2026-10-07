@@ -1,7 +1,38 @@
-import { IndentAction, LanguageConfiguration, OnEnterRule } from "vscode";
+import { IndentAction, LanguageConfiguration, languages, OnEnterRule, workspace } from "vscode";
+import { IAmDisposable } from "../../shared/interfaces";
 import { config } from "../config";
 
 export class DartLanguageConfiguration implements LanguageConfiguration {
+	public static register(language: string): IAmDisposable {
+		// Track the current active subscription for the language config.
+		let subscription: IAmDisposable | undefined;
+
+		// Helper to register the current language config, unregistering
+		// any existing config first.
+		const register = () => {
+			subscription?.dispose();
+			subscription = languages.setLanguageConfiguration(language, new DartLanguageConfiguration());
+		};
+
+		// Watch the config and re-register any time the automaticCommentSlashes setting changes.
+		const configWatcher = workspace.onDidChangeConfiguration((e) => {
+			if (e.affectsConfiguration("dart.automaticCommentSlashes"))
+				register();
+		});
+
+		// Perform initial registration.
+		register();
+
+		// Return a wrapper that disposes both the config watcher and the current active
+		// config.
+		return {
+			dispose: () => {
+				configWatcher.dispose();
+				subscription?.dispose();
+			},
+		};
+	}
+
 	private readonly doubleSlashRules: OnEnterRule[] = [
 		{
 			// Double-slash with space.
@@ -54,22 +85,22 @@ export class DartLanguageConfiguration implements LanguageConfiguration {
 			// When between "/** | */" this puts a " * " in but also pushes the "*/" down to next line.
 			action: { indentAction: IndentAction.IndentOutdent, appendText: " * " },
 			afterText: /^\s*\*\/$/,
-			beforeText: /^\s*\/\*\*(?!\/)([^\*]|\*(?!\/))*$/,
+			beforeText: /^\s*\/\*\*(?!\/)([^*]|\*(?!\/))*$/,
 		},
 		{
 			// When after "/**" will put a " * " in (like above, but where there's no "*/" to push down).
 			action: { indentAction: IndentAction.None, appendText: " * " },
-			beforeText: /^\s*\/\*\*(?!\/)([^\*]|\*(?!\/))*$/,
+			beforeText: /^\s*\/\*\*(?!\/)([^*]|\*(?!\/))*$/,
 		},
 		{
 			// Continue " * " when on a line already start with this.
 			action: { indentAction: IndentAction.None, appendText: "* " },
-			beforeText: /^(\t|(\ \ ))*\ \*(\ ([^\*]|\*(?!\/))*)?$/,
+			beforeText: /^(\t|( {2}))* \*( ([^*]|\*(?!\/))*)?$/,
 		},
 		{
 			// After "*/" we need to remove the indent.
 			action: { indentAction: IndentAction.None, removeText: 1 },
-			beforeText: /^(\t|(\ \ ))*\ \*\/\s*$/,
+			beforeText: /^(\t|( {2}))* \*\/\s*$/,
 		},
 	];
 	private readonly tripleQuoteRules: OnEnterRule[] = [

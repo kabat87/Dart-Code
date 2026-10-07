@@ -7,7 +7,7 @@ import { LogCategory } from "../../shared/enums";
 import { internalApiSymbol } from "../../shared/symbols";
 import { fsPath } from "../../shared/utils/fs";
 import { InternalExtensionApi } from "../../shared/vscode/interfaces";
-import { activate, logger, waitForResult } from "../helpers";
+import { activate, activateWithoutAnalysis, logger, privateApi, waitForResult } from "../helpers";
 
 describe("flutter", () => {
 	beforeEach("activate", () => activate());
@@ -30,21 +30,21 @@ describe("flutter", () => {
 		const moduleProjectFolder = fsPath(vs.workspace.workspaceFolders![2].uri);
 		const pubspecFile = path.join(moduleProjectFolder, "pubspec.yaml");
 
-		await projectFileContainsExpectedString(pubspecFile, "description: A new flutter module project");
+		await projectFileContainsExpectedString(pubspecFile, "A new Flutter module project");
 	});
 
 	it("created a package project", async () => {
 		const packageProjectFolder = fsPath(vs.workspace.workspaceFolders![3].uri);
 		const pubspecFile = path.join(packageProjectFolder, "pubspec.yaml");
 
-		await projectFileContainsExpectedString(pubspecFile, "description: A new Flutter package project");
+		await projectFileContainsExpectedString(pubspecFile, "A new Flutter package project");
 	});
 
 	it("created a plugin project", async () => {
 		const pluginProjectFolder = fsPath(vs.workspace.workspaceFolders![4].uri);
 		const pubspecFile = path.join(pluginProjectFolder, "pubspec.yaml");
 
-		await projectFileContainsExpectedString(pubspecFile, "description: A new flutter plugin project");
+		await projectFileContainsExpectedString(pubspecFile, "A new Flutter plugin project");
 	});
 
 	it("triggered Flutter mode", async () => {
@@ -56,6 +56,20 @@ describe("flutter", () => {
 		assert.equal(api.workspaceContext.hasAnyFlutterProjects, true);
 	});
 
+	it("used the correct output channel name", async () => {
+		await activateWithoutAnalysis(null);
+
+		const channels = privateApi.getOutputChannelNames();
+		assert.deepStrictEqual(channels, [
+			"flutter (package:flutter_create_basic)",
+			"flutter (package:flutter_create_module)",
+			"flutter (package:flutter_create_package)",
+			"flutter (package:flutter_create_plugin)",
+			"flutter (package:sample (flutter_create_sample))",
+			"flutter daemon",
+			"flutter initialization",
+		]);
+	});
 });
 
 async function projectFileContainsExpectedString(fileToCheck: string, expectedString: string): Promise<void> {
@@ -68,12 +82,12 @@ async function projectFileContainsExpectedString(fileToCheck: string, expectedSt
 	const lowerExpectedString = expectedString.toLowerCase();
 	await waitForResult(() => {
 		const contents = fs.readFileSync(fileToCheck).toString().toLowerCase();
-		return contents.indexOf(lowerExpectedString) !== -1;
+		return contents.includes(lowerExpectedString);
 		// This timeout needs to be quite high because Flutter creates the project first, then later overwrites the code
 		// so we may see the original content for a little while.
 	}, undefined, 30000, false); // Don't throw on failure as we have a better assert below that can include the contents.
 
 	const contents = fs.readFileSync(fileToCheck).toString().toLowerCase();
-	if (contents.indexOf(lowerExpectedString) === -1)
+	if (!contents.includes(lowerExpectedString))
 		assert.fail(`Did not find "${expectedString}'" in the file (${fileToCheck}):\n\n${contents}`);
 }

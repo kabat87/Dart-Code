@@ -26,42 +26,10 @@ export interface DaemonConnected {
 	pid: number;
 }
 
-export interface AppStart extends AppEvent {
-	deviceId: string;
-	directory: string;
-	supportsRestart?: boolean;
-}
-
-export interface AppEvent {
-	appId: string;
-}
-
-export interface AppDebugPort extends AppEvent {
-	wsUri: string;
-	baseUri?: string;
-}
-
-export interface AppProgress extends AppEvent {
-	message?: string;
-	finished?: boolean;
-	id: number;
-	progressId: string;
-}
-
-export interface AppWebLaunchUrl extends AppEvent {
-	url: string;
-	launched: boolean;
-}
-
 export interface DaemonLogMessage {
 	level: "info" | "warning" | "error";
 	message: string;
 	stackTrace?: string;
-}
-
-export interface AppLog {
-	error: boolean;
-	log: string;
 }
 
 export interface DaemonLog {
@@ -76,7 +44,8 @@ export interface ShowMessage {
 }
 
 export interface SupportedPlatformsResponse {
-	platforms: PlatformType[];
+	platforms?: PlatformType[]; // Legacy, removed in https://github.com/flutter/flutter/issues/140473
+	platformTypes: Record<PlatformType, { isSupported: boolean }> | undefined; // Supported since 2023
 }
 
 export interface ServeDevToolsResponse {

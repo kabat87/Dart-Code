@@ -1,6 +1,6 @@
 import { strict as assert } from "assert";
 import * as vs from "vscode";
-import { activate, ensureCompletion, extApi, flutterHelloWorldMainFile, getCompletionsAt, getPackages, openFile, setTestContent } from "../../helpers";
+import { activate, completionLabel, ensureCompletion, flutterHelloWorldCounterAppFile, flutterHelloWorldMainFile, getCompletionsAt, getPackages, openFile, privateApi, setTestContent } from "../../helpers";
 
 describe("completion_item_provider", () => {
 
@@ -10,29 +10,40 @@ describe("completion_item_provider", () => {
 
 	it("includes expected completions", async () => {
 		await openFile(flutterHelloWorldMainFile);
-		await extApi.currentAnalysis();
-		const completions = await getCompletionsAt("return ^Text");
+		await privateApi.currentAnalysis();
+		const completions = await getCompletionsAt("return T^ext");
 
 		ensureCompletion(completions, vs.CompletionItemKind.Constructor, "Text(…)", "Text");
 		ensureCompletion(completions, vs.CompletionItemKind.Constructor, "Text.rich(…)", "Text.rich");
 	});
 
-	describe("with SuggestionSet support", () => {
-		beforeEach("ensure SuggestionSets are supported", function () {
-			if (extApi.analyzerCapabilities && !extApi.analyzerCapabilities.supportsAvailableSuggestions)
-				this.skip();
-		});
+	it("includes an icon preview in resolved icon completions", async () => {
+		await openFile(flutterHelloWorldCounterAppFile);
+		const completions = await getCompletionsAt("Icons.add^", { resolveCount: 100 });
+		const completion = ensureCompletion(completions, vs.CompletionItemKind.Field, "add");
+		const documentation = (completion.documentation as vs.MarkdownString).value;
 
+		assert.match(documentation, /!\[add\]\(.+\/media\/doc-icons\/material\/add%402x\.png\|width=32,height=32\)/);
+	});
+
+	describe("with not-imported completions", () => {
 		it("includes overlapping unimported symbols from multiple files", async () => {
 			await setTestContent(`
 main() {
 	EdgeInsetsDirecti
 }
 		`);
-			const completions = await getCompletionsAt("EdgeInsetsDirecti^");
-			const edgeInsetsCompletions = completions.filter((c) => c.label === "EdgeInsetsDirectional");
+			const completions = await getCompletionsAt("EdgeInsetsDirecti^", { requireComplete: true });
+			const edgeInsetsCompletions = completions.filter((c) => completionLabel(c) === "EdgeInsetsDirectional");
 			// We should get at least 5 because it's in rendering, painting, widgets, material, cupertino.
-			assert.equal(edgeInsetsCompletions.length >= 5, true);
+			assert.equal(
+				edgeInsetsCompletions.length >= 5,
+				true,
+				[
+					"Expected at least 5 EdgeInsetsDirectional completions (rendering, painting, widgets, material, cupertino) but only found:",
+					...edgeInsetsCompletions.map(completionLabel),
+				].join("\n    "),
+			);
 		});
 
 		it("does not include overlapping unimported symbols from multiple files if one is already imported", async () => {
@@ -44,7 +55,7 @@ main() {
 }
 		`);
 			const completions = await getCompletionsAt("EdgeInsetsDirecti^");
-			const edgeInsetsCompletions = completions.filter((c) => c.label === "EdgeInsetsDirectional");
+			const edgeInsetsCompletions = completions.filter((c) => completionLabel(c) === "EdgeInsetsDirectional");
 			// We should only get one from the already imported file.
 			assert.equal(edgeInsetsCompletions.length, 1);
 		});
@@ -54,11 +65,13 @@ main() {
 import 'package:flutter/material.dart';
 
 main() {
-	var a = TextOverflo
+  Text(
+    overflow: TextOverflo
+  );
 }
 		`);
 			const completions = await getCompletionsAt("TextOverflo^");
-			const clipCompletion = completions.filter((c) => c.label === "TextOverflow.clip");
+			const clipCompletion = completions.filter((c) => completionLabel(c) === "TextOverflow.clip");
 			// We should only get one from the already imported file.
 			assert.equal(clipCompletion.length, 1);
 		});
@@ -68,7 +81,7 @@ main() {
 import 'package:flutter/rendering.dart';
 
 main() {
-  ProcessInf
+  ProcessRes
 }
 		`);
 			const count = 50;
@@ -79,8 +92,8 @@ main() {
 				const startMemoryInner = process.memoryUsage();
 				const startTimeInner = Date.now();
 
-				const completions = await getCompletionsAt("ProcessInf^");
-				ensureCompletion(completions, vs.CompletionItemKind.Class, "ProcessInfo", "ProcessInfo");
+				const completions = await getCompletionsAt("ProcessRes^");
+				ensureCompletion(completions, vs.CompletionItemKind.Class, "ProcessResult", "ProcessResult");
 
 				const heapChangeMbs = (process.memoryUsage().heapUsed - startMemoryInner.heapUsed) / 1024 / 1024;
 				console.log(`Iteration #${i < 10 ? " " : ""}${i} took ${Date.now() - startTimeInner} ms to return ${completions.length} results, heap change was ${Math.round(heapChangeMbs)} MB`);

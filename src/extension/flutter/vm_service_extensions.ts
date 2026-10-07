@@ -1,15 +1,16 @@
 import * as vs from "vscode";
-import { isWin } from "../../shared/constants";
+import { FlutterCapabilities } from "../../shared/capabilities/flutter";
+import { isDartCodeTestRun, isWin } from "../../shared/constants";
+import { SERVICE_CONTEXT_PREFIX, SERVICE_EXTENSION_CONTEXT_PREFIX } from "../../shared/constants.contexts";
 import { VmService, VmServiceExtension } from "../../shared/enums";
 import { Logger } from "../../shared/interfaces";
-import { getAllProjectFolders } from "../../shared/vscode/utils";
+import { fsPath } from "../../shared/utils/fs";
+import { DartDebugSessionInformation } from "../../shared/vscode/interfaces";
+import { getDartWorkspaceFolders } from "../../shared/vscode/utils";
+import { WorkspaceContext } from "../../shared/workspace";
 import { DebugCommands, debugSessions } from "../commands/debug";
-import { config } from "../config";
-import { SERVICE_CONTEXT_PREFIX, SERVICE_EXTENSION_CONTEXT_PREFIX } from "../extension";
-import { getExcludedFolders } from "../utils";
-import { DartDebugSessionInformation } from "../utils/vscode/debug";
 
-export const IS_INSPECTING_WIDGET_CONTEXT = "dart-code:flutter.isInspectingWidget";
+const IS_INSPECTING_WIDGET_CONTEXT = "dart-code:flutter.isInspectingWidget";
 
 const keyTimeDilation = "timeDilation";
 const keyEnabled = "enabled";
@@ -21,10 +22,9 @@ const keyValue = "value";
 ///     { enabled: true }
 ///
 /// This map tracks the name of the key for a given extension.
-const toggleExtensionStateKeys: { [key: string]: string } = {
+const toggleExtensionStateKeys: Record<string, string> = {
 	[VmServiceExtension.PlatformOverride]: keyValue,
 	[VmServiceExtension.DebugBanner]: keyEnabled,
-	[VmServiceExtension.CheckElevations]: keyEnabled,
 	[VmServiceExtension.DebugPaint]: keyEnabled,
 	[VmServiceExtension.PaintBaselines]: keyEnabled,
 	[VmServiceExtension.InspectorSelectMode]: keyEnabled,
@@ -37,18 +37,22 @@ const toggleExtensionStateKeys: { [key: string]: string } = {
 export const timeDilationNormal = 1.0;
 export const timeDilationSlow = 5.0;
 
-export interface ServiceExtensionArgs { type: VmServiceExtension; params: any; }
 
 /// Manages state for (mostly Flutter) VM service extensions.
 export class VmServiceExtensions {
-	private registeredServices: { [x in VmService]?: string } = {};
+	private registeredServices: Partial<Record<VmService, string>> = {};
 	private loadedServiceExtensions: VmServiceExtension[] = [];
 	private readonly loadedServiceExtensionIsolateIds = new Map<VmServiceExtension, string>();
 	/// Extension values owned by us. If someone else updates a value, we should
 	/// remove it from here.
-	private currentExtensionValues: { [key: string]: any } = {};
+	private currentExtensionValues: Record<string, unknown> = {};
 
-	constructor(private readonly logger: Logger, private readonly debugCommands: DebugCommands) {
+	constructor(
+		private readonly logger: Logger,
+		private readonly debugCommands: DebugCommands,
+		private readonly workspaceContext: WorkspaceContext,
+		private readonly flutterCapabilities: FlutterCapabilities,
+	) {
 		this.debugCommands.onWillHotRestart(() => this.markAllServiceExtensionsUnloaded());
 	}
 
@@ -57,26 +61,29 @@ export class VmServiceExtensions {
 		if (e.event === "dart.serviceExtensionAdded") {
 			this.handleServiceExtensionLoaded(session, e.body.extensionRPC as VmServiceExtension, e.body.isolateId as string | null | undefined);
 
-			try {
-				if (e.body.extensionRPC === VmServiceExtension.InspectorSetPubRootDirectories) {
-					const projectFolders = await getAllProjectFolders(this.logger, getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
+			const useAddPubRootDirectories = this.flutterCapabilities.supportsAddPubRootDirectories;
+			const pubRootDirectoriesService = useAddPubRootDirectories
+				? VmServiceExtension.InspectorAddPubRootDirectories
+				: VmServiceExtension.InspectorSetPubRootDirectories;
 
-					const params: { [key: string]: string } = {
+			try {
+				if (e.body.extensionRPC === pubRootDirectoriesService) {
+					const params: Record<string, string> = {
 						// TODO: Is this OK???
 						isolateId: e.body.isolateId,
 					};
 
 					let argNum = 0;
-					for (const projectFolder of projectFolders) {
-						params[`arg${argNum++}`] = projectFolder;
-						if (isWin)
-							params[`arg${argNum++}`] = this.formatPathForPubRootDirectories(projectFolder);
+					for (const workspaceFolder of getDartWorkspaceFolders()) {
+						params[`arg${argNum++}`] = this.formatPathForPubRootDirectories(fsPath(workspaceFolder.uri));
 					}
 
-					await this.callServiceExtension(e.session, VmServiceExtension.InspectorSetPubRootDirectories, params);
+					await this.callServiceExtension(e.session, pubRootDirectoriesService, params);
 				}
 			} catch (e) {
-				this.logger.error(e);
+				if (!this.shouldSilenceError(e)) {
+					this.logger.error(e);
+				}
 			}
 		} else if (e.event === "dart.serviceRegistered") {
 			this.handleServiceRegistered(e.body.service as VmService, e.body.method as string);
@@ -85,12 +92,24 @@ export class VmServiceExtensions {
 		}
 	}
 
-	// TODO: Remove this function (and the call to it) once the fix has rolled to Flutter beta.
-	// https://github.com/flutter/flutter-intellij/issues/2217
+	private shouldSilenceError(e: any): boolean {
+		return !!(isDartCodeTestRun && "message" in e && typeof e.message === "string" && e.message.includes("Service connection disposed"));
+	}
+
 	private formatPathForPubRootDirectories(path: string): string {
-		return isWin
-			? path && `file:///${path.replace(/\\/g, "/")}`
-			: path;
+		if (isWin) {
+			return `file:///${path.replace(/\\/g, "/")}`;
+		}
+
+		// TODO(helin24): Use DDS for this translation.
+		const search = "/google3/";
+		if (this.workspaceContext.config.forceFlutterWorkspace && path.startsWith("/google") && path.includes(search)) {
+			const idx = path.indexOf(search);
+			const remainingPath = path.substring(idx + search.length);
+			return `google3:///${remainingPath}`;
+		}
+
+		return path;
 	}
 
 	public async overridePlatform() {
@@ -109,7 +128,7 @@ export class VmServiceExtensions {
 
 	/// Toggles between two values. Always picks the value1 if the current value
 	/// is not already value1 (eg. if it's neither of those, it'll pick val1).
-	public async toggle(id: VmServiceExtension, val1: any = true, val2: any = false): Promise<void> {
+	public async toggle(id: VmServiceExtension, val1: unknown = true, val2: unknown = false): Promise<void> {
 		/// Helper that toggles for one session.
 		const toggleForSession = async (session: DartDebugSessionInformation) => {
 			const newValue = val1 === val2
@@ -124,7 +143,7 @@ export class VmServiceExtensions {
 		await Promise.all(debugSessions.map((session) => toggleForSession(session).catch((e) => this.logger.error(e))));
 	}
 
-	public async getCurrentServiceExtensionValue(session: vs.DebugSession, method: VmServiceExtension) {
+	public async getCurrentServiceExtensionValue(session: vs.DebugSession, method: VmServiceExtension): Promise<unknown> {
 		const responseBody = await this.callServiceExtension(session, method);
 		return this.extractServiceValue(responseBody[toggleExtensionStateKeys[method]]);
 	}
@@ -134,7 +153,7 @@ export class VmServiceExtensions {
 		await this.callServiceExtension(session, method, params);
 	}
 
-	private async callServiceExtension(session: vs.DebugSession, method: VmServiceExtension, params?: any) {
+	private async callServiceExtension(session: vs.DebugSession, method: VmServiceExtension, params?: any): Promise<any> {
 		if (!params?.isolateId) {
 			params = params || {};
 			params.isolateId = this.loadedServiceExtensionIsolateIds.get(method);
@@ -142,15 +161,17 @@ export class VmServiceExtensions {
 		return await session.customRequest("callService", { method, params });
 	}
 
-	private syncContextStates(id: string, value: any) {
+	private syncContextStates(id: string, value: unknown) {
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-enum-comparison
 		if (id === VmServiceExtension.InspectorSelectMode) {
 			/// Keep the context in sync so that the "Cancel Inspect Widget" command is enabled/disabled.
-			vs.commands.executeCommand("setContext", IS_INSPECTING_WIDGET_CONTEXT, !!value);
+			void vs.commands.executeCommand("setContext", IS_INSPECTING_WIDGET_CONTEXT, !!value);
+			this.debugCommands.isInspectingWidget = !!value;
 		}
 	}
 
 	/// Handles updates that come from the VM (eg. were updated by another tool).
-	private handleRemoteValueUpdate(id: string, value: any) {
+	private handleRemoteValueUpdate(id: string, value: unknown) {
 		this.syncContextStates(id, value);
 
 		// Don't try to process service extension we don't know about.
@@ -165,7 +186,7 @@ export class VmServiceExtensions {
 			delete this.currentExtensionValues[id];
 	}
 
-	private extractServiceValue(value: any) {
+	private extractServiceValue(value: unknown): unknown {
 		// HACK: Everything comes through as strings, but we need bools/ints and sometimes strings,
 		// so attempt to parse it, but keep the original string in the case of failure.
 		if (typeof value === "string") {
@@ -184,9 +205,9 @@ export class VmServiceExtensions {
 	}
 
 	/// Tracks registered services and updates contexts to enable VS Code commands.
-	private handleServiceRegistered(service: VmService, method: string) {
+	public handleServiceRegistered(service: VmService, method: string) {
 		this.registeredServices[service] = method;
-		vs.commands.executeCommand("setContext", `${SERVICE_CONTEXT_PREFIX}${service}`, true);
+		void vs.commands.executeCommand("setContext", `${SERVICE_CONTEXT_PREFIX}${service}`, true);
 	}
 
 	/// Tracks loaded service extensions and updates contexts to enable VS Code commands.
@@ -195,7 +216,7 @@ export class VmServiceExtensions {
 		this.loadedServiceExtensions.push(extensionRPC);
 		if (isolateId)
 			this.loadedServiceExtensionIsolateIds.set(extensionRPC, isolateId);
-		vs.commands.executeCommand("setContext", `${SERVICE_EXTENSION_CONTEXT_PREFIX}${extensionRPC}`, true);
+		void vs.commands.executeCommand("setContext", `${SERVICE_EXTENSION_CONTEXT_PREFIX}${extensionRPC}`, true);
 
 		// If this extension is one we have an override value for, then this must be the extension loading
 		// for a new isolate (perhaps after a restart), so send its value.
@@ -204,14 +225,19 @@ export class VmServiceExtensions {
 		const value = this.currentExtensionValues[extensionRPC];
 		const hasValue = value !== undefined;
 
-		if (isTogglableService && hasValue)
-			this.sendExtensionValue(session.session, extensionRPC, value).catch((e) => this.logger.error(e));
+		if (isTogglableService && hasValue) {
+			this.sendExtensionValue(session.session, extensionRPC, value).catch((e) => {
+				if (!this.shouldSilenceError(e)) {
+					this.logger.error(e);
+				}
+			});
+		}
 	}
 
 	/// Marks all services as not-loaded (happens after session ends).
 	public markAllServicesUnloaded() {
 		for (const id of Object.keys(this.registeredServices)) {
-			vs.commands.executeCommand("setContext", `${SERVICE_CONTEXT_PREFIX}${id}`, undefined);
+			void vs.commands.executeCommand("setContext", `${SERVICE_CONTEXT_PREFIX}${id}`, undefined);
 		}
 		this.registeredServices = {};
 	}
@@ -219,7 +245,7 @@ export class VmServiceExtensions {
 	/// Marks all service extensions as not-loaded (happens after session ends or after hot restart).
 	public markAllServiceExtensionsUnloaded() {
 		for (const id of this.loadedServiceExtensions) {
-			vs.commands.executeCommand("setContext", `${SERVICE_EXTENSION_CONTEXT_PREFIX}${id}`, undefined);
+			void vs.commands.executeCommand("setContext", `${SERVICE_EXTENSION_CONTEXT_PREFIX}${id}`, undefined);
 		}
 		this.loadedServiceExtensions.length = 0;
 		this.loadedServiceExtensionIsolateIds.clear();

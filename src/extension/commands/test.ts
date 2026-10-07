@@ -1,43 +1,47 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as vs from "vscode";
+import { URI } from "vscode-uri";
+import { DartCapabilities } from "../../shared/capabilities/dart";
+import { DartTestCapabilities } from "../../shared/capabilities/dart_test";
 import { FlutterCapabilities } from "../../shared/capabilities/flutter";
 import { noAction } from "../../shared/constants";
-import { TestStatus } from "../../shared/enums";
-import { Logger } from "../../shared/interfaces";
-import { GroupNode, SuiteData, SuiteNode, TestModel, TestNode, TreeNode } from "../../shared/test/test_model";
+import { IAmDisposable, Logger } from "../../shared/interfaces";
+import { RunnableTreeNode, SuiteData, SuiteNode, TestNode, TreeNode } from "../../shared/test/test_model";
+import { getPackageTestCapabilitiesForDartProject } from "../../shared/test/version";
 import { disposeAll, escapeDartString, generateTestNameFromFileName, uniq } from "../../shared/utils";
 import { sortBy } from "../../shared/utils/array";
-import { fsPath, isWithinPath, mkDirRecursive } from "../../shared/utils/fs";
-import { TestOutlineInfo } from "../../shared/utils/outline_das";
-import { createTestFileAction, defaultTestFileContents, getLaunchConfig, TestName } from "../../shared/utils/test";
+import { fsPath, getPackageName, isWithinPath, mkDirRecursive, uriComparisonString } from "../../shared/utils/fs";
+import { TestOutlineInfo } from "../../shared/utils/outline";
+import { TestSelection, createTestFileAction, defaultTestFileContents, getLaunchConfig, getTestSelectionForNodes, getTestSelectionForOutline } from "../../shared/utils/test";
 import { getLaunchConfigDefaultTemplate } from "../../shared/vscode/debugger";
+import { getActiveRealFileEditor, isDartDocument } from "../../shared/vscode/editors";
+import { locateBestProjectRoot } from "../../shared/vscode/project";
 import { getAllProjectFolders } from "../../shared/vscode/utils";
 import { WorkspaceContext } from "../../shared/workspace";
 import { config } from "../config";
-import { getActiveRealFileEditor, isDartDocument } from "../editors";
 import { VsCodeTestController } from "../test/vs_test_controller";
-import { ensureDebugLaunchUniqueId, getExcludedFolders, isInsideFlutterProject, isInsideFolderNamed, isTestFile } from "../utils";
+import { ensureDebugLaunchUniqueId, getExcludedFolders, isInsideFlutterProject, isInsideFolderNamed, isPathInsideFlutterProject, isTestFile } from "../utils";
 
 const CAN_JUMP_BETWEEN_TEST_IMPLEMENTATION = "dart-code:canGoToTestOrImplementationFile";
 // HACK: Used for testing since we can't read contexts?
 export let isInTestFileThatHasImplementation = false;
 export let isInImplementationFileThatCanHaveTest = false;
 
-export type SuiteList = [SuiteNode, TestName[]];
 
-export class TestCommands implements vs.Disposable {
-	private disposables: vs.Disposable[] = [];
+export class TestCommands implements IAmDisposable {
+	private disposables: IAmDisposable[] = [];
 
-	constructor(protected readonly logger: Logger, private readonly testModel: TestModel, protected readonly wsContext: WorkspaceContext, private readonly vsCodeTestController: VsCodeTestController | undefined, protected readonly flutterCapabilities: FlutterCapabilities) {
+	constructor(protected readonly logger: Logger, protected readonly wsContext: WorkspaceContext, private readonly vsCodeTestController: VsCodeTestController | undefined, protected readonly dartCapabilities: DartCapabilities, protected readonly flutterCapabilities: FlutterCapabilities) {
 		this.disposables.push(
 			vs.commands.registerCommand("_dart.startDebuggingTestFromOutline", (test: TestOutlineInfo, launchTemplate: any | undefined) => this.startTestFromOutline(false, test, launchTemplate)),
 			vs.commands.registerCommand("_dart.startWithoutDebuggingTestFromOutline", (test: TestOutlineInfo, launchTemplate: any | undefined) => this.startTestFromOutline(true, test, launchTemplate)),
-			vs.commands.registerCommand("_dart.startDebuggingTestsFromVsTestController", (suiteData: SuiteData, treeNodes: Array<SuiteNode | GroupNode | TestNode>, suppressPromptOnErrors: boolean, testRun: vs.TestRun | undefined) => this.runTestsForNode(suiteData, this.getTestNamesForNodes(treeNodes), true, suppressPromptOnErrors, treeNodes.length === 1 && treeNodes[0] instanceof TestNode, undefined, testRun)),
-			vs.commands.registerCommand("_dart.startWithoutDebuggingTestsFromVsTestController", (suiteData: SuiteData, treeNodes: Array<SuiteNode | GroupNode | TestNode>, suppressPromptOnErrors: boolean, testRun: vs.TestRun | undefined) => this.runTestsForNode(suiteData, this.getTestNamesForNodes(treeNodes), false, suppressPromptOnErrors, treeNodes.length === 1 && treeNodes[0] instanceof TestNode, undefined, testRun)),
-			vs.commands.registerCommand("_dart.runAllTestsWithoutDebugging", (suites: SuiteNode[] | undefined, testRun: vs.TestRun | undefined, isRunningAll: boolean) => this.runAllTestsWithoutDebugging(suites, testRun, isRunningAll)),
+			vs.commands.registerCommand("_dart.startDebuggingTestsFromVsTestController", (suiteData: SuiteData, treeNodes: RunnableTreeNode[], suppressPrompts: boolean, includeCoverage: boolean, testRun: vs.TestRun | undefined, token?: vs.CancellationToken) => this.runTestsForNode(suiteData, treeNodes, true, suppressPrompts, treeNodes.length === 1 && treeNodes[0] instanceof TestNode, includeCoverage, token, testRun)),
+			vs.commands.registerCommand("_dart.startWithoutDebuggingTestsFromVsTestController", (suiteData: SuiteData, treeNodes: RunnableTreeNode[], suppressPrompts: boolean, includeCoverage: boolean, testRun: vs.TestRun | undefined, token?: vs.CancellationToken) => this.runTestsForNode(suiteData, treeNodes, false, suppressPrompts, treeNodes.length === 1 && treeNodes[0] instanceof TestNode, includeCoverage, token, testRun)),
+			vs.commands.registerCommand("_dart.runAllTestsWithoutDebugging", (suitesToRun: SuiteNode[] | undefined, nodesToExclude: TestNode[] | undefined, includeCoverage: boolean, testRun: vs.TestRun | undefined, isRunningAll: boolean) => this.runAllTestsWithoutDebugging(suitesToRun, nodesToExclude, includeCoverage, testRun, isRunningAll)),
 			vs.commands.registerCommand("dart.goToTests", (resource: vs.Uri | undefined) => this.goToTestOrImplementationFile(resource), this),
 			vs.commands.registerCommand("dart.goToTestOrImplementationFile", () => this.goToTestOrImplementationFile(), this),
+			vs.commands.registerCommand("dart.findTestOrImplementationFile", () => this.findTestOrImplementationFile(), this),
 			vs.window.onDidChangeActiveTextEditor((e) => this.updateEditorContexts(e)),
 		);
 
@@ -45,7 +49,7 @@ export class TestCommands implements vs.Disposable {
 		this.updateEditorContexts(vs.window.activeTextEditor);
 	}
 
-	private async runAllTestsWithoutDebugging(suites: SuiteNode[] | undefined, testRun: vs.TestRun | undefined, isRunningAll: boolean): Promise<void> {
+	private async runAllTestsWithoutDebugging(suites: SuiteNode[] | undefined, exclusions: TestNode[] | undefined, includeCoverage: boolean, testRun: vs.TestRun | undefined, isRunningAll: boolean): Promise<void> {
 		// To run multiple folders/suites, we can pass the first as `program` and the rest as `args` which
 		// will be appended immediately after `program`. However, this only works for things in the same project
 		// as the first one that runs will be used for resolving package: URIs etc. We also can't mix and match
@@ -63,31 +67,41 @@ export class TestCommands implements vs.Disposable {
 			return projectFolders.find((f) => isWithinPath(suitePath, f));
 		}
 
-		const projectsWithTests: Array<{ projectFolder: string, name: string, tests: string[] }> = [];
+		const projectsWithTests: Array<{ projectFolder: string, name: string, relativeTestPaths: string[] }> = [];
 		function addTestItemsForProject(projectFolder: string, integrationTests: boolean) {
 			if (!suites)
 				return;
 
 			let testPaths = suites
-				.map((suite) => suite.suiteData.path)
+				.map((suite) => suite.path)
 				.filter((suitePath) => isWithinPath(suitePath, projectFolder))
 				.filter((suitePath) => isInsideFolderNamed(suitePath, "integration_test") === integrationTests)
 				.filter((suitePath) => closestProjectFolder(suitePath) === projectFolder);
 
+			// If we might be running all, compute if there are any exclusions in this project. If not, we
+			// can drop passing all the test names to "dart test" and just run the whole top level folder.
+			const hasExclusions = isRunningAll && exclusions?.length && !!exclusions
+				.map((node) => node.suiteData.path)
+				.filter((suitePath) => isWithinPath(suitePath, projectFolder))
+				.filter((suitePath) => isInsideFolderNamed(suitePath, "integration_test") === integrationTests)
+				.find((suitePath) => closestProjectFolder(suitePath) === projectFolder);
 
 			if (testPaths.length) {
 				const projectName = path.basename(projectFolder);
 				const testType = integrationTests ? "Integration Tests" : "Tests";
 				const name = `${projectName} ${testType}`;
 
+				// Use relative paths.
+				testPaths = testPaths.map((suitePath) => path.relative(projectFolder, suitePath));
+
 				// To avoid making a huge list of suite names that may trigger
 				// "The command line is too long" on Windows, if we know we're running them
 				// _all_ we can simplify the list of test names to just the top-level folders
 				// that contain each.
-				if (isRunningAll)
-					testPaths = uniq(testPaths.map((suitePath) => path.relative(projectFolder, suitePath).split(path.sep)[0]));
+				if (isRunningAll && !hasExclusions)
+					testPaths = uniq(testPaths.map((suitePath) => suitePath.split(path.sep)[0]));
 
-				projectsWithTests.push({ projectFolder, name, tests: testPaths });
+				projectsWithTests.push({ projectFolder, name, relativeTestPaths: testPaths });
 			}
 		}
 
@@ -97,67 +111,119 @@ export class TestCommands implements vs.Disposable {
 		}
 
 		if (projectsWithTests.length === 0) {
-			vs.window.showErrorMessage("Unable to find any test folders");
+			void vs.window.showErrorMessage("Unable to find any test folders");
 			return;
 		}
 
-		await Promise.all(projectsWithTests.map((projectWithTests) => this.runTests({
-			debug: false,
-			launchTemplate: {
-				args: projectWithTests.tests.slice(1),
-				cwd: projectWithTests.projectFolder,
-				name: projectWithTests.name,
-			},
-			programPath: projectWithTests.tests[0],
-			shouldRunSkippedTests: false,
-			suppressPromptOnErrors: true,
-			testNames: undefined,
-			testRun,
-			token: undefined,
-			useLaunchJsonTestTemplate: true,
-		})));
+		await Promise.all(
+			projectsWithTests.map((projectWithTests) => this.runTests({
+				debug: false,
+				includeCoverage,
+				isFlutter: undefined, // unknown, runTests will compute
+				launchTemplate: {
+					args: projectWithTests.relativeTestPaths.slice(1),
+					cwd: projectWithTests.projectFolder,
+					name: projectWithTests.name,
+				},
+				programPath: path.join(projectWithTests.projectFolder, projectWithTests.relativeTestPaths[0]),
+				shouldRunSkippedTests: false,
+				suppressPrompts: suites?.length !== 1,
+				testRun,
+				testSelection: undefined,
+				token: undefined,
+				useLaunchJsonTestTemplate: true,
+			}))
+		);
 	}
 
-	private async runTestsForNode(suiteData: SuiteData, testNames: TestName[] | undefined, debug: boolean, suppressPromptOnErrors: boolean, runSkippedTests: boolean, token?: vs.CancellationToken, testRun?: vs.TestRun) {
-		const programPath = fsPath(suiteData.path);
-		const canRunSkippedTest = this.flutterCapabilities.supportsRunSkippedTests || !isInsideFlutterProject(vs.Uri.file(suiteData.path));
-		const shouldRunSkippedTests = runSkippedTests && canRunSkippedTest;
+	private async runTestsForNode(suiteData: SuiteData, nodes: TreeNode[], debug: boolean, suppressPrompts: boolean, runSkippedTests: boolean, includeCoverage: boolean, token?: vs.CancellationToken, testRun?: vs.TestRun) {
+		// TODO(dantup): We accept a cancellation token here, but it appears never used. Can we remove it?
+		const testSelection = getTestSelectionForNodes(nodes);
+		const programPath = fsPath(URI.file(suiteData.path));
+		const isFlutter = isInsideFlutterProject(vs.Uri.file(suiteData.path));
 
 		return this.runTests({
 			debug,
+			includeCoverage,
+			isFlutter,
 			launchTemplate: undefined,
 			programPath,
-			shouldRunSkippedTests,
-			suppressPromptOnErrors,
-			testNames,
+			shouldRunSkippedTests: runSkippedTests,
+			suppressPrompts,
 			testRun,
+			testSelection,
 			token,
 			useLaunchJsonTestTemplate: true,
 		});
 	}
 
-	private runTests({ programPath, debug, testNames, shouldRunSkippedTests, suppressPromptOnErrors, launchTemplate, testRun, token, useLaunchJsonTestTemplate }: TestLaunchInfo): Promise<boolean> {
+	private async runTests({ includeCoverage, programPath, debug, testSelection, shouldRunSkippedTests, suppressPrompts, launchTemplate, testRun, token, useLaunchJsonTestTemplate, isFlutter }: TestLaunchInfo): Promise<boolean> {
+		const programUri = vs.Uri.file(programPath);
+		const programUriComparisonString = uriComparisonString(programUri);
+		const doc = vs.workspace.textDocuments.find((doc) => uriComparisonString(doc.uri) === programUriComparisonString);
+		const docIsDirty = doc?.isDirty ?? false;
+
 		if (useLaunchJsonTestTemplate) {
 			// Get the default Run/Debug template for running/debugging tests and use that as a base.
-			const template = getLaunchConfigDefaultTemplate(vs.Uri.file(programPath), debug);
+			const template = getLaunchConfigDefaultTemplate(programUri, debug);
 			if (template)
 				launchTemplate = Object.assign({}, template, launchTemplate);
 		}
 
-		const subs: vs.Disposable[] = [];
-		return new Promise<boolean>(async (resolve, reject) => {
-			let testsName = path.basename(programPath);
-			// Handle when running whole test folder.
-			if (testsName === "test")
-				testsName = path.basename(path.dirname(programPath));
+		isFlutter = isFlutter ?? isPathInsideFlutterProject(programPath);
+
+		// Get all workspace packages for coverage
+		let workspacePackageNames: string[] | undefined;
+		if (includeCoverage) {
+			const workspacePackagePaths = await getAllProjectFolders(this.logger, getExcludedFolders, { requirePubspec: true, searchDepth: config.projectSearchDepth });
+			workspacePackageNames = workspacePackagePaths.map((packagePath) => getPackageName(packagePath));
+		}
+
+		// Compute package:test capabilities for Dart (non-Flutter) projects. Flutter test
+		// capabilities are pinned by the SDK.
+		let dartTestCapabilities: DartTestCapabilities | undefined;
+		if (!isFlutter) {
+			const projectFolderPath = locateBestProjectRoot(programPath);
+			if (projectFolderPath)
+				dartTestCapabilities = getPackageTestCapabilitiesForDartProject(this.logger, this.wsContext, projectFolderPath);
+		}
+
+		let preferredTestMode = config.testInvocationMode;
+		if (preferredTestMode === "auto") {
+			// Default to line if the test is complex, but only if the file is not dirty, because
+			// if we try to save, we might trigger the formatter which will then change the line
+			// number where the test is.
+			if (!docIsDirty && testSelection?.length && testSelection.find((ts) => ts.name.includes("$")))
+				preferredTestMode = "line";
+			else
+				preferredTestMode = "name";
+		}
+
+		let doRunTestsByLine = false;
+		// Determine whether we can and should run tests by line number.
+		if (testSelection?.length && preferredTestMode === "line") {
+			if (isFlutter) {
+				doRunTestsByLine = true;
+			} else if (dartTestCapabilities?.supportsRunTestsByLine) {
+				doRunTestsByLine = true;
+			}
+		}
+
+		const subs: IAmDisposable[] = [];
+		return new Promise<boolean>(async (resolve) => {
 			const launchConfiguration = {
-				suppressPromptOnErrors,
+				suppressPrompts,
 				...getLaunchConfig(
 					!debug,
+					!!includeCoverage,
+					!!isFlutter,
 					programPath,
-					testNames,
+					testSelection,
+					doRunTestsByLine,
 					shouldRunSkippedTests,
 					launchTemplate,
+					dartTestCapabilities,
+					workspacePackageNames,
 				),
 				name: launchTemplate?.name ?? `${path.basename(programPath)} tests`,
 			};
@@ -168,7 +234,7 @@ export class TestCommands implements vs.Disposable {
 			// If we were given a test to use by VS Code, use it. Otherwise we'll lazily create one at the
 			// other end.
 			if (testRun)
-				this.vsCodeTestController?.registerTestRun(dartCodeDebugSessionID, testRun, false);
+				this.vsCodeTestController?.registerTestRun(dartCodeDebugSessionID, testRun, { wasStartedByTestRunner: true });
 
 			if (token) {
 				subs.push(vs.debug.onDidStartDebugSession((e) => {
@@ -181,173 +247,196 @@ export class TestCommands implements vs.Disposable {
 					resolve(true);
 			}));
 			const didStart = await vs.debug.startDebugging(
-				vs.workspace.getWorkspaceFolder(vs.Uri.file(programPath)),
+				vs.workspace.getWorkspaceFolder(programUri),
 				launchConfiguration
 			);
-			if (!didStart)
-				reject();
+			if (!didStart) {
+				// Failures to start will trigger their own messages (from debug_config_provider) so we
+				// should not reject() here, as VS Code will show an additional (less helpful) error
+				// message.
+				resolve(false);
+
+			}
 		}).finally(() => {
 			disposeAll(subs);
 		});
 	}
 
-	private getTestNamesForNodes(nodes: TreeNode[]): TestName[] | undefined {
-		if (nodes.find((node) => node instanceof SuiteNode))
-			return undefined;
-
-		return (nodes as Array<GroupNode | TestNode>)
-			.filter((treeNode) => treeNode.name)
-			.map((treeNode) => ({ name: treeNode.name!, isGroup: treeNode instanceof GroupNode }));
-	}
-
-	private getTestNames(treeNode: TreeNode, onlyOfStatus?: TestStatus): TestName[] | undefined {
-		// If we're getting all tests, we can just use the test name/group name (or undefined for suite) directly.
-		if (onlyOfStatus === undefined) {
-			if ((treeNode instanceof TestNode || treeNode instanceof GroupNode) && treeNode.name !== undefined)
-				return [{ name: treeNode.name, isGroup: treeNode instanceof GroupNode }];
-
-			return undefined;
-		}
-
-		// Otherwise, collect all descendant tests that are of the specified type.
-		let names: TestName[] = [];
-		if (treeNode instanceof SuiteNode || treeNode instanceof GroupNode) {
-			for (const child of treeNode.children) {
-				const childNames = this.getTestNames(child, onlyOfStatus);
-				if (childNames)
-					names = names.concat(childNames);
-			}
-		} else if (treeNode instanceof TestNode && treeNode.name !== undefined) {
-			if (treeNode.status === onlyOfStatus)
-				names.push({ name: treeNode.name, isGroup: treeNode instanceof GroupNode });
-		}
-
-		return names;
-	}
-
 	private startTestFromOutline(noDebug: boolean, test: TestOutlineInfo, launchTemplate: any | undefined) {
-		const canRunSkippedTest = !test.isGroup && (this.flutterCapabilities.supportsRunSkippedTests || !isInsideFlutterProject(vs.Uri.file(test.file)));
-		const shouldRunSkippedTests = canRunSkippedTest; // These are the same when running directly, since we always run skipped.
+		const isFlutter = isInsideFlutterProject(vs.Uri.file(test.file));
 
 		return this.runTests({
 			debug: !noDebug,
+			includeCoverage: false,
+			isFlutter,
 			launchTemplate,
 			programPath: test.file,
-			shouldRunSkippedTests,
-			suppressPromptOnErrors: false,
-			testNames: [{ name: test.fullName, isGroup: test.isGroup }],
+			shouldRunSkippedTests: true,
+			suppressPrompts: false,
 			testRun: undefined,
+			testSelection: [getTestSelectionForOutline(test)],
 			token: undefined,
 		});
 	}
 
 	private async goToTestOrImplementationFile(resource?: vs.Uri): Promise<void> {
+		return this.locateTestOrImplementationFile(resource);
+	}
+
+	private async findTestOrImplementationFile(): Promise<void> {
+		return this.locateTestOrImplementationFile(undefined, { showFindDialogIfNoMatches: true });
+	}
+
+	private async locateTestOrImplementationFile(resource?: vs.Uri, { showFindDialogIfNoMatches }: { showFindDialogIfNoMatches?: boolean } = {}): Promise<void> {
 		const doc = resource
 			? await vs.workspace.openTextDocument(resource)
 			: getActiveRealFileEditor()?.document;
-		if (doc && isDartDocument(doc)) {
-			const filePath = fsPath(doc.uri);
-			const isTest = isTestFile(filePath);
-			const otherFile = isTest
-				? this.getImplementationFileForTest(filePath)
-				: this.getTestFileForImplementation(filePath);
+		if (!doc || !isDartDocument(doc))
+			return;
 
-			if (!otherFile || (isTest && !fs.existsSync(otherFile)))
+		const filePath = fsPath(doc.uri);
+		const isTest = isTestFile(filePath);
+		const candidateFiles = isTest
+			? this.getCandidateImplementationFiles(filePath)
+			: this.getCandidateTestFiles(filePath);
+
+		let otherExistingFile = candidateFiles.find(fs.existsSync);
+		const otherFile = otherExistingFile ?? (candidateFiles.length ? candidateFiles[0] : undefined);
+
+		// If no match and we want to search, search...
+		if (!otherExistingFile && showFindDialogIfNoMatches)
+			return this.showSearchResults(filePath, isTest);
+
+		let selectionOffset: number | undefined;
+		let selectionLength: number | undefined;
+
+		// Offer to create files.
+		if (!otherExistingFile && otherFile) {
+			// But not if we're a test... we can create test files, but not implementations.
+			if (isTest)
 				return;
 
-			let selectionOffset: number | undefined;
-			let selectionLength: number | undefined;
+			const relativePath = vs.workspace.asRelativePath(otherFile, false);
+			const yesAction = createTestFileAction(relativePath);
+			const response = await vs.window.showInformationMessage(
+				`Would you like to create a test file at ${relativePath}?`,
+				yesAction,
+				noAction,
+			);
 
-			// Offer to create test files.
-			if (!fs.existsSync(otherFile)) {
-				if (isTest)
-					return;
+			if (response !== yesAction)
+				return;
 
-				const relativePath = vs.workspace.asRelativePath(otherFile, false);
-				const yesAction = createTestFileAction(relativePath);
-				const response = await vs.window.showInformationMessage(
-					`Would you like to create a test file at ${relativePath}?`,
-					yesAction,
-					noAction,
-				);
+			otherExistingFile = otherFile;
+			mkDirRecursive(path.dirname(otherExistingFile));
+			const testFileInfo = defaultTestFileContents(this.wsContext.hasAnyFlutterProjects, escapeDartString(generateTestNameFromFileName(relativePath)));
+			fs.writeFileSync(otherExistingFile, testFileInfo.contents);
 
-				if (response !== yesAction)
-					return;
-
-				mkDirRecursive(path.dirname(otherFile));
-				const testFileInfo = defaultTestFileContents(this.wsContext.hasAnyFlutterProjects, escapeDartString(generateTestNameFromFileName(relativePath)));
-				fs.writeFileSync(otherFile, testFileInfo.contents);
-
-				selectionOffset = testFileInfo.selectionOffset;
-				selectionLength = testFileInfo.selectionLength;
-			}
-
-			const document = await vs.workspace.openTextDocument(otherFile);
-			const editor = await vs.window.showTextDocument(document);
-
-			if (selectionOffset && selectionLength)
-				editor.selection = new vs.Selection(document.positionAt(selectionOffset), document.positionAt(selectionOffset + selectionLength));
+			selectionOffset = testFileInfo.selectionOffset;
+			selectionLength = testFileInfo.selectionLength;
 		}
+
+		const document = await vs.workspace.openTextDocument(otherExistingFile!);
+		const editor = await vs.window.showTextDocument(document);
+
+		if (selectionOffset && selectionLength)
+			editor.selection = new vs.Selection(document.positionAt(selectionOffset), document.positionAt(selectionOffset + selectionLength));
+	}
+
+	private showSearchResults(filePath: string, isTest: boolean) {
+		const sourceFileBaseName = path.parse(filePath).name;
+		const targetFileBaseName = isTest
+			? (sourceFileBaseName.endsWith("_test") ? sourceFileBaseName.substring(0, sourceFileBaseName.length - "_test".length) : sourceFileBaseName)
+			: `${sourceFileBaseName}_test`;
+		void vs.commands.executeCommand("workbench.action.quickOpen", `${targetFileBaseName}.dart`);
 	}
 
 	private updateEditorContexts(e: vs.TextEditor | undefined): void {
 		isInTestFileThatHasImplementation = false;
 		isInImplementationFileThatCanHaveTest = false;
 
-		if (e && e.document && isDartDocument(e.document)) {
+		if (e?.document && isDartDocument(e.document)) {
 			const filePath = fsPath(e.document.uri);
 			if (isTestFile(filePath)) {
 				// Implementation files must exist.
-				const implementationFilePath = this.getImplementationFileForTest(filePath);
+				const implementationFilePath = this.getCandidateImplementationFiles(filePath).find(fs.existsSync);
 				isInTestFileThatHasImplementation = !!implementationFilePath && fs.existsSync(implementationFilePath);
 			} else {
-				isInImplementationFileThatCanHaveTest = !!this.getTestFileForImplementation(filePath);
+				isInImplementationFileThatCanHaveTest = this.getCandidateTestFiles(filePath).length > 0;
 			}
 		}
 
-		vs.commands.executeCommand("setContext", CAN_JUMP_BETWEEN_TEST_IMPLEMENTATION, isInTestFileThatHasImplementation || isInImplementationFileThatCanHaveTest);
+		void vs.commands.executeCommand("setContext", CAN_JUMP_BETWEEN_TEST_IMPLEMENTATION, isInTestFileThatHasImplementation || isInImplementationFileThatCanHaveTest);
 	}
 
-	private getImplementationFileForTest(filePath: string) {
-		const pathSegments = filePath.split(path.sep);
+	private getCandidateImplementationFiles(filePath: string): string[] {
+		const candidates: string[] = [];
 
-		// Replace test folder with lib.
+		const pathSegments = filePath.split(path.sep);
 		const testFolderIndex = pathSegments.lastIndexOf("test");
-		if (testFolderIndex !== -1)
-			pathSegments[testFolderIndex] = "lib";
 
 		// Remove _test from the filename.
 		pathSegments[pathSegments.length - 1] = pathSegments[pathSegments.length - 1].replace(/_test\.dart/, ".dart");
 
-		return pathSegments.join(path.sep);
+		// Add a copy with test -> lib
+		if (testFolderIndex !== -1) {
+			const temp = [...pathSegments];
+			temp[testFolderIndex] = "lib";
+			candidates.push(temp.join(path.sep));
+
+			// Also add a copy with test -> lib/src to match what we do the other way
+			temp.splice(testFolderIndex + 1, 0, "src");
+			candidates.push(temp.join(path.sep));
+		}
+
+		// Add the original path to support files alongside.
+		candidates.push(pathSegments.join(path.sep));
+
+		return candidates;
 	}
 
-	private getTestFileForImplementation(filePath: string) {
-		const pathSegments = filePath.split(path.sep);
+	private getCandidateTestFiles(filePath: string): string[] {
+		const candidates: string[] = [];
 
-		// Replace lib folder with test.
+		const pathSegments = filePath.split(path.sep);
 		const libFolderIndex = pathSegments.lastIndexOf("lib");
-		if (libFolderIndex === -1)
-			return undefined;
-		pathSegments[libFolderIndex] = "test";
 
 		// Add _test to the filename.
 		pathSegments[pathSegments.length - 1] = pathSegments[pathSegments.length - 1].replace(/\.dart/, "_test.dart");
 
-		return pathSegments.join(path.sep);
+		// Add a copy with lib -> test
+		if (libFolderIndex !== -1) {
+			const temp = [...pathSegments];
+			temp[libFolderIndex] = "test";
+			candidates.push(temp.join(path.sep));
+
+			// If we're in lib/src, also add a copy in the corresponding test folder without
+			// the src/ since sometimes src/ is omitted in the test paths.
+			if (temp[libFolderIndex + 1] === "src") {
+				temp.splice(libFolderIndex + 1, 1);
+				candidates.push(temp.join(path.sep));
+			}
+		}
+
+		// Add the original path to support files alongside.
+		candidates.push(pathSegments.join(path.sep));
+
+		return candidates;
 	}
 
-	public dispose(): any {
+	public dispose(): void {
 		disposeAll(this.disposables);
 	}
 }
 
 interface TestLaunchInfo {
+	includeCoverage: boolean | undefined;
 	programPath: string;
+	isFlutter: boolean | undefined;
 	debug: boolean;
-	testNames: TestName[] | undefined;
+	testSelection: TestSelection[] | undefined;
 	shouldRunSkippedTests: boolean;
-	suppressPromptOnErrors: boolean;
+	suppressPrompts: boolean;
 	launchTemplate: any | undefined;
 	useLaunchJsonTestTemplate?: boolean;
 	testRun: vs.TestRun | undefined;

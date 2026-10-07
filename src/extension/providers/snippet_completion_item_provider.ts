@@ -1,7 +1,7 @@
 import * as path from "path";
-import { CancellationToken, CompletionContext, CompletionItem, CompletionItemKind, CompletionItemProvider, CompletionList, MarkdownString, Position, SnippetString, TextDocument, Uri } from "vscode";
+import { CancellationToken, CompletionContext, CompletionItem, CompletionItemKind, CompletionItemProvider, CompletionList, Position, SnippetString, TextDocument, Uri } from "vscode";
 import { DartCapabilities } from "../../shared/capabilities/dart";
-import { extensionPath, readJson } from "../../shared/vscode/extension_utils";
+import { createMarkdownString, extensionPath, readJson } from "../../shared/vscode/extension_utils";
 import { config } from "../config";
 
 export class SnippetCompletionItemProvider implements CompletionItemProvider {
@@ -10,7 +10,7 @@ export class SnippetCompletionItemProvider implements CompletionItemProvider {
 
 	constructor(private readonly dartCapabilities: DartCapabilities, filename: string, shouldRender: (uri: Uri) => boolean) {
 		this.shouldRender = shouldRender;
-		const snippets = readJson(path.join(extensionPath, filename)) as { [key: string]: { [key: string]: { prefix: string, description: string | undefined, body: string | string[] } } };
+		const snippets = readJson(path.join(extensionPath, filename)) as Record<string, Record<string, { prefix: string, description: string | undefined, body: string | string[] }>>;
 		for (const snippetType of Object.keys(snippets)) {
 			for (const snippetName of Object.keys(snippets[snippetType])) {
 				const snippet = snippets[snippetType][snippetName];
@@ -22,7 +22,7 @@ export class SnippetCompletionItemProvider implements CompletionItemProvider {
 						: snippet.body,
 				);
 				completionItem.detail = snippet.description;
-				completionItem.documentation = new MarkdownString().appendCodeblock(completionItem.insertText.value);
+				completionItem.documentation = createMarkdownString("").appendCodeblock(completionItem.insertText.value);
 				completionItem.sortText = "zzzzzzzzzzzzzzzzzzzzzz";
 				this.completions.items.push(completionItem);
 			}
@@ -30,17 +30,17 @@ export class SnippetCompletionItemProvider implements CompletionItemProvider {
 	}
 
 	public provideCompletionItems(
-		document: TextDocument, position: Position, token: CancellationToken, context: CompletionContext,
+		document: TextDocument, position: Position, _token: CancellationToken, _context: CompletionContext,
 	): CompletionList | undefined {
 		if (!config.enableSnippets)
 			return;
 
-		if (config.enableServerSnippets && this.dartCapabilities.supportsServerSnippets)
+		if (config.enableServerSnippets)
 			return;
 
 		const line = document.lineAt(position.line).text.slice(0, position.character);
 
-		if (!this.shouldAllowCompletion(line, context))
+		if (!this.shouldAllowCompletion(line))
 			return;
 
 		if (!this.shouldRender(document.uri))
@@ -49,13 +49,13 @@ export class SnippetCompletionItemProvider implements CompletionItemProvider {
 		return this.completions;
 	}
 
-	private shouldAllowCompletion(line: string, context: CompletionContext): boolean {
+	private shouldAllowCompletion(line: string): boolean {
 		line = line.trim();
 
 		// Don't provide completions after comment markers. This isn't perfect since it'll
 		// suppress them for ex if // appears inside strings, but it's a reasonable
 		// approximation given we don't have a reliable way to tell that.
-		if (line.indexOf("//") !== -1)
+		if (line.includes("//"))
 			return false;
 
 		// Otherwise, allow through.

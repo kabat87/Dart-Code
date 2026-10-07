@@ -1,23 +1,28 @@
 import * as vs from "vscode";
+import * as lsp from "../../shared/analysis/lsp/custom_protocol";
+import { IAmDisposable } from "../../shared/interfaces";
 import { disposeAll, flatMap } from "../../shared/utils";
-import { DocumentPositionTracker } from "../../shared/vscode/trackers";
+import { fsPath } from "../../shared/utils/fs";
+import { SingleDocumentPositionTracker } from "../../shared/vscode/trackers";
+import { lspToPosition } from "../../shared/vscode/utils";
+import { LspAnalyzer } from "../analysis/analyzer";
 import { config } from "../config";
 
 const nonBreakingSpace = "\xa0";
 const verticalLine = "│";
 const horizontalLine = "─";
-const bottomCorner = "└";
+const bottomCorner = "╰";
 const middleCorner = "├";
 
-export abstract class FlutterUiGuideDecorations implements vs.Disposable {
-	protected disposables: vs.Disposable[] = [];
+export class FlutterUiGuideDecorations implements IAmDisposable {
+	protected disposables: IAmDisposable[] = [];
 	protected tracker: WidgetGuideTracker | undefined;
 
 	private readonly borderDecoration = vs.window.createTextEditorDecorationType({
 		rangeBehavior: vs.DecorationRangeBehavior.OpenOpen,
 	});
 
-	constructor() {
+	constructor(private readonly analyzer: LspAnalyzer) {
 		// Update any editor that becomes active.
 		this.disposables.push(vs.window.onDidChangeActiveTextEditor((e) => this.buildForTextEditor(e)));
 
@@ -32,18 +37,24 @@ export abstract class FlutterUiGuideDecorations implements vs.Disposable {
 
 		// Update the current visible editor when we were registered.
 		setImmediate(() => this.buildForTextEditor(vs.window.activeTextEditor));
+
+		// Whenever we get a new Flutter Outline, if it's for the active document,
+		// update that too.
+		this.disposables.push(this.analyzer.fileTracker.onFlutterOutline((op) => {
+			const editor = vs.window.activeTextEditor;
+			if (editor?.document && fsPath(editor.document.uri) === fsPath(vs.Uri.parse(op.uri)))
+				this.buildFromOutline(editor, op.outline);
+		}));
 	}
 
-	protected abstract buildForTextEditor(editor: vs.TextEditor | undefined): void;
-
 	private buildFromUpdatedGuides(doc: vs.TextDocument, guides: WidgetGuide[]) {
-		if (vs.window.activeTextEditor && vs.window.activeTextEditor.document === doc)
+		if (vs.window.activeTextEditor?.document === doc)
 			this.renderGuides(vs.window.activeTextEditor, guides);
 	}
 
 	protected renderGuides(editor: vs.TextEditor, guides: WidgetGuide[]) {
 		const color = new vs.ThemeColor("dart.flutterUiGuides");
-		const guidesByLine: { [key: number]: WidgetGuide[]; } = {};
+		const guidesByLine: Record<number, WidgetGuide[]> = {};
 		for (const guide of guides) {
 			for (let line = guide.start.line; line <= guide.end.line; line++) {
 				guidesByLine[line] = guidesByLine[line] || [];
@@ -54,7 +65,7 @@ export abstract class FlutterUiGuideDecorations implements vs.Disposable {
 		editor.setDecorations(this.borderDecoration, decorations);
 	}
 
-	private buildDecorations(doc: vs.TextDocument, tabSize: number, guidesByLine: { [key: number]: WidgetGuide[] }, color: vs.ThemeColor): vs.DecorationOptions[] {
+	private buildDecorations(doc: vs.TextDocument, tabSize: number, guidesByLine: Record<number, WidgetGuide[]>, color: vs.ThemeColor): vs.DecorationOptions[] {
 		const decorations: vs.DecorationOptions[] = [];
 		for (const line of Object.keys(guidesByLine).map((k) => parseInt(k, 10))) {
 			const lineInfo = doc.lineAt(line);
@@ -134,15 +145,63 @@ export abstract class FlutterUiGuideDecorations implements vs.Disposable {
 	public dispose() {
 		disposeAll(this.disposables);
 	}
+
+	protected buildForTextEditor(editor: vs.TextEditor | undefined): void {
+		if (editor?.document)
+			this.buildFromOutline(editor, this.analyzer.fileTracker.getFlutterOutlineFor(editor.document.uri));
+	}
+
+	private buildFromOutline(editor: vs.TextEditor, outline: lsp.FlutterOutline | undefined): void {
+		if (this.tracker)
+			this.tracker.clear();
+		if (!editor?.document || !outline)
+			return;
+
+		// Check that the outline we got looks like it still matches the document.
+		// If the lengths are different, just bail without doing anything since
+		// there have probably been new edits and we'll get a new outline soon.
+		const outlineLength = editor.document.offsetAt(lspToPosition(outline.range.end));
+		if (editor.document.getText().length !== outlineLength)
+			return;
+
+		const guides = this.extractGuides(editor.document, outline);
+		if (this.tracker)
+			this.tracker.trackDoc(editor.document, guides);
+		this.renderGuides(editor, guides);
+	}
+
+	private extractGuides(document: vs.TextDocument, node: lsp.FlutterOutline): WidgetGuide[] {
+		let guides: WidgetGuide[] = [];
+		if (node.kind === "NEW_INSTANCE") {
+			const parentLine = node.codeRange.start.line;
+			const childLines = node.children?.map((c) => c.codeRange.start.line).filter((cl) => cl > parentLine);
+			if (childLines) {
+				const startPos = this
+					.firstNonWhitespace(document, parentLine);
+				childLines.forEach((childLine) => {
+					const firstCodeChar = this.firstNonWhitespace(document, childLine);
+					guides.push(new WidgetGuide(startPos, firstCodeChar));
+				});
+			}
+		}
+
+		// Recurse down the tree to include childrens (and they'll include their
+		// childrens, etc.).
+		if (node.children)
+			guides = guides.concat(flatMap(node.children, (c) => this.extractGuides(document, c)));
+
+		return guides;
+	}
 }
 
-export class WidgetGuide {
+
+class WidgetGuide {
 	constructor(public readonly start: vs.Position, public readonly end: vs.Position) { }
 }
 
-class WidgetGuideTracker implements vs.Disposable {
-	private readonly disposables: vs.Disposable[] = [];
-	private readonly tracker: DocumentPositionTracker = new DocumentPositionTracker();
+class WidgetGuideTracker implements IAmDisposable {
+	private readonly disposables: IAmDisposable[] = [];
+	private readonly tracker: SingleDocumentPositionTracker = new SingleDocumentPositionTracker();
 	private readonly guideMap: Map<WidgetGuide, [vs.Position, vs.Position]> = new Map<WidgetGuide, [vs.Position, vs.Position]>();
 
 	private onGuidesChangedEmitter = new vs.EventEmitter<[vs.TextDocument, WidgetGuide[]]>();

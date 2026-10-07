@@ -1,44 +1,54 @@
+import { DebugProtocol } from "@vscode/debugprotocol";
 import { strict as assert } from "assert";
 import { Writable } from "stream";
 import { DebugAdapterTracker, DebugAdapterTrackerFactory, DebugSession, DebugSessionCustomEvent, window } from "vscode";
-import { DebugProtocol } from "vscode-debugprotocol";
-import { DartVsCodeLaunchArgs } from "../shared/debug/interfaces";
+import { DartCapabilities } from "../shared/capabilities/dart";
+import { tenMinutesInMs } from "../shared/constants";
+import { DartVsCodeLaunchArgs } from "../shared/debugging/interfaces";
+import { DebuggerType } from "../shared/enums";
 import { TestSessionCoordinator } from "../shared/test/coordinator";
 import { Notification, Test, TestDoneNotification, TestStartNotification } from "../shared/test_protocol";
+import { withTimeout } from "../shared/utils";
 import { getRandomInt } from "../shared/utils/fs";
 import { waitFor } from "../shared/utils/promises";
 import { DebugCommandHandler } from "../shared/vscode/interfaces";
 import { DebugClient, ILocation, IPartialLocation } from "./debug_client_ms";
-import { delay, logger, watchPromise, withTimeout } from "./helpers";
+import { currentTestName, delay, logger, privateApi, watchPromise } from "./helpers";
 
-const customEventsToForward = ["dart.log", "dart.serviceExtensionAdded", "dart.serviceRegistered", "dart.debuggerUris", "dart.startTerminalProcess", "dart.exposeUrl"];
+const customEventsToForward = ["dart.log", "dart.serviceExtensionAdded", "dart.serviceRegistered", "dart.debuggerUris", "dart.startTerminalProcess", "dart.exposeUrl", "flutter.appStart", "flutter.appStarted", "dart.toolEvent", "dart.flutter.devToolsDeepLink"];
 
-type DebugClientArgs = { runtime: string, executable: string, args: string[], port?: undefined } | { runtime?: undefined, executable?: undefined, args?: undefined, port: number };
+type DebugClientArgs = { runtime: string, executable: string, args: string[] } | { runtime?: undefined, executable?: undefined, args?: undefined };
 
 export class DartDebugClient extends DebugClient {
-	private readonly port: number | undefined;
 	public currentSession?: DebugSession;
-	public currentTracker?: DebugAdapterTracker;
+	public currentTrackers: DebugAdapterTracker[] = [];
 	public hasStarted = false;
-	public readonly isDartDap: boolean;
+	public hasTerminated = false;
 
-	constructor(args: DebugClientArgs, private readonly debugCommands: DebugCommandHandler, readonly testCoordinator: TestSessionCoordinator | undefined, private readonly debugTrackerFactory: DebugAdapterTrackerFactory) {
-		super(args.runtime, args.executable, args.args, "dart", undefined, true);
-		this.isDartDap = args.runtime !== undefined && args.runtime !== "node";
-		this.port = args.port;
+	constructor(public readonly debuggerType: DebuggerType, daArgs: DebugClientArgs, private readonly debugCommands: DebugCommandHandler, readonly testCoordinator: TestSessionCoordinator | undefined, private readonly debugTrackerFactories: DebugAdapterTrackerFactory[], private readonly dartCapabitilies: DartCapabilities) {
+		const useShell = daArgs.runtime?.endsWith(".sh") || daArgs.runtime?.endsWith(".bat");
+		const runtime = useShell ? `"${daArgs.runtime}"` : daArgs.runtime;
+		const executable = useShell ? `"${daArgs.executable}"` : daArgs.executable;
+		const args = useShell ? daArgs.args?.map((a) => `"${a}"`) : daArgs.args;
+		super(runtime, executable, args, "dart", { shell: useShell ? true : undefined }, true);
+
+		// Tests can attach a lot of listeners, so bump the threshold for warning.
+		this.setMaxListeners(30);
 
 		// HACK to handle incoming requests..
 		const me = (this as unknown as { dispatch(body: string): void });
-		const oldDispatch = me.dispatch;
+		const oldDispatch = me.dispatch.bind(this);
 		me.dispatch = (body: string) => {
 			const rawData = JSON.parse(body);
-			if (this.currentTracker?.onWillReceiveMessage)
-				this.currentTracker.onWillReceiveMessage(rawData);
+			for (const tracker of this.currentTrackers) {
+				if (tracker.onDidSendMessage)
+					tracker.onDidSendMessage(rawData);
+			}
 			if (rawData.type === "request") {
 				const request = rawData as DebugProtocol.Request;
 				this.emit(request.command, request);
 			} else {
-				oldDispatch.bind(this)(body);
+				oldDispatch(body);
 			}
 		};
 
@@ -47,16 +57,17 @@ export class DartDebugClient extends DebugClient {
 		customEventsToForward.forEach((evt) => this.on(evt, (e: DebugSessionCustomEvent) => this.handleCustomEvent(e)));
 
 		// Log important events to make troubleshooting tests easier.
-		this.on("output", (event: DebugProtocol.OutputEvent) => {
+		this.on("output", (event) => {
 			logger.info(`[${event.body.category}] ${event.body.output}`);
 		});
-		this.on("terminated", (event: DebugProtocol.TerminatedEvent) => {
+		this.on("terminated", () => {
+			this.hasTerminated = true;
 			logger.info(`[terminated]`);
 		});
 		this.on("stopped", (event: DebugProtocol.StoppedEvent) => {
 			logger.info(`[stopped] ${event.body.reason}`);
 		});
-		this.on("initialized", (event: DebugProtocol.InitializedEvent) => {
+		this.on("initialized", () => {
 			logger.info(`[initialized]`);
 		});
 		this.on("runInTerminal", (request: DebugProtocol.RunInTerminalRequest) => {
@@ -71,7 +82,7 @@ export class DartDebugClient extends DebugClient {
 			});
 
 			terminal.show();
-			terminal.processId.then((pid) => {
+			void terminal.processId.then((pid) => {
 				this.sendResponse(request, { shellProcessId: pid });
 			});
 		});
@@ -80,13 +91,23 @@ export class DartDebugClient extends DebugClient {
 		// debug session.
 		if (testCoordinator) {
 			this.on("dart.testNotification", (e: DebugSessionCustomEvent) => testCoordinator.handleDebugSessionCustomEvent(this.currentSession!.id, this.currentSession!.configuration.dartCodeDebugSessionID as string | undefined, e.event, e.body));
-			this.on("terminated", (e: DebugProtocol.TerminatedEvent) => testCoordinator.handleDebugSessionEnd(this.currentSession!.id, this.currentSession!.configuration.dartCodeDebugSessionID as string | undefined));
+			this.on("terminated", () => {
+				// Sometimes when we get failures on CI, it seems like the errors here (if this happened before launch() completed)
+				// will mask the real errors and we won't get them. I can't repro this locally (I always see failures printed above
+				// this error), but I also don't know for what reason they are failing (the logs show that the debug session has not
+				// launched).
+				if (!this.currentSession)
+					return;
+				testCoordinator.handleDebugSessionEnd(this.currentSession.id, this.currentSession.configuration.dartCodeDebugSessionID as string | undefined);
+			});
 		}
 	}
 
 	public send(command: string, args?: any): Promise<any> {
-		if (this.currentTracker?.onDidSendMessage)
-			this.currentTracker.onDidSendMessage({ command, args });
+		for (const tracker of this.currentTrackers) {
+			if (tracker.onWillReceiveMessage)
+				tracker.onWillReceiveMessage({ command, arguments: args });
+		}
 		return super.send(command, args);
 	}
 
@@ -94,11 +115,11 @@ export class DartDebugClient extends DebugClient {
 		this.hasStarted = true;
 		if (port)
 			throw new Error("Do not provide a port to DartDebugClient.start!");
-		return super.start(this.port);
+		return super.start();
 	}
 
 	private sendResponse(request: DebugProtocol.Request, body: any): void {
-		// Hack: Underlyung class doesn't have response support.
+		// Hack: Underlying class doesn't have response support.
 		const me = (this as unknown as { outputStream: Writable, sequence: number });
 
 		const response: DebugProtocol.Response = {
@@ -124,11 +145,6 @@ export class DartDebugClient extends DebugClient {
 	}
 
 	public async launch(launchArgs: DartVsCodeLaunchArgs & DebugProtocol.LaunchRequestArguments): Promise<void> {
-		// The new DAP doesn't default to breaking on any exceptions so to simplify tests
-		// set it based on whether we'd in debug mode or not.
-		const isDebugging = !(launchArgs.noDebug ?? false);
-		if (isDebugging)
-			await this.setExceptionBreakpointsRequest({ filters: ["Unhandled"] });
 		const configuration = Object.assign(
 			{
 				name: "Dart & Flutter",
@@ -139,7 +155,7 @@ export class DartDebugClient extends DebugClient {
 		);
 		const currentSession = this.currentSession = {
 			configuration,
-			customRequest: async (cmd, args) => (await this.customRequest(cmd, args)).body,
+			customRequest: async (cmd, args) => (await this.customRequest(cmd, args)).body as unknown,
 			getDebugProtocolBreakpoint: () => { throw new Error("Not implemented for tests"); },
 			id: `INTEGRATION-TEST-${getRandomInt(0x1000, 0x10000).toString(16)}`,
 			name: configuration.name,
@@ -147,33 +163,51 @@ export class DartDebugClient extends DebugClient {
 			workspaceFolder: undefined,
 		};
 
+		// The new DAP doesn't default to breaking on any exceptions so to simplify tests
+		// set it based on whether we'd in debug mode or not.
+		const isDebugging = !(launchArgs.noDebug ?? false);
+		if (isDebugging)
+			await this.setExceptionBreakpointsRequest({ filters: ["Unhandled"] });
+
 		// Set up logging.
-		this.currentTracker = (await this.debugTrackerFactory.createDebugAdapterTracker(currentSession))!;
-		this.currentTracker.onWillStartSession!();
-		this.on("terminated", (e: DebugProtocol.TerminatedEvent) => {
-			if (this.currentTracker?.onWillStopSession)
-				this.currentTracker.onWillStopSession();
+		for (const trackerFactory of this.debugTrackerFactories) {
+			const tracker = await trackerFactory.createDebugAdapterTracker(currentSession);
+			if (tracker) {
+				this.currentTrackers.push(tracker);
+				if (tracker.onWillStartSession)
+					tracker.onWillStartSession();
+			}
+		}
+		this.on("terminated", () => {
+			for (const tracker of this.currentTrackers) {
+				if (tracker.onWillStopSession)
+					tracker.onWillStopSession();
+			}
 		});
 
 		this.debugCommands.handleDebugSessionStart(currentSession);
-		this.waitForEvent("terminated", "for handleDebugSessionEnd")
-			.then(() => this.debugCommands.handleDebugSessionEnd(currentSession))
+		this.waitForEvent("terminated", "for handleDebugSessionEnd", tenMinutesInMs)
+			.then(() => {
+				this.debugCommands.handleDebugSessionEnd(currentSession);
+				privateApi.testController?.handleDebugSessionEnd(currentSession);
+			})
 			.catch((e) => console.error(`Error while waiting for termination: ${e}`));
 
 		// We override the base method to swap for attachRequest when required, so that
 		// all the existing methods that provide useful functionality but assume launching
 		// (for ex. hitBreakpoint) can be used in attach tests.
 		const response = await watchPromise("launch->initializeRequest", this.initializeRequest());
-		if (response.body && response.body.supportsConfigurationDoneRequest) {
+		if (response.body?.supportsConfigurationDoneRequest) {
 			this._supportsConfigurationDoneRequest = true;
 		}
 		// Attach will be paused by default and issue a step when we connect; but our tests
 		// generally assume we will automatically resume.
-		if (launchArgs.request === "attach" && launchArgs.deviceId !== "flutter-tester") {
+		if (launchArgs.request === "attach") {
 			logger.info("Attaching to process...");
+			const stoppedEvent = watchPromise("launch->attach->waitForEvent:stopped", this.waitForEvent("stopped", "waiting for stop event on attach to paused"));
 			await watchPromise("launch->attach->attachRequest", this.attachRequest(launchArgs));
 			logger.info("Waiting for stopped (step/entry) event...");
-			const event = await watchPromise("launch->attach->waitForEvent:stopped", this.waitForEvent("stopped", "waiting for stop event on attach to paused"));
+			const event = await stoppedEvent;
 			// Allow either step (old DC DA) or entry (SDK DA).
 			if (event.body.reason !== "step")
 				assert.equal(event.body.reason, "entry");
@@ -195,11 +229,6 @@ export class DartDebugClient extends DebugClient {
 					this.resume(),
 				]),
 			);
-		} else if (launchArgs.request === "attach") {
-			// For Flutter, we don't need all the crazy stuff above, just issue a standard
-			// attach request.
-			logger.info("Attaching to process...");
-			await watchPromise("launch->attach->attachRequest", this.attachRequest(launchArgs));
 		} else {
 			await watchPromise("launch()->launchRequest", this.launchRequest(launchArgs));
 		}
@@ -232,9 +261,21 @@ export class DartDebugClient extends DebugClient {
 		return this.stackTraceRequest({ threadId: thread.id, startFrame, levels });
 	}
 
-	public async getTopFrameVariables(scope: "Exceptions" | "Locals"): Promise<DebugProtocol.Variable[]> {
+	private lastTestThatCalledGetTopFrameId: string | undefined = undefined;
+
+	public async getTopFrameId(): Promise<number> {
+		if (this.lastTestThatCalledGetTopFrameId === currentTestName) {
+			throw new Error(`Test "${this.lastTestThatCalledGetTopFrameId}" called getTopFrameId() twice. For performance, only call once and reuse the value.`);
+		}
+		this.lastTestThatCalledGetTopFrameId = currentTestName;
+
 		const stack = await this.getStack();
-		const scopes = await this.scopesRequest({ frameId: stack.body.stackFrames[0].id });
+		return stack.body.stackFrames[0].id;
+	}
+
+	public async getTopFrameVariables(scope: "Exceptions" | "Locals", { frameId }: { frameId?: number } = {}): Promise<DebugProtocol.Variable[]> {
+		frameId ??= await this.getTopFrameId();
+		const scopes = await this.scopesRequest({ frameId });
 		const s = scopes.body.scopes.find((s) => s.name === scope);
 		assert.ok(s);
 		return this.getVariables(s.variablesReference);
@@ -245,30 +286,29 @@ export class DartDebugClient extends DebugClient {
 		return variables.body.variables;
 	}
 
-	public async evaluateForFrame(expression: string, context?: string): Promise<{
+	public async evaluateForFrame(expression: string, { frameId, context }: { frameId?: number, context?: string; } = {}): Promise<{
 		result: string;
 		type?: string;
 		variablesReference: number;
 		namedVariables?: number;
 		indexedVariables?: number;
 	}> {
-		const thread = await this.getMainThread();
-		const stack = await this.stackTraceRequest({ threadId: thread.id });
-		const result = await this.evaluateRequest({ expression, frameId: stack.body.stackFrames[0].id, context });
+		frameId ??= await this.getTopFrameId();
+		const result = await this.evaluateRequest({ expression, frameId, context });
 		return result.body;
 	}
 
 	public assertOutputContains(category: string | undefined, text: string): Promise<DebugProtocol.OutputEvent> {
 		let output = "";
-		let cleanup = () => { }; // tslint:disable-line: no-empty
+		let cleanup = () => { };
 		const textLF = text.replace(/\r/g, "");
 		const textCRLF = textLF.replace(/\n/g, "\r\n");
 		return withTimeout(
 			new Promise<DebugProtocol.OutputEvent>((resolve) => {
 				function handleOutput(event: DebugProtocol.OutputEvent) {
-					if (!category || event.body.category === category) {
+					if (!category || (event.body.category ?? "console") === category) {
 						output += event.body.output;
-						if (output.indexOf(textLF) !== -1 || output.indexOf(textCRLF) !== -1) {
+						if (output.includes(textLF) || output.includes(textCRLF)) {
 							resolve(event);
 						}
 					}
@@ -280,7 +320,17 @@ export class DartDebugClient extends DebugClient {
 		).finally(() => cleanup());
 	}
 
-	public waitForCustomEvent<T>(type: string, filter: (notification: T) => boolean): Promise<T> {
+	public async debuggerReady(): Promise<void> {
+		await this.waitForCustomEvent("dart.debuggerUris");
+		await delay(100);
+	}
+
+	public async flutterAppStarted(): Promise<void> {
+		await this.waitForCustomEvent("flutter.appStarted");
+		await delay(100);
+	}
+
+	public waitForCustomEvent<T>(type: string, filter?: (notification: T) => boolean): Promise<T> {
 		return new Promise((resolve, reject) => {
 			setTimeout(
 				() => {
@@ -291,7 +341,7 @@ export class DartDebugClient extends DebugClient {
 			const handler = (event: DebugProtocol.Event) => {
 				try {
 					const notification = event.body as T;
-					if (filter(notification)) {
+					if (!filter || filter(notification)) {
 						this.removeListener(type, handler);
 						resolve(notification);
 					}
@@ -334,7 +384,7 @@ export class DartDebugClient extends DebugClient {
 			this.waitForTestNotification<TestDoneNotification>(
 				"testDone",
 				(e) => {
-					if (test && e.testID === test.id) {
+					if (e.testID === test?.id) {
 						assert.equal(e.result, expectedStatus, `Test ${test.name} result was not as expected`);
 						return true;
 					} else {

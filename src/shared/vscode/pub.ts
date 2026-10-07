@@ -1,0 +1,362 @@
+import * as fs from "fs";
+import * as path from "path";
+import * as semver from "semver";
+import { commands, Uri, window } from "vscode";
+import * as YAML from "yaml";
+import { Logger, Sdks } from "../interfaces";
+import { PackageMap } from "../pub/package_map";
+import { uniq } from "../utils";
+import { fsPath, getPubGeneratorVersion, isWithinPath } from "../utils/fs";
+
+interface PubPackageStatus { folderUri: Uri, pubRequired: false | "GET" | "UPGRADE", reason?: string, workspace: "NONE" | "ROOT" | "PROJECT" }
+
+/**
+ * Information about a package folder, that is either a single package
+ * folder, or a Pub Workspace that has a count of packages within.
+ */
+export interface PubWorkspaceOrPackageFolderInfo {
+	path: string;
+	workspacePackageCount?: number;
+}
+
+const pubspecHasDependenciesRegex = new RegExp("^(dev_)?dependencies\\s*:", "im");
+const pubspecIsWorkspaceProjectRegex = new RegExp("^resolution\\s*:\\s*workspace", "im");
+const pubspecIsWorkspaceRootRegex = new RegExp("^workspace\\s*:", "im");
+
+export function getPubWorkspaceStatus(
+	sdks: Sdks,
+	logger: Logger,
+	folderUris: Uri[],
+	includeDates = true,
+	existsSync: (itemPath: string) => boolean = fs.existsSync,
+	readFileSync: (itemPath: string) => string = (p) => fs.readFileSync(p, "utf8").toString(),
+	mtimeSync: (itemPath: string) => Date = (p) => fs.statSync(p).mtime,
+): PubPackageStatus[] {
+	// Compute the statuses for the requested packages.
+	const statuses = folderUris.map((folderUri) => getPubPackageStatus(sdks, logger, folderUri, includeDates, existsSync, readFileSync, mtimeSync));
+
+	// For any workspace projects, we need to also check their roots if they were not already in the initial set.
+	const workspaceProjects = statuses.filter((s) => s.workspace === "PROJECT");
+	if (workspaceProjects.length) {
+		logger.info(`Found ${workspaceProjects.length} Pub workspace projects with roots that are not already in the set`);
+		const includedWorkspaceRootPaths = new Set<string>();
+		statuses.filter((s) => s.workspace === "ROOT").forEach((p) => includedWorkspaceRootPaths.add(fsPath(p.folderUri)));
+
+		projectLoop:
+		for (const project of workspaceProjects) {
+			const folderPath = fsPath(project.folderUri);
+			let currentFolder = path.dirname(folderPath);
+			while (true) {
+				// First check if the current folder is already a root we know about.
+				if (includedWorkspaceRootPaths.has(currentFolder)) {
+					continue projectLoop;
+				}
+				// Otherwise, see if it is actually the root.
+				let isRoot = false;
+				try {
+					isRoot = pubspecIsWorkspaceRootRegex.test(readFileSync(path.join(currentFolder, "pubspec.yaml")));
+				} catch {
+					// File may not exist, but using exists first is a race, so just try to read and ignore failure.
+				}
+
+				if (isRoot) {
+					logger.info(`Found new Pub workspace root at ${currentFolder}`);
+					// We found the root, add the result and to our set so we don't repeat this work.
+					statuses.push(getPubPackageStatus(sdks, logger, Uri.file(currentFolder), includeDates, existsSync, readFileSync, mtimeSync));
+					includedWorkspaceRootPaths.add(currentFolder);
+					continue projectLoop;
+				}
+
+				// Otherwise, try the next folder up.
+				const parent = path.dirname(currentFolder);
+				if (parent === currentFolder) {
+					logger.warn(`Failed to find a Pub workspace root for project at ${folderPath} before getting to root folder`);
+					continue projectLoop;
+				}
+				currentFolder = parent;
+			}
+		}
+	}
+
+	return statuses;
+}
+
+function getWorkspaceFolderPaths(
+	logger: Logger,
+	folder: string,
+	pubspecContent: string,
+): string[] {
+	try {
+		const yaml = YAML.parse(pubspecContent);
+		const workspaceList = yaml.workspace;
+		if (Array.isArray(workspaceList) && workspaceList.every((s: unknown) => typeof s === "string")) {
+			return workspaceList.map((s) => path.join(folder, s));
+		} else {
+			logger.error(`Failed to parse pubspec workspaces, items are not all strings`);
+			return [];
+		}
+	} catch {
+		logger.error(`Failed to parse pubspec workspaces`);
+		return [];
+	}
+}
+
+export function isValidPubGetTarget(folderUri: Uri): { valid: true } | { valid: false, reason: string } {
+	const folderPath = fsPath(folderUri);
+
+	// If a folder starts with '__' or '{' then it's probably a template of some
+	// sort and we shouldn't run.
+	if (folderPath.includes("__") || folderPath.includes("{"))
+		return { valid: false, reason: "Folder includes __ or { and looks like a template folder" };
+
+	return { valid: true };
+}
+
+function getPubPackageStatus(
+	sdks: Sdks,
+	logger: Logger,
+	folderUri: Uri,
+	includeDatesAndFullPaths = true,
+	existsSync: (itemPath: string) => boolean = fs.existsSync,
+	readFileSync: (itemPath: string) => string = (p) => fs.readFileSync(p, "utf8").toString(),
+	mtimeSync: (itemPath: string) => Date = (p) => fs.statSync(p).mtime,
+): PubPackageStatus {
+	const folder = fsPath(folderUri);
+	const pubspecPath = path.join(folder, "pubspec.yaml");
+	const pubspecLockPath = path.join(folder, "pubspec.lock");
+	const packageMapPath = path.join(folder, ".dart_tool", "package_config.json");
+	if (!folder || !existsSync(pubspecPath))
+		return { folderUri, pubRequired: false, reason: "Folder or pubspec do not exist", workspace: "NONE" };
+
+	const isValid = isValidPubGetTarget(folderUri);
+	if (!isValid.valid)
+		return { folderUri, pubRequired: false, reason: isValid.reason, workspace: "NONE" };
+
+	const pubspecContent = readFileSync(pubspecPath);
+	const hasDependencies = pubspecHasDependenciesRegex.test(pubspecContent);
+	const isWorkspaceProject = pubspecIsWorkspaceProjectRegex.test(pubspecContent);
+	const isWorkspaceRoot = pubspecIsWorkspaceRootRegex.test(pubspecContent);
+
+	const result: Partial<PubPackageStatus> & { folderUri: Uri, workspace: string } = { folderUri, workspace: isWorkspaceRoot ? "ROOT" : isWorkspaceProject ? "PROJECT" : "NONE" };
+
+	// If we don't appear to have deps listed in pubspec, then no point prompting.
+	if (!isWorkspaceRoot && !hasDependencies)
+		return { ...result, pubRequired: false, reason: "Pubspec does not contain any dependencies" };
+
+	// If we are part of a pub workspace, we don't do anything, it's handled by the root.
+	if (isWorkspaceProject)
+		return { ...result, pubRequired: false, reason: "The project is part of a Pub workspace" };
+
+	// If we don't have package_config, we probably need running.
+	if (!existsSync(packageMapPath))
+		return { ...result, pubRequired: "GET", reason: "The .dart_tool/package_config.json file is missing" };
+
+	// If the Dart SDK version has upgraded by more than just a patch, we should
+	// prefer upgrade.
+	const lastUsedSdkVersion = getPubGeneratorVersion(logger, packageMapPath, existsSync, readFileSync);
+	const currentSdkVersion = sdks.dartVersion;
+	if (lastUsedSdkVersion && currentSdkVersion) {
+		const lastUsedSdkMajorMinor = `${semver.major(lastUsedSdkVersion)}.${semver.minor(lastUsedSdkVersion)}.0`;
+		const currentSdkMajorMinor = `${semver.major(currentSdkVersion)}.${semver.minor(currentSdkVersion)}.0`;
+
+		logger.info(`Version last used for Pub is ${lastUsedSdkVersion} (${lastUsedSdkMajorMinor}), current is ${currentSdkVersion} (${currentSdkMajorMinor})`);
+		// For an SDK upgrade, we want to encourage upgrading.
+		if (semver.gt(currentSdkMajorMinor, lastUsedSdkMajorMinor))
+			return { ...result, pubRequired: "UPGRADE", reason: `The current SDK version (${currentSdkVersion}) is newer than the one last used to run "pub get" (${lastUsedSdkVersion})` };
+		// For a downgrade, Pub Get is enough to fix.
+		else if (semver.lt(currentSdkMajorMinor, lastUsedSdkMajorMinor))
+			return { ...result, pubRequired: "GET", reason: `The current SDK version (${currentSdkVersion}) is older than the one last used to run "pub get" (${lastUsedSdkVersion})` };
+	}
+
+
+	// Helpers for Date/Paths so that output is complete for production, but simplified for tests.
+	const tryMtimeSync = (f: string) => { try { return mtimeSync(f); } catch { return undefined; } };
+	const maybeDate = includeDatesAndFullPaths
+		? (d: Date) => ` (${d})`
+		: (_: Date) => "";
+	const displayPath = includeDatesAndFullPaths
+		? (p: string) => p
+		: (p: string) => path.basename(p) === "package_config.json" ? `${path.basename(path.dirname(path.dirname(p)))}/${path.basename(path.dirname(p))}/${path.basename(p)}` : `${path.basename(path.dirname(p))}/${path.basename(p)}`;
+
+	const pubspecLockModified = tryMtimeSync(pubspecLockPath);
+	const packageMapModified = tryMtimeSync(packageMapPath);
+	if (pubspecLockModified && packageMapModified && pubspecLockModified > packageMapModified) {
+		return { ...result, pubRequired: "GET", reason: `The ${displayPath(pubspecLockPath)} file was modified${maybeDate(pubspecLockModified)} more recently than the ${displayPath(packageMapPath)} file${maybeDate(packageMapModified)}` };
+	}
+
+	const relevantProjectFolders = isWorkspaceRoot ? [folder, ...getWorkspaceFolderPaths(logger, folder, pubspecContent)] : [folder];
+	for (const relevantProjectFolder of relevantProjectFolders) {
+		const relevantPubspecYamlPath = path.join(relevantProjectFolder, "pubspec.yaml");
+		const pubspecModified = tryMtimeSync(relevantPubspecYamlPath);
+		if (!pubspecModified)
+			continue;
+
+		if (packageMapModified && pubspecModified > packageMapModified) {
+			return { ...result, pubRequired: "GET", reason: `The ${displayPath(relevantPubspecYamlPath)} file was modified${maybeDate(pubspecModified)} more recently than the ${displayPath(packageMapPath)} file${maybeDate(packageMapModified)}` };
+		} else if (pubspecLockModified && pubspecModified > pubspecLockModified) {
+			return { ...result, pubRequired: "GET", reason: `The ${displayPath(relevantPubspecYamlPath)} file was modified${maybeDate(pubspecModified)} more recently than the ${displayPath(pubspecLockPath)} file${maybeDate(pubspecLockModified)}` };
+		}
+	}
+
+	// If we're a Flutter project and our SDK doesn't match the one used
+	// in the package file, we also need running.
+	if (sdks.flutter) {
+		const packageMap = PackageMap.loadForProject(logger, folder);
+		const flutterPackagePath = packageMap.getPackagePath("flutter");
+		if (flutterPackagePath && !isWithinPath(flutterPackagePath, sdks.flutter)) {
+			return { ...result, pubRequired: "GET", reason: `The referenced Flutter package (${flutterPackagePath}) does not match the current SDK in use (${sdks.flutter})` };
+		}
+	}
+
+	return { ...result, pubRequired: false, reason: "Up-to-date" };
+}
+
+export async function promptToRunPubGet(folders: Uri[]) {
+	const label = "Run 'pub get'";
+	const clickedButton = await window.showInformationMessage("Some packages are missing or out of date, would you like to get them now?", label);
+	if (clickedButton === label)
+		await runPubGet(folders);
+}
+
+export function runPubGet(folders: Uri[]) {
+	return commands.executeCommand("dart.getPackages", folders);
+}
+
+
+export async function promptToRunPubUpgrade(folders: Uri[]) {
+	const label = "Run 'pub upgrade'";
+	const clickedButton = await window.showInformationMessage("Your SDK has been updated since you last fetched packages, would you like to fetch updated packages?", label);
+	if (clickedButton === label)
+		await runPubUpgrade(folders);
+}
+
+function runPubUpgrade(folders: Uri[]) {
+	return commands.executeCommand("dart.upgradePackages", folders);
+}
+
+/**
+ * Returns the paths of "pub roots" for a set of package folders/pubspecs, where "pub root" is
+ * the Pub Workspace root (if the package is part of a workspace) or the package folder.
+ *
+ * If multiple packages belong to the same Pub Workspace, it will only be returned once.
+ */
+function getPubWorkspaceOrPackageFolderPaths(packageFolderOrPubspecPaths: string[]): string[] {
+	return uniq(packageFolderOrPubspecPaths.map((p) => getPubWorkspaceFolderOrPackageFolderPath(p))).sort();
+}
+
+/**
+ * Gets the set of packages in `packageFolderOrPubspecPaths`, folding any workspace packages into
+ * the workspace root. This is used for commands like `pub get` which are always run in the context
+ * of a Pub Workspace root and not the child packages.
+ */
+export function getPubWorkspaceOrPackageFolderInfo(
+	packageFolderOrPubspecPaths: string[],
+	existsSync: (itemPath: string) => boolean = fs.existsSync,
+	readFileSync: (itemPath: string) => string = (p) => fs.readFileSync(p, "utf8").toString(),
+): PubWorkspaceOrPackageFolderInfo[] {
+	const pubWorkspacePackageCounts = new Map<string, number>();
+
+	for (const packageFolderOrPubspecPath of packageFolderOrPubspecPaths) {
+		const packageFolderPath = path.basename(packageFolderOrPubspecPath) === "pubspec.yaml"
+			? path.dirname(packageFolderOrPubspecPath)
+			: packageFolderOrPubspecPath;
+		const workspaceRootPath = getPubWorkspaceFolderOrPackageFolderPath(packageFolderOrPubspecPath, existsSync, readFileSync);
+
+		let count = pubWorkspacePackageCounts.get(workspaceRootPath) ?? 0;
+		const isRoot = workspaceRootPath === packageFolderPath;
+		if (!isRoot)
+			count++;
+
+		pubWorkspacePackageCounts.set(workspaceRootPath, count);
+	}
+
+	return [...pubWorkspacePackageCounts.entries()]
+		.map((p) => p[1] ? { path: p[0], workspacePackageCount: p[1] } : { path: p[0] })
+		.sort((a, b) => a.path.localeCompare(b.path));
+}
+
+/**
+ * Returns the uris of "pub roots" for a set of package folders/pubspecs, where "pub root" is
+ * the Pub Workspace root (if the package is part of a workspace) or the package folder.
+ *
+ * If multiple packages belong to the same Pub Workspace, it will only be returned once.
+ *
+ * If any URIs are non-file URIs, they will be dropped.
+ */
+export function getPubWorkspaceOrPackageFolderUris(packageFolderOrPubspecUris: Uri[]): Uri[] {
+	const packageFolderPaths = packageFolderOrPubspecUris
+		.filter((uri) => uri.scheme === "file")
+		.map((uri) => fsPath(uri));
+	const mappedPaths = getPubWorkspaceOrPackageFolderPaths(packageFolderPaths);
+	return mappedPaths.map((mappedPath) => Uri.file(mappedPath));
+}
+
+/**
+ * If `packageFolderOrPubspecUri` is part of a Pub Workspace, returns the workspace root folder URI.
+ *
+ * Otherwise (or if there is no workspace root, or URI is not file-scheme), returns `packageFolderOrPubspecUri`.
+ */
+export function getPubWorkspaceFolderOrPackageFolderUri(packageFolderOrPubspecUri: Uri): Uri {
+	return packageFolderOrPubspecUri.scheme === "file"
+		? Uri.file(getPubWorkspaceFolderOrPackageFolderPath(fsPath(packageFolderOrPubspecUri)))
+		: packageFolderOrPubspecUri;
+}
+
+/**
+ * If `packageFolderOrPubspecPath` is part of a Pub Workspace, returns the workspace root folder.
+ *
+ * Otherwise (or if there is no workspace root), returns `packageFolderOrPubspecPath` (or if it's a pubspec path, the
+ * containing folder).
+ */
+export function getPubWorkspaceFolderOrPackageFolderPath(
+	packageFolderOrPubspecPath: string,
+	existsSync: (itemPath: string) => boolean = fs.existsSync,
+	readFileSync: (itemPath: string) => string = (p) => fs.readFileSync(p, "utf8").toString(),
+): string {
+	const pubspecPath = path.basename(packageFolderOrPubspecPath) === "pubspec.yaml"
+		? packageFolderOrPubspecPath
+		: path.join(packageFolderOrPubspecPath, "pubspec.yaml");
+	const packageFolderPath = path.dirname(pubspecPath);
+
+	// We shouldn't really have gotten here without a pubspec because that means this isn't
+	// a package, but in that case just return the containing folder.
+	if (!existsSync(pubspecPath))
+		return packageFolderPath;
+
+	let pubspecContent: string;
+	try {
+		pubspecContent = readFileSync(pubspecPath);
+	} catch {
+		return packageFolderPath;
+	}
+
+	// If this is not a Pub Workspace project, just return the package itself.
+	if (!pubspecIsWorkspaceProjectRegex.test(pubspecContent))
+		return packageFolderPath;
+
+	// Walk up the tree to find the workspace root.
+	let currentFolder = path.dirname(packageFolderPath);
+	while (true) {
+		// Check if the current folder is the workspace root
+		try {
+			const currentPubspecPath = path.join(currentFolder, "pubspec.yaml");
+			const currentPubspecContent = readFileSync(currentPubspecPath);
+
+			// We've found the root.
+			if (pubspecIsWorkspaceRootRegex.test(currentPubspecContent))
+				return currentFolder;
+		} catch {
+			// A pubspec may not exist at every level.
+		}
+
+		// Otherwise, continue up.
+		const parent = path.dirname(currentFolder);
+
+		// If we get to the root of the filesystem without finding, use the original package.
+		if (parent === currentFolder)
+			return packageFolderPath;
+
+		// Otherwise, loop.
+		currentFolder = parent;
+	}
+}

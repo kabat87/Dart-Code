@@ -2,13 +2,25 @@ import * as child_process from "child_process";
 import * as stream from "stream";
 import { DaemonCapabilities } from "./capabilities/flutter";
 import { LogCategory, LogSeverity } from "./enums";
+import { Event } from "./events";
 import * as f from "./flutter/daemon_interfaces";
 import { UnknownResponse } from "./services/interfaces";
 import { WorkspaceContext } from "./workspace";
 
 export interface SdkSearchResults {
-	sdkPath: string | undefined;
+	// The fully resolved path to the SDK.
+	sdkPath?: string;
+	// The original path (before following symlinks) that led us to [sdkPath].
+	originalPath?: string;
 	candidatePaths: string[];
+	sdkInitScript: string | undefined;
+}
+
+export interface SdkSearchResult {
+	// The fully resolved path to the SDK.
+	sdkPath: string;
+	// The original path (before following symlinks) that led us to [sdkPath].
+	originalPath: string;
 }
 
 export interface Sdks {
@@ -17,6 +29,7 @@ export interface Sdks {
 	readonly flutter?: string;
 	readonly flutterVersion?: string;
 	readonly dartSdkIsFromFlutter: boolean;
+	readonly isPreReleaseSdk: boolean;
 }
 
 export interface DartSdks extends Sdks {
@@ -44,22 +57,39 @@ export interface WritableWorkspaceConfig {
 	startDevToolsServerEagerly?: boolean;
 	startDevToolsFromDaemon?: boolean;
 	disableAnalytics?: boolean;
-	disableAutomaticPackageGet?: boolean;
+	/// Whether to disable automatically running "pub get" such as to fetch packages, or for "pub deps"
+	/// that might create .dart_tool folders where they are not wanted.
+	disableAutomaticPub?: boolean;
+	/// Whether to disable DTD for this workspace.
+	disableDartToolingDaemon?: boolean;
 	disableSdkUpdateChecks?: boolean;
 	disableStartupPrompts?: boolean;
 	flutterDaemonScript?: CustomScript;
+	flutterDevToolsScript?: CustomScript;
 	flutterDoctorScript?: CustomScript;
 	flutterRunScript?: CustomScript;
 	flutterSdkHome?: string;
-	flutterSyncScript?: string;
 	flutterTestScript?: CustomScript;
+	flutterToolsScript?: CustomScript;
 	flutterVersion?: string;
-	useLsp?: boolean;
-	useVmForTests?: boolean;
 	forceFlutterWorkspace?: boolean;
 	forceFlutterDebug?: boolean;
 	skipFlutterInitialization?: boolean;
 	omitTargetFlag?: boolean;
+	defaultDartSdk?: string;
+	restartMacDaemonMessage?: string;
+	localDeviceCommandAdviceMessage?: string;
+	localMacWarningMessage?: string;
+	/// Whether or not we can use pkg:test for running tests. This means the tool supports
+	/// arguments like "--plain-name", "--name".
+	///
+	/// true: definitely does support it (Bazel)
+	/// false: definitely does not support it (Dart SDK)
+	/// undefined: only if there's a pubspec
+	supportsPackageTest?: boolean;
+	/// Similar to [supportsPackageTest], but whether we can successfully run
+	/// commands like "dart run test:test --version".
+	supportsDartRunTest?: boolean;
 }
 
 export type WorkspaceConfig = Readonly<WritableWorkspaceConfig>;
@@ -78,11 +108,13 @@ export interface DartProjectTemplate {
 
 export interface FlutterProjectTemplate {
 	readonly id: string;
+	readonly empty?: boolean;
 }
 
 export interface FlutterCreateTriggerData {
 	readonly sample?: string;
 	readonly template?: string;
+	readonly empty?: boolean;
 }
 
 export interface Logger {
@@ -98,8 +130,23 @@ export interface LogMessage {
 	toLine(maxLength: number): string;
 }
 
+/**
+ * A disposable that is synchronous (or at least, can be treated as such).
+ */
 export interface IAmDisposable {
+	dispose(): void;
+}
+
+/**
+ * A disposable that may be async.
+ */
+export interface IAmDisposableAsync {
 	dispose(): void | Promise<void>;
+}
+
+export interface CancellationToken {
+	isCancellationRequested: boolean;
+	onCancellationRequested: Event<any>;
 }
 
 export interface IFlutterDaemon extends IAmDisposable {
@@ -134,7 +181,7 @@ export interface CustomEmulator {
 	name: string;
 	executable: string;
 	args?: string[];
-	env?: { [key: string]: string };
+	env?: Record<string, string>;
 }
 
 export interface EmulatorCreator {
@@ -147,11 +194,12 @@ export interface PlatformEnabler {
 	id?: undefined;
 	type: "platform-enabler";
 	platformType: f.PlatformType;
+	projectRoot: string;
 }
 
 export interface FlutterCreateCommandArgs {
-	projectPath?: string;
-	projectName?: string;
+	packagePath?: string;
+	packageName?: string;
 	triggerData?: FlutterCreateTriggerData;
 	platform?: string;
 }
@@ -163,11 +211,6 @@ export interface CustomEmulatorDefinition {
 	args?: string[];
 }
 
-export interface Location {
-	startLine: number;
-	startColumn: number;
-	length: number;
-}
 
 export interface FlutterRawSurveyData {
 	uniqueId: string;
@@ -199,15 +242,24 @@ export interface OpenedFileInformation {
 
 export interface DevToolsPage {
 	id: string;
-	commandId: string;
+	commandSuffix: string;
 	routeId?: (flutterVersion: string | undefined) => string;
 	title: string;
+	requiresFlutter?: boolean;
+	requiredDartSdkVersion?: string;
+	// Page can be opened without a VM Service.
+	isStaticTool?: boolean;
 }
 
-export interface WidgetErrorInspectData {
+export interface LegacyWidgetErrorInspectData {
 	errorDescription: string;
 	devToolsUrl: string;
 	inspectorReference: string;
+}
+
+export interface DevToolsDeepLinkData {
+	summary: string;
+	deepLinkUrl: string;
 }
 
 export interface Range {
@@ -226,4 +278,27 @@ export interface Analytics {
 	logFlutterSurveyShown(): void;
 	logFlutterSurveyClicked(): void;
 	logFlutterSurveyDismissed(): void;
+}
+
+export interface MyCancellationToken {
+	isCancellationRequested: boolean;
+}
+
+export interface CustomDevToolsConfig {
+	args?: string[];
+	path?: string;
+	env?: Record<string, string>;
+	legacy?: boolean; // devtools_tool instead of dt
+}
+
+export interface GetSDKCommandConfig {
+	executable: string;
+	args?: string[];
+	cwd?: string,
+	env?: Record<string, string>;
+}
+
+export interface GetSDKCommandResult {
+	path?: string,
+	error?: string,
 }

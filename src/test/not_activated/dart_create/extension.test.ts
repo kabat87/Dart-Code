@@ -20,7 +20,8 @@ describe("test environment", () => {
 });
 
 describe("extension", () => {
-	it("did not activate", async () => {
+	// Skipped due to https://github.com/microsoft/vscode/issues/266221
+	it.skip("did not activate", async () => {
 		assert.equal(ext.isActive, false);
 	});
 });
@@ -29,11 +30,11 @@ describe("extension", () => {
 // Other tests must go in their own folders and be listed in test_all/launch.json individually.
 
 describe("command", () => {
-	it("Dart: New Project can be invoked and creates trigger file", async () => {
+	it("Dart: Create New Project can be invoked and creates trigger file", async () => {
 		attachLoggingWhenExtensionAvailable();
 
 		const projectName = "my_test_dart_proj";
-		const templateName = "console-full";
+		const templateName = "console";
 		const templateEntrypoint = "bin/__projectName__.dart";
 
 		const showOpenDialog = sb.stub(vs.window, "showOpenDialog");

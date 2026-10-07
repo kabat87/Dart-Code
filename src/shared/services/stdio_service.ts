@@ -1,25 +1,28 @@
 import * as fs from "fs";
-import { IAmDisposable, Logger, SpawnedProcess } from "../../shared/interfaces";
-import { Request, UnknownResponse } from "../../shared/services/interfaces";
+import { IAmDisposable, IAmDisposableAsync, Logger, SpawnedProcess } from "../interfaces";
 import { safeSpawn } from "../processes";
+import { Request, UnknownResponse } from "../services/interfaces";
+import { disposeAllAsync, PromiseCompleter } from "../utils";
 
 // Reminder: This class is used in the debug adapter as well as the main Code process!
 
 export abstract class StdIOService<T> implements IAmDisposable {
-	private readonly disposables: IAmDisposable[] = [];
+	private readonly disposables: IAmDisposableAsync[] = [];
 	public process?: SpawnedProcess;
 	protected readonly additionalPidsToTerminate: number[] = [];
 	private nextRequestID = 1;
-	private readonly activeRequests: { [key: string]: [(result: any) => void | Promise<void>, (error: any) => void | Promise<void>, string] | "CANCELLED" } = {};
+	private readonly activeRequests: Record<string, [(result: any) => void | Promise<void>, (error: any) => void | Promise<void>, string] | "CANCELLED"> = {};
 	private messageBuffers: Buffer[] = [];
 	private openLogFile: string | undefined;
 	private logStream?: fs.WriteStream;
-	private readonly requestErrorSubscriptions: Array<(notification: any) => void> = [];
-	private processExited = false;
+	protected processExited = false;
+	private processExitCompleter = new PromiseCompleter<ProcessExitCodes>();
+	public processExit = this.processExitCompleter.promise;
 	private description: string | undefined;
+	protected isDisposed = false;
 
 	constructor(
-		protected readonly logger: Logger,
+		public readonly logger: Logger,
 		public readonly maxLogLineLength: number | undefined,
 		public messagesWrappedInBrackets = false,
 		public readonly treatHandlingErrorsAsUnhandledMessages = false,
@@ -27,7 +30,7 @@ export abstract class StdIOService<T> implements IAmDisposable {
 		private logFile?: string) {
 	}
 
-	protected createProcess(workingDirectory: string | undefined, binPath: string, args: string[], envOverrides: { envOverrides?: { [key: string]: string | undefined }, toolEnv?: { [key: string]: string | undefined } }) {
+	protected createProcess(workingDirectory: string | undefined, binPath: string, args: string[], envOverrides: { envOverrides?: Record<string, string | undefined>, toolEnv?: Record<string, string | undefined> }) {
 		this.logTraffic(`Spawning ${binPath} with args ${JSON.stringify(args)}`);
 		this.description = binPath;
 		if (workingDirectory)
@@ -36,14 +39,22 @@ export abstract class StdIOService<T> implements IAmDisposable {
 			this.logTraffic(`..  with ${JSON.stringify(envOverrides)}`);
 
 		const env = Object.assign({}, envOverrides.toolEnv, envOverrides.envOverrides);
-		this.process = safeSpawn(workingDirectory, binPath, args, env);
+		try {
+			this.process = safeSpawn(workingDirectory, binPath, args, env);
+		} catch (e) {
+			this.logger.error(`Failed to spawn process! ${e}`);
+			this.handleError(e);
+			this.handleExit(null, null);
+		}
 
-		this.logTraffic(`    PID: ${process.pid}`);
+		if (this.process) {
+			this.logTraffic(`    PID: ${process.pid}`);
 
-		this.process.stdout.on("data", (data: Buffer | string) => this.handleStdOut(data));
-		this.process.stderr.on("data", (data: Buffer | string) => this.handleStdErr(data));
-		this.process.on("exit", (code, signal) => this.handleExit(code, signal));
-		this.process.on("error", (error) => this.handleError(error));
+			this.process.stdout.on("data", (data: Buffer | string) => this.handleStdOut(data));
+			this.process.stderr.on("data", (data: Buffer | string) => this.handleStdErr(data));
+			this.process.on("exit", (code, signal) => this.handleExit(code, signal));
+			this.process.on("error", (error) => this.handleError(error));
+		}
 	}
 
 	/// Flutter may send only \r as a line terminator for improved terminal output
@@ -75,11 +86,13 @@ export abstract class StdIOService<T> implements IAmDisposable {
 	}
 
 	protected handleExit(code: number | null, signal: NodeJS.Signals | null) {
-		this.logTraffic(`Process ${this.description} terminated! ${code}, ${signal}`);
+		const isError = !!code;
+		this.logTraffic(`Process ${this.description} terminated! ${code}, ${signal}`, isError);
 		this.processExited = true;
+		this.processExitCompleter.resolve({ code, signal });
 	}
 
-	protected handleError(error: Error) {
+	protected handleError(error: unknown) {
 		this.logTraffic(`Process errored! ${error}`);
 	}
 
@@ -91,11 +104,19 @@ export abstract class StdIOService<T> implements IAmDisposable {
 		};
 	}
 
+	protected notifyRequestAfterExit() { }
+
 	protected sendRequest<TReq, TResp>(method: string, params?: TReq): Promise<TResp> {
 		// Generate an ID for this request so we can match up the response.
 		const id = this.nextRequestID++;
 
 		return new Promise<TResp>((resolve, reject) => {
+			if (this.processExited) {
+				this.notifyRequestAfterExit();
+				reject(`Tried to call "${method}" but process has already exited with code ${this.process?.exitCode}`);
+				return;
+			}
+
 			// Stash the callbacks so we can call them later.
 			this.activeRequests[id.toString()] = [resolve, reject, method];
 
@@ -108,6 +129,7 @@ export abstract class StdIOService<T> implements IAmDisposable {
 	}
 
 	public cancelAllRequests() {
+		// TODO(dantup): Consider/test rejecting all active requests?
 		Object.keys(this.activeRequests).forEach((key) => this.activeRequests[key] = "CANCELLED");
 	}
 
@@ -136,8 +158,7 @@ export abstract class StdIOService<T> implements IAmDisposable {
 	}
 
 	protected abstract shouldHandleMessage(message: string): boolean;
-	// tslint:disable-next-line:no-empty
-	protected async processUnhandledMessage(message: string): Promise<void> { }
+	protected async processUnhandledMessage(_message: string): Promise<void> { }
 
 	public async handleMessage(message: string): Promise<void> {
 		this.logTraffic(`<== ${message.trimRight()}\r\n`);
@@ -148,9 +169,11 @@ export abstract class StdIOService<T> implements IAmDisposable {
 
 		let msg: any;
 		try {
+			// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 			msg = JSON.parse(message);
 
-			if (this.messagesWrappedInBrackets && msg && msg.length === 1)
+			if (this.messagesWrappedInBrackets && msg?.length === 1)
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 				msg = msg[0];
 		} catch (e: any) {
 			if (this.treatHandlingErrorsAsUnhandledMessages) {
@@ -163,8 +186,7 @@ export abstract class StdIOService<T> implements IAmDisposable {
 
 		try {
 			if (msg && this.isNotification(msg))
-				// tslint:disable-next-line: no-floating-promises
-				this.handleNotification(msg as T).catch((e) => this.logger.error(e));
+				void this.handleNotification(msg as T).catch((e) => this.logger.error(e));
 			else if (msg && this.isRequest(msg))
 				this.processServerRequest(msg as Request<any>).catch((e) => this.logger.error(e));
 			else if (msg && this.isResponse(msg))
@@ -184,15 +206,14 @@ export abstract class StdIOService<T> implements IAmDisposable {
 	}
 
 	protected abstract handleNotification(evt: T): Promise<void>;
-	// tslint:disable-next-line: no-empty
-	protected async handleRequest(method: string, args: any): Promise<any> { }
+	protected async handleRequest(_method: string, _args: any): Promise<any> { }
 	protected isNotification(msg: any): boolean { return !!msg.event; }
 	protected isRequest(msg: any): boolean { return !!msg.method && !!msg.id; }
 	protected isResponse(msg: any): boolean { return !!msg.id; }
 
 	private async processServerRequest(request: Request<any>) {
-		let result: any;
-		let error: any;
+		let result: unknown;
+		let error: unknown;
 		try {
 			result = await this.handleRequest(request.method, request.params);
 		} catch (e) {
@@ -216,13 +237,8 @@ export abstract class StdIOService<T> implements IAmDisposable {
 			this.logger.error(`Unable to handle response with ID ${evt.id} because its handler is not available`);
 			return;
 		}
-		const method: string = handler[2];
+		// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 		const error = evt.error;
-
-		if (error && error.code === "SERVER_ERROR") {
-			error.method = method;
-			this.notify(this.requestErrorSubscriptions, error).catch((e) => this.logger.error(e));
-		}
 
 		if (error) {
 			await handler[1](error);
@@ -231,8 +247,9 @@ export abstract class StdIOService<T> implements IAmDisposable {
 		}
 	}
 
-	protected notify<T>(subscriptions: Array<(notification: T) => void>, notification: T): Promise<unknown> {
-		return Promise.all(subscriptions.slice().map((sub) => sub(notification))).catch((e) => console.error(e));
+	protected notify<T>(subscriptions: Array<(notification: T) => Promise<void> | void>, notification: T): Promise<unknown> {
+		const promises = subscriptions.map(async (sub) => await sub(notification));
+		return Promise.all(promises).catch((e) => this.logger.error(e));
 	}
 
 	protected subscribe<T>(subscriptions: Array<(notification: T) => void>, subscriber: (notification: T) => void): IAmDisposable {
@@ -256,10 +273,6 @@ export abstract class StdIOService<T> implements IAmDisposable {
 		this.disposables.push(disposable);
 
 		return disposable;
-	}
-
-	public registerForRequestError(subscriber: (notification: any) => void): IAmDisposable {
-		return this.subscribe(this.requestErrorSubscriptions, subscriber);
 	}
 
 	protected logTraffic(message: string, isError = false): void {
@@ -288,33 +301,43 @@ export abstract class StdIOService<T> implements IAmDisposable {
 			this.logStream.write(message.trim() + "\r\n");
 	}
 
-	public dispose() {
+	public async dispose(): Promise<void> {
+		this.isDisposed = true;
+
+		this.logTraffic(`Process ${this.description} is being disposed`);
 		for (const pid of this.additionalPidsToTerminate) {
 			try {
+				this.logTraffic(`Process ${this.description} is terminating process ${pid}`);
 				process.kill(pid);
 			} catch (e: any) {
 				// TODO: Logger knows the category!
+				// eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
 				this.logger.error({ message: e.toString() });
 			}
 		}
 		this.additionalPidsToTerminate.length = 0;
 		try {
-			if (!this.processExited && this.process && !this.process.killed)
+			if (!this.processExited && this.process && !this.process.killed) {
+				this.logTraffic(`Process ${this.description} is terminating the main process`);
 				this.process.kill();
-		} catch (e) {
+			} else {
+				if (this.processExited) {
+					this.logTraffic(`Process ${this.description} skipped terminating because it had already exited`);
+				} else if (!this.process) {
+					this.logTraffic(`Process ${this.description} skipped terminating because there is no process`);
+				} else if (this.process?.killed) {
+					this.logTraffic(`Process ${this.description} skipped terminating because it was already killed`);
+				} else {
+					this.logTraffic(`Process ${this.description} skipped terminating because 🤷‍♂️`);
+				}
+			}
+		} catch {
 			// This tends to throw a lot because the shell process quit when we terminated the related
 			// process above, so just swallow the error.
 		}
 		this.process = undefined;
 
-		this.disposables.forEach(async (d) => {
-			try {
-				return await d.dispose();
-			} catch (e: any) {
-				this.logger.error({ message: e.toString() });
-			}
-		});
-		this.disposables.length = 0;
+		await disposeAllAsync(this.disposables, this.logger);
 
 		// Clear log file so if any more log events come through later, we don't
 		// create a new log file and overwrite what we had.
@@ -327,3 +350,5 @@ export abstract class StdIOService<T> implements IAmDisposable {
 		}
 	}
 }
+
+export interface ProcessExitCodes { code: number | null, signal: NodeJS.Signals | null }

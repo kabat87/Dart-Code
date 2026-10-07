@@ -33,7 +33,7 @@ export class PackageCacheData {
 	}
 
 	static fromJson(json: string): PackageCacheData | undefined {
-		const data = JSON.parse(json, PackageCacheData.mapReviver) as PackageCache;
+		const data = JSON.parse(json, (k, v) => PackageCacheData.mapReviver(k, v)) as PackageCache;
 
 		if (data.version !== PackageCacheData.cacheVersion)
 			return undefined;
@@ -50,8 +50,8 @@ export class PackageCacheData {
 				lastUpdated: this.lastUpdated,
 				packages: this.packages,
 				version: PackageCacheData.cacheVersion,
-			} as PackageCache,
-			PackageCacheData.mapReplacer,
+			} satisfies PackageCache,
+			(key, value) => PackageCacheData.mapReplacer(key, value),
 			2,
 		);
 	}
@@ -77,4 +77,36 @@ interface PackageCache {
 	lastUpdated: number;
 	packages: Map<string, string | undefined>;
 	version: number;
+}
+
+interface QuickPickItem {
+	label: string;
+	description?: string;
+	detail?: string;
+	picked?: boolean;
+	alwaysShow?: boolean;
+}
+
+export type PickablePackage = QuickPickItem & (PubPackage | LocalPubPackageMarker | GitPubPackageMarker);
+export type PackageInfo = PubPackage | PathPubPackage | GitPubPackage;
+
+
+export interface PubPackage {
+	marker: undefined;
+	packageNames: string;
+}
+
+export interface LocalPubPackageMarker { marker: "PATH"; }
+export interface GitPubPackageMarker { marker: "GIT"; }
+
+export interface PathPubPackage extends LocalPubPackageMarker {
+	path: string;
+	packageName: string;
+}
+
+export interface GitPubPackage extends GitPubPackageMarker {
+	url: string;
+	packageName: string;
+	ref?: string;
+	path?: string;
 }

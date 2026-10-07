@@ -1,14 +1,16 @@
 import * as path from "path";
 import * as vs from "vscode";
 import { modifyingFilesOutsideWorkspaceInfoUrl, moreInfoAction } from "../../shared/constants";
+import { IAmDisposable } from "../../shared/interfaces";
 import { disposeAll } from "../../shared/utils";
 import { fsPath } from "../../shared/utils/fs";
+import { isWithinWorkspace } from "../../shared/vscode/project";
 import { envUtils } from "../../shared/vscode/utils";
 import { config } from "../config";
 import * as util from "../utils";
 
-export class FileChangeWarnings implements vs.Disposable {
-	private readonly disposables: vs.Disposable[] = [];
+export class FileChangeWarnings implements IAmDisposable {
+	private readonly disposables: IAmDisposable[] = [];
 	private readonly filesWarnedAbout = new Set<string>();
 	constructor() {
 		this.disposables.push(
@@ -17,7 +19,7 @@ export class FileChangeWarnings implements vs.Disposable {
 	}
 
 	public onDidChangeTextDocument(e: vs.TextDocumentChangeEvent) {
-		if (!util.isAnalyzable(e.document))
+		if (!util.isDartFile(fsPath(e.document.uri)))
 			return;
 
 		if (e.contentChanges.length === 0) // This event fires for metadata changes (dirty?) so don't need to notify AS then.
@@ -25,12 +27,11 @@ export class FileChangeWarnings implements vs.Disposable {
 
 		const filePath = fsPath(e.document.uri);
 
-		if (vs.workspace.workspaceFolders
-			&& vs.workspace.workspaceFolders.length // Only prompt if we actually have workspace folders open
-			&& !util.isWithinWorkspace(filePath)
+		if (vs.workspace.workspaceFolders?.length // Only prompt if we actually have workspace folders open
+			&& !isWithinWorkspace(filePath)
 			&& !this.filesWarnedAbout.has(filePath)) {
 
-			const isInPubCache = filePath.indexOf(`${path.sep}hosted${path.sep}pub.dartlang.org${path.sep}`) !== -1;
+			const isInPubCache = filePath.includes(`${path.sep}hosted${path.sep}pub.dartlang.org${path.sep}`) || filePath.includes(`${path.sep}hosted${path.sep}pub.dev${path.sep}`);
 			const shouldWarn = isInPubCache
 				? config.warnWhenEditingFilesInPubCache
 				: config.warnWhenEditingFilesOutsideWorkspace;
@@ -43,19 +44,19 @@ export class FileChangeWarnings implements vs.Disposable {
 			const dontShowAgainAction = "Don't Warn Me";
 
 			if (shouldWarn) {
-				vs.window.showWarningMessage(promptText, moreInfoAction, dontShowAgainAction)
+				void vs.window.showWarningMessage(promptText, moreInfoAction, dontShowAgainAction)
 					.then(async (action) => {
 						if (action === moreInfoAction) {
 							await envUtils.openInBrowser(modifyingFilesOutsideWorkspaceInfoUrl);
 						} else if (action === dontShowAgainAction)
-							dontShowAgainSetter();
+							void dontShowAgainSetter();
 					});
 				this.filesWarnedAbout.add(filePath);
 			}
 		}
 	}
 
-	public dispose(): any {
+	public dispose(): void {
 		disposeAll(this.disposables);
 	}
 }
